@@ -1,0 +1,12 @@
+[package]
+name = "leetcode"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+itertools = "0.14.0"
+rayon = "1.10.0"
+trace = "0.1.7"
+time_it_macro = {git = "https://github.com/LePhilippeDucTai/time_it_macro.git"}
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
