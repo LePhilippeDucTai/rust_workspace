@@ -1,4 +1,7 @@
-pub fn add(left: u64, right: u64) -> u64 {
+pub fn add<T>(left: T, right: T) -> T
+where
+    T: std::ops::Add<Output = T>,
+{
     left + right
 }
 
@@ -8,7 +11,7 @@ mod tests {
 
     #[test]
     fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
+        let result = add(2.0, 25.3);
+        assert_eq!(result, 27.3);
     }
 }

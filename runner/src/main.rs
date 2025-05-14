@@ -1,3 +1,4 @@
 fn main() {
-    println!("Hello, world!");
+    let v = math::add(5, 3);
+    println!("Hello, world! {v}");
 }
