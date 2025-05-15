@@ -100,7 +100,7 @@ impl Board {
         Ok(candidates)
     }
     fn with_values(self, i: usize, j: usize, value: u8) -> Board {
-        let mut new_board = self.clone();
+        let mut new_board = self;
         new_board.board[i][j] = value;
         new_board
     }
@@ -126,7 +126,6 @@ fn complete_unique_value(board: Board, possible_candidates: Candidates) -> (bool
 
 pub fn solve_sudoku(board: Board) -> Result<Board, InvalidSudoku> {
     let possible_candidates = board.compute_candidates();
-    // println!("{possible_candidates:?}");
     if let Ok(candidates) = possible_candidates {
         let (has_changed, new_board) = complete_unique_value(board, candidates);
         if has_changed {
@@ -148,13 +147,12 @@ pub fn solve(board: Board) -> Result<Board, InvalidSudoku> {
 
 fn solve_sudoku_backtracking(board: Board) -> Result<Board, InvalidSudoku> {
     let candidates = board.compute_candidates().unwrap();
-    let ((i, j), selected) = candidates.iter().find(|(_, x)| x.len() <= 3).unwrap();
+    let ((i, j), selected) = candidates.iter().min_by_key(|(_, x)| x.len()).unwrap();
     for v in selected {
         let new_board = board.clone().with_values(*i, *j, *v);
         if let Ok(solution) = solve_sudoku(new_board) {
             return Ok(solution);
         }
-        // println!("Trying second value.");
     }
     Err(InvalidSudoku)
 }
