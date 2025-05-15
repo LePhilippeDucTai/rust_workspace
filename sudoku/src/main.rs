@@ -89,8 +89,8 @@ impl Board {
             let row = self.row(i, j);
             let col = self.col(i, j);
             let block = self.block(i, j);
-            // let union = union_of_disjoints(vec![row, col, block]);
-            let union = &nums - &(&(&row | &col) | &block);
+            let seen = &(&row | &col) | &block;
+            let union = &nums - &seen;
             if !union.is_empty() {
                 candidates.insert((i, j), union);
             } else {
