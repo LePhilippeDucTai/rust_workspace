@@ -99,6 +99,7 @@ impl Board {
         }
         Ok(candidates)
     }
+
     fn with_values(self, i: usize, j: usize, value: u8) -> Board {
         let mut new_board = self;
         new_board.board[i][j] = value;
@@ -120,10 +121,8 @@ fn solve_sudoku(board: Board) -> Result<Board, InvalidSudoku> {
                 return Ok(solution);
             }
         }
-        Err(InvalidSudoku)
-    } else {
-        Err(InvalidSudoku)
     }
+    Err(InvalidSudoku)
 }
 #[time_it]
 pub fn solve(board: Board) -> Result<Board, InvalidSudoku> {
