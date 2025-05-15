@@ -104,57 +104,30 @@ impl Board {
         new_board.board[i][j] = value;
         new_board
     }
-
-    fn has_nulls(&self) -> bool {
-        self.board.as_flattened().iter().any(|&x| x == NULL_ELEMENT)
-    }
 }
 
-fn complete_unique_value(board: Board, possible_candidates: Candidates) -> (bool, Board) {
-    let one_value = possible_candidates
-        .into_iter()
-        .filter(|(_, val)| val.len() == 1)
-        .map(|(t, h)| (t, h.into_iter().next().unwrap()))
-        .next();
-    if let Some(((i, j), v)) = one_value {
-        let new_board = board.with_values(i, j, v);
-        (true, new_board)
-    } else {
-        (false, board)
-    }
-}
-
-pub fn solve_sudoku(board: Board) -> Result<Board, InvalidSudoku> {
+fn solve_sudoku(board: Board) -> Result<Board, InvalidSudoku> {
     let possible_candidates = board.compute_candidates();
+    println!("Possible Candidates: {:?}", possible_candidates);
     if let Ok(candidates) = possible_candidates {
-        let (has_changed, new_board) = complete_unique_value(board, candidates);
-        if has_changed {
-            return solve_sudoku(new_board);
-        } else {
-            if new_board.has_nulls() {
-                return solve_sudoku_backtracking(new_board);
-            }
-            return Ok(new_board);
+        if candidates.is_empty() {
+            return Ok(board);
         }
+        let ((i, j), selected) = candidates.iter().min_by_key(|(_, x)| x.len()).unwrap();
+        for v in selected {
+            let new_board = board.clone().with_values(*i, *j, *v);
+            if let Ok(solution) = solve_sudoku(new_board) {
+                return Ok(solution);
+            }
+        }
+        Err(InvalidSudoku)
+    } else {
+        Err(InvalidSudoku)
     }
-    Err(InvalidSudoku)
 }
-
 #[time_it]
 pub fn solve(board: Board) -> Result<Board, InvalidSudoku> {
     solve_sudoku(board)
-}
-
-fn solve_sudoku_backtracking(board: Board) -> Result<Board, InvalidSudoku> {
-    let candidates = board.compute_candidates().unwrap();
-    let ((i, j), selected) = candidates.iter().min_by_key(|(_, x)| x.len()).unwrap();
-    for v in selected {
-        let new_board = board.clone().with_values(*i, *j, *v);
-        if let Ok(solution) = solve_sudoku(new_board) {
-            return Ok(solution);
-        }
-    }
-    Err(InvalidSudoku)
 }
 
 #[cfg(test)]
@@ -217,7 +190,7 @@ mod tests {
         ];
 
         let board = Board::new(board_data);
-        let solved = solve_sudoku(board).unwrap();
+        let solved = solve(board).unwrap();
         assert_eq!(solved.board, expected_solution);
     }
 
@@ -249,7 +222,7 @@ mod tests {
         ];
 
         let board = Board::new(board_data);
-        let solved = solve_sudoku(board).unwrap();
+        let solved = solve(board).unwrap();
         assert_eq!(solved.board, expected_solution);
     }
 }
