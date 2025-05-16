@@ -108,22 +108,20 @@ impl Board {
 }
 
 fn solve_sudoku(board: Board) -> Result<Board, InvalidSudoku> {
-    let possible_candidates = board.compute_candidates();
-    println!("Possible Candidates: {:?}", possible_candidates);
-    if let Ok(candidates) = possible_candidates {
-        if let Some(((i, j), selected)) = candidates.iter().min_by_key(|(_, x)| x.len()) {
-            for v in selected {
-                let new_board = board.clone().with_values(*i, *j, *v);
-                if let Ok(solution) = solve_sudoku(new_board) {
-                    return Ok(solution);
-                }
-            }
-        } else {
-            return Ok(board);
-        }
-    }
-    Err(InvalidSudoku)
+    let candidates = board.compute_candidates()?;
+    println!("Possible Candidates: {:?}", candidates);
+    let Some(((i, j), selected)) = candidates.iter().min_by_key(|(_, x)| x.len()) else {
+        return Ok(board);
+    };
+    selected
+        .iter()
+        .find_map(|&v| {
+            let new_board = board.clone().with_values(*i, *j, v);
+            solve_sudoku(new_board).ok()
+        })
+        .ok_or(InvalidSudoku)
 }
+
 #[time_it]
 pub fn solve(board: Board) -> Result<Board, InvalidSudoku> {
     solve_sudoku(board)
