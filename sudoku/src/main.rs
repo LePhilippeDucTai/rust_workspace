@@ -1,4 +1,5 @@
 use itertools::Itertools;
+use tracing::{debug, info};
 use std::collections::{HashMap, HashSet};
 use std::error;
 use std::fmt;
@@ -109,7 +110,7 @@ impl Board {
 
 fn solve_sudoku(board: Board) -> Result<Board, InvalidSudoku> {
     let candidates = board.compute_candidates()?;
-    println!("Possible Candidates: {:?}", candidates);
+    info!("Possible Candidates: {:?}", candidates);
     let Some(((i, j), selected)) = candidates.iter().min_by_key(|(_, x)| x.len()) else {
         return Ok(board);
     };
