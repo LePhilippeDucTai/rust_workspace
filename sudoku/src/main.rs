@@ -1,9 +1,9 @@
 use itertools::Itertools;
-use tracing::info;
 use std::collections::{HashMap, HashSet};
 use std::error;
 use std::fmt;
 use time_it_macro::time_it;
+use tracing::info;
 
 const DIM: usize = 9;
 const NULL_ELEMENT: u8 = 0;
@@ -101,7 +101,7 @@ impl Board {
         Ok(candidates)
     }
 
-    fn with_values(self, i: usize, j: usize, value: u8) -> Board {
+    fn with_value(self, i: usize, j: usize, value: u8) -> Board {
         let mut new_board = self;
         new_board.board[i][j] = value;
         new_board
@@ -110,14 +110,13 @@ impl Board {
 
 fn solve_sudoku(board: Board) -> Result<Board, InvalidSudoku> {
     let candidates = board.compute_candidates()?;
-    info!("Possible Candidates: {:?}", candidates);
     let Some(((i, j), selected)) = candidates.iter().min_by_key(|(_, x)| x.len()) else {
         return Ok(board);
     };
     selected
         .iter()
         .find_map(|&v| {
-            let new_board = board.clone().with_values(*i, *j, v);
+            let new_board = board.clone().with_value(*i, *j, v);
             solve_sudoku(new_board).ok()
         })
         .ok_or(InvalidSudoku)
