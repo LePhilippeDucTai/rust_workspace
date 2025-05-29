@@ -56,26 +56,30 @@ impl Board {
     }
     #[inline]
     fn row(&self, i: usize, _: usize) -> HashSet<u8> {
-        (0..DIM)
-            .map(|x| self.board[i][x])
-            .filter(|&x| x != 0)
+        self.board[i]
+            .into_iter()
+            .filter(|&value| value != 0)
             .collect()
     }
     #[inline]
     fn col(&self, _: usize, j: usize) -> HashSet<u8> {
-        (0..DIM)
-            .map(|x| self.board[x][j])
-            .filter(|&x| x != 0)
+        self.board
+            .iter()
+            .map(|row| row[j])
+            .filter(|&value| value != 0)
             .collect()
     }
 
     fn block(&self, i: usize, j: usize) -> HashSet<u8> {
-        let k = BLOCK_DIM * (i / BLOCK_DIM);
-        let l = BLOCK_DIM * (j / BLOCK_DIM);
-        (k..(k + BLOCK_DIM))
-            .cartesian_product(l..(l + BLOCK_DIM))
-            .map(|(x, y)| self.board[x][y])
-            .filter(|&x| x != 0)
+        let block_row_start = BLOCK_DIM * (i / BLOCK_DIM);
+        let block_col_start = BLOCK_DIM * (j / BLOCK_DIM);
+        (0..BLOCK_DIM)
+            .flat_map(|row_offset| {
+                (0..BLOCK_DIM).map(move |col_offset| {
+                    self.board[block_row_start + row_offset][block_col_start + col_offset]
+                })
+            })
+            .filter(|&value| value != 0)
             .collect()
     }
 
