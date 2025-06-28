@@ -880,9 +880,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "time_it"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.104",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "time_it_macro"
 version = "0.1.0"
-source = "git+https://github.com/LePhilippeDucTai/time_it_macro.git#b42555f2d1121275f0731f6f1f075eb3647e9af0"
+source = "git+https://github.com/LePhilippeDucTai/time_it_macro.git#585277bd8d65904f312dcb1d1b57119ebb713f1b"
 dependencies = [
  "proc-macro2",
  "quote",

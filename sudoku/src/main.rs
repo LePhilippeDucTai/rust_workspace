@@ -2,8 +2,7 @@ use itertools::Itertools;
 use std::collections::{HashMap, HashSet};
 use std::error;
 use std::fmt;
-use time_it_macro::time_it;
-use tracing::info;
+use time_it::time_it;
 
 const DIM: usize = 9;
 const NULL_ELEMENT: u8 = 0;
@@ -126,8 +125,10 @@ fn solve_sudoku(board: Board) -> Result<Board, InvalidSudoku> {
         .ok_or(InvalidSudoku)
 }
 
+pub fn solve(board: Board) -> Result<Board, InvalidSudoku> {
+    solve_sudoku(board)
+}
 #[time_it]
-
 fn main() {
     tracing_subscriber::fmt::init();
     let board_data = [
@@ -145,9 +146,6 @@ fn main() {
     let board = Board::new(board_data);
     let new_board = solve(board).unwrap();
     new_board.pretty_print();
-}
-pub fn solve(board: Board) -> Result<Board, InvalidSudoku> {
-    solve_sudoku(board)
 }
 
 #[cfg(test)]
