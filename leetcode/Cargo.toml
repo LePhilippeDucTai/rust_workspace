@@ -7,5 +7,6 @@ edition = "2024"
 itertools = "0.14.0"
 rayon = "1.10.0"
 trace = "0.1.7"
-tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
+time_it = { path = "../time_it" }
+tracing = "0.1.41"

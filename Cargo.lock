@@ -327,6 +327,7 @@ version = "0.1.0"
 dependencies = [
  "itertools",
  "rayon",
+ "time_it",
  "trace",
  "tracing",
  "tracing-subscriber",

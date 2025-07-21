@@ -3,7 +3,7 @@ pub struct Solution;
 
 impl Solution {
     pub fn candy(ratings: Vec<i32>) -> i32 {
-        ratings
+        ratings[0]
     }
 }
 #[cfg(test)]

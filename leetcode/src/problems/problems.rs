@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use itertools::Itertools;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-use time_it_macro::time_it;
+use time_it::time_it;
 
 pub fn two_sums(nums: Vec<i32>, target: i32) -> (usize, usize) {
     let enums = nums.iter().enumerate();
