@@ -18,7 +18,7 @@ const fn generate_candidates() -> [u8; DIM] {
 const CANDIDATES: [u8; DIM] = generate_candidates();
 const BLOCK_DIM: usize = DIM.isqrt();
 
-type Candidates = HashMap<(usize, usize), HashSet<u8>>;
+pub type Candidates = HashMap<(usize, usize), HashSet<u8>>;
 
 #[derive(Debug, Clone)]
 pub struct InvalidSudoku;

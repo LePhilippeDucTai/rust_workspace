@@ -1,3 +1,4 @@
 pub mod solver;
+pub mod solver_iter;
 
-pub use solver::{Board, InvalidSudoku, solve};
+pub use solver::{Board, Candidates, InvalidSudoku, solve};
