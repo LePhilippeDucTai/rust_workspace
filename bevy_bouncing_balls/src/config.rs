@@ -5,11 +5,11 @@ pub const WINDOW_HEIGHT: f32 = 720.0;
 pub const HALF_WIDTH: f32 = WINDOW_WIDTH * 0.5;
 pub const HALF_HEIGHT: f32 = WINDOW_HEIGHT * 0.5;
 
-pub const INITIAL_BALLS: usize = 500;
+pub const INITIAL_BALLS: usize = 100;
 pub const MIN_RADIUS: f32 = 2.0;
 pub const MAX_RADIUS: f32 = 10.0;
 
-pub const INITIAL_SPEED: f32 = 200.0;
+pub const INITIAL_SPEED: f32 = 100.0;
 pub const GRAVITY_ACCEL: f32 = 800.0;
 pub const WALL_RESTITUTION: f32 = 1.0;
 

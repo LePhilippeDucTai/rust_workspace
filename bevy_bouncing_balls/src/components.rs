@@ -12,6 +12,9 @@ pub struct Ball {
 pub struct Velocity(pub Vec2);
 
 #[derive(Component)]
+pub struct ColorCycler;
+
+#[derive(Component)]
 pub struct HudText;
 
 #[derive(Component)]
