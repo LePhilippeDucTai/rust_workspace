@@ -1,0 +1,9 @@
+[package]
+name = "bevy_bouncing_balls"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = "0.18.1"
+rand = "0.8"
+rayon = "1.10"

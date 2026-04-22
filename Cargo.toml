@@ -1,6 +1,12 @@
 [workspace]
 resolver="2"
-members = [ "bevy_game", "bevy_math_equations_interactive", "leetcode", "math", "runner","sudoku", "time_it"]
+members = [ "bevy_bouncing_balls", "bevy_game", "bevy_math_equations_interactive", "leetcode", "math", "runner","sudoku", "time_it"]
 
 [profile.dev.package.bevy_math_equations]
 opt-level = 1
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
