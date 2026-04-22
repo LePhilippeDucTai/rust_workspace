@@ -34,7 +34,7 @@ struct SudokuSolver {
     current_frame: Option<SolverFrame>,
     solver_state: SolverState,
 
-    current_cell: Option<(usize, usize)>,
+    // current_cell: Option<(usize, usize)>,
     steps_count: u32,
     backtrack_count: u32,
 }
@@ -47,7 +47,6 @@ impl SudokuSolver {
             stack: Vec::new(),
             current_frame: None,
             solver_state: SolverState::Idle,
-            current_cell: None,
             steps_count: 0,
             backtrack_count: 0,
         }
@@ -58,9 +57,20 @@ impl SudokuSolver {
 
     fn step(&mut self) -> SolverResult {
         match &self.solver_state {
-            SolverState::Idle => return SolverResult::InProgress,
+            SolverState::Idle => {
+                let x = 1;
+                SolverResult::InProgress
+            }
             SolverState::Complete => return SolverResult::Complete,
-            SolverState::Computing => return SolverResult::InProgress,
+            SolverState::Computing => {
+                if let Ok(candidates) = self.board.compute_candidates() {}
+                if self.stack.is_empty() {
+                    SolverResult::Failed
+                } else {
+                    self.solver_state = SolverState::Backtracking;
+                    SolverResult::InProgress
+                }
+            }
             SolverState::Trying(candidate) => return SolverResult::InProgress,
             SolverState::Failed => return SolverResult::Failed,
             SolverState::Backtracking => return SolverResult::InProgress,

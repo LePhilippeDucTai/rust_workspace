@@ -84,7 +84,7 @@ impl Board {
             .collect()
     }
 
-    fn compute_candidates(&self) -> Result<Candidates, InvalidSudoku> {
+    pub fn compute_candidates(&self) -> Result<Candidates, InvalidSudoku> {
         let mut candidates = Candidates::new();
         let nums = HashSet::from(CANDIDATES);
         let all_nulls = (0..DIM)

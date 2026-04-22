@@ -1,0 +1,36 @@
+J'ai une idée d'application IA... Je souhaite créer une application écrite en Rust (bevy) où l'utilisateur entre une équation avec des lettres ou chiffres, et il peut déplacer à gauche ou à droite chaque terme en respectant les opérations. Par exemple l'utilisateur écrit a + b = c, et peut déplacer b à droite et cela donne a = c - b, s'il le positionne à droite de c, ou a = -b + c s'il le positionne à gauche de c. De même s'il y a une multiplication sur le left hand side, elle fera une division sur le right hand side.
+Cette application doit fonctionner pour n'importe quel type d'équation. L'affichage doit être le plus joli possible en utilisant des fonts proches du LateX, en blanc avec fond noir.
+Si tu as des questions n'hésite pas à me demander.
+
+
+Laisse-moi d'abord explorer ce qui existe déjà dans le répertoire du projet.
+
+Exécuté
+List project directory contents and read Cargo.toml if exists
+Le dossier est vide - parfait, on part de zéro. Avant de commencer, j'ai quelques questions pour bien cadrer le projet :
+
+1. Interaction — Comment l'utilisateur déplace-t-il les termes ?
+
+Glisser-déposer avec la souris (drag & drop) ?
+Cliquer sur le terme puis sur les flèches gauche/droite ?
+Autre ?
+2. Saisie de l'équation — L'utilisateur tape l'équation comment ?
+
+Un champ texte directement dans l'application Bevy ?
+En argument de ligne de commande au lancement ?
+3. Complexité des équations — Quel est le périmètre souhaité ?
+
+Simple (termes additifs/soustractifs, pas de parenthèses) : a + b = c
+Avec parenthèses : (a + b) * c = d — si on déplace (a+b), ça donne c = d / (a+b) ?
+Avec exposants, fractions, racines ?
+4. Affichage des fractions — Quand une division est créée (ex: a = c / b), tu préfères :
+
+Notation inline : a = c / b
+Fraction verticale style LaTeX : a = c sur b avec une barre ?
+5. Animation — Quand un terme se déplace, veux-tu une animation fluide (le terme "glisse" visuellement), ou juste une mise à jour instantanée de l'équation ?
+
+1. Drag and drop à la souris.
+2. Un champ texte dans bevy
+3. Avec exposants, fractions, racines, (toutes les opérations pouvant être réversibles). OUi si on déplace (a+b) cela donne c = d / (a+b). On ne peut déplacer que ce qui est déplaçable directement.
+4. Je veux une fractions style LateX.
+5. Oui animation fluide !
