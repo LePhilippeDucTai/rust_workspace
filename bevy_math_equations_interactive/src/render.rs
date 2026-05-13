@@ -17,6 +17,7 @@ impl Plugin for RenderPlugin {
 #[derive(Resource, Default)]
 pub struct MathFont {
     pub handle: Handle<Font>,
+    #[allow(dead_code)]
     pub loaded: bool,
 }
 
@@ -44,6 +45,7 @@ pub struct DropIndicator {
 }
 
 /// Highlight overlay for hover/drag states
+#[allow(dead_code)]
 #[derive(Component)]
 pub struct TermHighlight;
 
@@ -251,7 +253,7 @@ pub fn render_input_field(
     font: Res<MathFont>,
     old_bg: Query<Entity, With<InputFieldBg>>,
     old_txt: Query<Entity, With<InputFieldText>>,
-    time: Res<Time>,
+    _time: Res<Time>,
     app_state: Res<State<AppState>>,
 ) {
     if !eq_res.is_changed() && !app_state.is_changed() {

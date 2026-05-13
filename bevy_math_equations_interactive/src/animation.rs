@@ -18,6 +18,7 @@ pub struct Tween {
 }
 
 impl Tween {
+    #[allow(dead_code)]
     pub fn new(start: Vec3, end: Vec3, duration: f32) -> Self {
         Self { start, end, elapsed: 0.0, duration }
     }

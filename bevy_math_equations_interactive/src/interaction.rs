@@ -4,9 +4,7 @@ use bevy::input::ButtonState;
 use crate::ast::{Equation, Side};
 use crate::parser::parse;
 use crate::transform::move_term;
-use crate::layout::{layout_equation, EquationLayout};
 use crate::render::{EquationDirty, MathFont, DraggableTerm, DropIndicator};
-use crate::animation::Tween;
 
 pub struct InteractionPlugin;
 
@@ -129,7 +127,7 @@ fn handle_mouse(
     drop_q: Query<(&DropIndicator, &Transform)>,
     ghost_q: Query<Entity, With<DragGhost>>,
     app_state: Res<State<AppState>>,
-    font: Res<MathFont>,
+    _font: Res<MathFont>,
 ) {
     if *app_state.get() != AppState::Display { return; }
 
@@ -270,7 +268,7 @@ fn update_hover_highlight(
     mut draggable_q: Query<(&DraggableTerm, &mut Sprite)>,
 ) {
     let dragging = drag_state.dragging;
-    let cursor = drag_state.cursor_world;
+    let _cursor = drag_state.cursor_world;
 
     for (dt, mut sprite) in draggable_q.iter_mut() {
         let tr = (dt.side, dt.index);
@@ -278,7 +276,7 @@ fn update_hover_highlight(
 
         if !is_dragging && dragging.is_none() {
             // Hover detection
-            let size = sprite.custom_size.unwrap_or(Vec2::ZERO);
+            let _size = sprite.custom_size.unwrap_or(Vec2::ZERO);
             // We can't easily get world pos here without Transform; use a simple alpha
             sprite.color = Color::srgba(1.0, 1.0, 1.0, 0.0);
         } else if is_dragging {

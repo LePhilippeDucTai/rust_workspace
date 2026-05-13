@@ -4,8 +4,10 @@ use bevy::prelude::Vec2;
 pub const FONT_SIZE: f32 = 42.0;
 pub const SMALL_FONT: f32 = 28.0;  // superscripts, root index
 pub const TINY_FONT: f32 = 20.0;
+#[allow(dead_code)]
 pub const EQ_SIGN_GAP: f32 = 28.0;
 pub const TERM_GAP: f32 = 12.0;
+#[allow(dead_code)]
 pub const OP_GAP: f32 = 8.0;
 pub const FRAC_BAR_PADDING: f32 = 6.0; // vertical space around fraction bar
 
@@ -225,6 +227,7 @@ impl LayoutNode {
     }
 
     /// Find the term_ref at world position (for click detection)
+    #[allow(dead_code)]
     pub fn term_at(&self, pt: Vec2) -> Option<(Side, usize)> {
         let (min, max) = self.world_rect();
         if pt.x < min.x || pt.x > max.x || pt.y < min.y || pt.y > max.y {
@@ -262,6 +265,7 @@ pub struct TextAtom {
     pub text: String,
     pub font_size: f32,
     pub pos: Vec2,
+    #[allow(dead_code)]
     pub term_ref: Option<(Side, usize)>,
 }
 
@@ -271,6 +275,7 @@ pub struct LineAtom {
     pub y: f32,
     pub width: f32,
     pub thickness: f32,
+    #[allow(dead_code)]
     pub term_ref: Option<(Side, usize)>,
 }
 
@@ -485,8 +490,10 @@ pub struct EquationLayout {
     pub rhs: LayoutNode,
     pub eq_sign: LayoutNode,
     /// World-space baseline y
+    #[allow(dead_code)]
     pub baseline_y: f32,
     /// Bounding box: (min, max)
+    #[allow(dead_code)]
     pub bbox: (Vec2, Vec2),
     /// Drop indicator atoms
     pub drop_indicators: Vec<DropIndicatorAtom>,
