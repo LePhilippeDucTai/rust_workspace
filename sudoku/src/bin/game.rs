@@ -77,7 +77,7 @@ fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: "Sudoku — un jardin tranquille".into(),
+                title: "Sudoku - un jardin tranquille".into(),
                 resolution: (WIN_W, WIN_H).into(),
                 resizable: false,
                 ..default()
@@ -250,7 +250,8 @@ fn is_complete_and_valid(b: &[[u8; N]; N]) -> bool {
 
 // ---------- Setup de la scène ----------
 
-fn setup(mut commands: Commands) {
+fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+    let font = asset_server.load("fonts/Geneva.ttf");
     commands.spawn(Camera2d);
 
     // Quelques feuillages décoratifs en fond, pour la touche Ghibli.
@@ -278,6 +279,7 @@ fn setup(mut commands: Commands) {
                 Text::new("Sudoku au village"),
                 TextFont {
                     font_size: 38.0,
+                    font: font.clone(),
                     ..default()
                 },
                 TextColor(COL_TITLE),
@@ -286,6 +288,7 @@ fn setup(mut commands: Commands) {
                 Text::new("~ une promenade chiffrée ~"),
                 TextFont {
                     font_size: 15.0,
+                    font: font.clone(),
                     ..default()
                 },
                 TextColor(COL_SUBTITLE),
@@ -347,6 +350,7 @@ fn setup(mut commands: Commands) {
                                                     Text::new(""),
                                                     TextFont {
                                                         font_size: 30.0,
+                                                        font: font.clone(),
                                                         ..default()
                                                     },
                                                     TextColor(COL_TEXT_USER),
@@ -392,6 +396,7 @@ fn setup(mut commands: Commands) {
                             Text::new(n.to_string()),
                             TextFont {
                                 font_size: 24.0,
+                                font: font.clone(),
                                 ..default()
                             },
                             TextColor(COL_TEXT_GIVEN),
@@ -423,6 +428,7 @@ fn setup(mut commands: Commands) {
                         Text::new("efface"),
                         TextFont {
                             font_size: 16.0,
+                            font: font.clone(),
                             ..default()
                         },
                         TextColor(COL_WHITE),
@@ -454,6 +460,7 @@ fn setup(mut commands: Commands) {
                     Text::new("nouvelle partie"),
                     TextFont {
                         font_size: 18.0,
+                        font: font.clone(),
                         ..default()
                     },
                     TextColor(COL_WHITE),
@@ -479,6 +486,7 @@ fn setup(mut commands: Commands) {
                     Text::new("Le jardin est en paix ~ bravo !"),
                     TextFont {
                         font_size: 20.0,
+                        font: font.clone(),
                         ..default()
                     },
                     TextColor(COL_WHITE),
