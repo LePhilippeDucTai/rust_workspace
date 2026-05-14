@@ -1,0 +1,25 @@
+{
+  "raccoon_dialogues": [
+    { "level": 1, "friendship_min": 0, "context": "on_game_start", "text": "Qq... qui... qui t'es ? Tu veux m'apprendre ?" },
+    { "level": 1, "friendship_min": 0, "context": "on_question", "text": "Hein ? C'est quoi ce mot ?" },
+    { "level": 1, "friendship_min": 0, "context": "on_correct_answer", "text": "Ah ! D'a-d'accord. Mer... merci !" },
+    { "level": 1, "friendship_min": 0, "context": "on_wrong_answer", "text": "Hmm... non, ce n'est pas ça..." },
+    { "level": 1, "friendship_min": 30, "context": "on_correct_answer", "text": "Yes ! T'es super !" },
+
+    { "level": 5, "friendship_min": 0, "context": "on_question", "text": "Tu peux m'expliquer ce mot ?" },
+    { "level": 5, "friendship_min": 0, "context": "on_correct_answer", "text": "Génial ! Maintenant je comprends !" },
+    { "level": 5, "friendship_min": 30, "context": "on_correct_answer", "text": "Excellente réponse ! Tu es vraiment une bonne prof !" },
+    { "level": 5, "friendship_min": 0, "context": "on_wrong_answer", "text": "Bof, je ne crois pas. Fais des recherches !" },
+
+    { "level": 10, "friendship_min": 0, "context": "on_question", "text": "Tiens, un mot bizarre. Tu sais ce que c'est ?" },
+    { "level": 10, "friendship_min": 0, "context": "on_correct_answer", "text": "Mmh, c'est intéressant ! Je vais m'en souvenir." },
+    { "level": 10, "friendship_min": 0, "context": "on_wrong_answer", "text": "Pourquoi les humains disent ça comme ça ?" },
+
+    { "level": 15, "friendship_min": 0, "context": "on_question", "text": "Encore un signal cosmique. Tu le connais ?" },
+    { "level": 15, "friendship_min": 0, "context": "on_correct_answer", "text": "Je vois ! C'est comme un concept abstrait !" },
+    { "level": 15, "friendship_min": 50, "context": "on_correct_answer", "text": "Tu m'apprends tellement de choses. Merci d'être là." },
+
+    { "level": 20, "friendship_min": 0, "context": "on_game_start", "text": "Salut ! J'ai hâte d'apprendre d'autres choses avec toi !" },
+    { "level": 20, "friendship_min": 0, "context": "on_correct_answer", "text": "Magnifique ! Je peux maintenant utiliser ce mot moi-même." }
+  ]
+}

@@ -1,0 +1,94 @@
+{
+  "qcm_choices": [
+    {
+      "word_id": "sillage_l1",
+      "correct_answer": "Trace visible que laisse quelque chose en se déplaçant.",
+      "wrong_answers": [
+        "Un type de voile pour les bateaux.",
+        "Le bruit que fait un bateau qui se déplace.",
+        "Un type de poisson rare."
+      ]
+    },
+    {
+      "word_id": "concept_l1",
+      "correct_answer": "Idée générale ou principe sur un sujet.",
+      "wrong_answers": [
+        "Un objet décoratif pour la maison.",
+        "Un instrument de musique ancien.",
+        "Une recette de cuisine compliquée."
+      ]
+    },
+    {
+      "word_id": "amour_l1",
+      "correct_answer": "Sentiment profond d'affection.",
+      "wrong_answers": [
+        "Un mot pour dire bonjour.",
+        "Une sorte de fruit exotique.",
+        "Un genre de danse traditionnelle."
+      ]
+    },
+    {
+      "word_id": "tristesse_l1",
+      "correct_answer": "État de chagrin et de peine.",
+      "wrong_answers": [
+        "Sentiment de joie intense.",
+        "Une fête entre amis.",
+        "Un moment de surprise."
+      ]
+    },
+    {
+      "word_id": "solidaire_l2",
+      "correct_answer": "Qui aide les autres et partage leurs difficultés.",
+      "wrong_answers": [
+        "Qui est tout seul.",
+        "Qui parle beaucoup.",
+        "Qui est très fort en sport."
+      ]
+    },
+    {
+      "word_id": "nuance_l3",
+      "correct_answer": "Petite différence subtile entre deux choses.",
+      "wrong_answers": [
+        "Une grosse erreur de calcul.",
+        "Un grand changement dans l'histoire.",
+        "Une explosion soudaine."
+      ]
+    },
+    {
+      "word_id": "miser_l4",
+      "correct_answer": "Parier ou compter sur quelque chose.",
+      "wrong_answers": [
+        "Cacher quelque chose dans une boîte.",
+        "Mélanger des couleurs ensemble.",
+        "Sentir un parfum agréable."
+      ]
+    },
+    {
+      "word_id": "perseverance_l5",
+      "correct_answer": "Continuer un effort malgré les difficultés.",
+      "wrong_answers": [
+        "Abandonner rapidement quand c'est dur.",
+        "Crier très fort pour gagner.",
+        "Demander de l'aide à quelqu'un."
+      ]
+    },
+    {
+      "word_id": "probabilite_l6",
+      "correct_answer": "Chance qu'un événement se produise.",
+      "wrong_answers": [
+        "Certitude qu'un événement va arriver.",
+        "Calcul du poids d'un objet.",
+        "Mesure de la taille d'une pièce."
+      ]
+    },
+    {
+      "word_id": "energie_l11",
+      "correct_answer": "Capacité à produire un travail ou à faire bouger les choses.",
+      "wrong_answers": [
+        "Une couleur très brillante.",
+        "Un type de matériau lourd.",
+        "Un instrument scientifique."
+      ]
+    }
+  ]
+}

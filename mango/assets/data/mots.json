@@ -1,0 +1,104 @@
+{
+  "words": [
+    {
+      "id": "sillage_l1",
+      "word": "Sillage",
+      "level_unlock": 1,
+      "theme": "VOCABULARY",
+      "difficulty": 1,
+      "definition": "Trace visible que laisse quelque chose derrière soi quand il se déplace.",
+      "sentence_context": "Le bateau laisse un sillage dans l'eau.",
+      "learning_tip": "Pense à l'eau qui s'agite derrière un bateau."
+    },
+    {
+      "id": "concept_l1",
+      "word": "Concept",
+      "level_unlock": 1,
+      "theme": "VOCABULARY",
+      "difficulty": 1,
+      "definition": "Idée générale ou principe fondamental sur un sujet.",
+      "sentence_context": "Le concept de l'amitié est important.",
+      "learning_tip": "C'est l'idée centrale derrière quelque chose."
+    },
+    {
+      "id": "amour_l1",
+      "word": "Amour",
+      "level_unlock": 1,
+      "theme": "VOCABULARY",
+      "difficulty": 1,
+      "definition": "Sentiment profond d'affection envers quelqu'un ou quelque chose.",
+      "sentence_context": "L'amour d'une famille est précieux.",
+      "learning_tip": "C'est ce que tu ressens pour ceux qui comptent pour toi."
+    },
+    {
+      "id": "tristesse_l1",
+      "word": "Tristesse",
+      "level_unlock": 1,
+      "theme": "VOCABULARY",
+      "difficulty": 1,
+      "definition": "État de chagrin, de peine ou de mélancolie.",
+      "sentence_context": "Il a ressenti une grande tristesse en perdant son jouet.",
+      "learning_tip": "C'est l'opposé de la joie."
+    },
+    {
+      "id": "solidaire_l2",
+      "word": "Solidaire",
+      "level_unlock": 2,
+      "theme": "VOCABULARY",
+      "difficulty": 2,
+      "definition": "Qui aide les autres et partage leurs difficultés.",
+      "sentence_context": "Être solidaire avec ses amis, c'est important.",
+      "learning_tip": "Comme une équipe qui se soutient."
+    },
+    {
+      "id": "nuance_l3",
+      "word": "Nuance",
+      "level_unlock": 3,
+      "theme": "VOCABULARY",
+      "difficulty": 3,
+      "definition": "Petite différence subtile entre deux choses proches.",
+      "sentence_context": "Il y a une nuance entre 'aimer' et 'apprécier'.",
+      "learning_tip": "Une toute petite différence parfois difficile à voir."
+    },
+    {
+      "id": "miser_l4",
+      "word": "Miser",
+      "level_unlock": 4,
+      "theme": "VOCABULARY",
+      "difficulty": 3,
+      "definition": "Parier ou compter sur quelque chose pour réussir.",
+      "sentence_context": "Je mise sur ton courage pour réussir.",
+      "learning_tip": "C'est faire confiance, parier sur quelque chose."
+    },
+    {
+      "id": "perseverance_l5",
+      "word": "Persévérance",
+      "level_unlock": 5,
+      "theme": "VOCABULARY",
+      "difficulty": 3,
+      "definition": "Qualité de continuer un effort malgré les difficultés.",
+      "sentence_context": "Sa persévérance lui a permis de réussir.",
+      "learning_tip": "Ne jamais abandonner, même quand c'est dur."
+    },
+    {
+      "id": "probabilite_l6",
+      "word": "Probabilité",
+      "level_unlock": 6,
+      "theme": "MATHEMATICS",
+      "difficulty": 3,
+      "definition": "Chance qu'un événement se produise.",
+      "sentence_context": "La probabilité d'obtenir un 6 au dé est 1 sur 6.",
+      "learning_tip": "C'est la chance que quelque chose arrive."
+    },
+    {
+      "id": "energie_l11",
+      "word": "Énergie",
+      "level_unlock": 11,
+      "theme": "SCIENCES",
+      "difficulty": 4,
+      "definition": "Capacité d'un corps ou d'un système à produire un travail.",
+      "sentence_context": "Le soleil fournit de l'énergie aux plantes.",
+      "learning_tip": "C'est ce qui fait bouger les choses."
+    }
+  ]
+}

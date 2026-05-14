@@ -1,0 +1,9 @@
+{
+  "themes": [
+    { "id": "VOCABULARY", "name": "Vocabulaire", "unlock_level": 1, "color_hex": "#FF6B6B" },
+    { "id": "MATHEMATICS", "name": "Mathématiques", "unlock_level": 6, "color_hex": "#4ECDC4" },
+    { "id": "SCIENCES", "name": "Sciences", "unlock_level": 11, "color_hex": "#45B7D1" },
+    { "id": "HISTORY", "name": "Histoire & Géographie", "unlock_level": 16, "color_hex": "#96CEB4" },
+    { "id": "CULTURE", "name": "Culture Générale", "unlock_level": 16, "color_hex": "#FFEAA7" }
+  ]
+}
