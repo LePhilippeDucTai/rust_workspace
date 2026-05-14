@@ -1,6 +1,5 @@
 use bevy::prelude::*;
 
-use crate::raccoon::emotion_color;
 use crate::types::*;
 
 pub const WINDOW_WIDTH: f32 = 1280.0;
@@ -9,6 +8,9 @@ pub const WINDOW_HEIGHT: f32 = 800.0;
 const PANEL_BG: Color = Color::srgba(0.05, 0.07, 0.12, 0.85);
 const ACCENT: Color = Color::srgb(0.95, 0.78, 0.35);
 const TEXT_LIGHT: Color = Color::srgb(0.98, 0.97, 0.95);
+const QCM_BUTTON_BG: Color = Color::srgba(0.12, 0.15, 0.22, 0.92);
+const QCM_BUTTON_HOVER: Color = Color::srgba(0.22, 0.27, 0.38, 0.95);
+const QCM_BUTTON_PRESSED: Color = Color::srgba(0.32, 0.38, 0.50, 0.95);
 
 #[derive(Component)]
 pub struct QcmButtonsRoot;
@@ -254,12 +256,6 @@ pub fn rebuild_qcm_buttons(
 
     commands.entity(container).despawn_related::<Children>();
 
-    let colors = [
-        Color::srgb(0.36, 0.55, 0.95),
-        Color::srgb(0.36, 0.78, 0.66),
-        Color::srgb(0.95, 0.55, 0.62),
-        Color::srgb(0.95, 0.7, 0.36),
-    ];
     commands.entity(container).with_children(|c| {
         for (i, option) in question.options.iter().enumerate() {
             c.spawn((
@@ -269,9 +265,11 @@ pub fn rebuild_qcm_buttons(
                     justify_content: JustifyContent::Center,
                     align_items: AlignItems::Center,
                     border_radius: BorderRadius::all(Val::Px(12.0)),
+                    border: UiRect::all(Val::Px(2.0)),
                     ..default()
                 },
-                BackgroundColor(colors[i % 4]),
+                BackgroundColor(QCM_BUTTON_BG),
+                BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.25)),
                 QcmButton { index: i },
             ))
             .with_children(|b| {
@@ -328,21 +326,17 @@ pub fn button_interaction_system(
     for (interaction, button, mut bg) in &mut interactions {
         match *interaction {
             Interaction::Pressed => {
-                bg.0 = Color::srgb(1.0, 1.0, 1.0);
+                bg.0 = QCM_BUTTON_PRESSED;
                 events.write(AnswerSelected {
                     button_index: button.index,
                 });
             }
             Interaction::Hovered => {
-                let c = bg.0.to_srgba();
-                bg.0 = Color::srgba(
-                    (c.red + 0.08).min(1.0),
-                    (c.green + 0.08).min(1.0),
-                    (c.blue + 0.08).min(1.0),
-                    c.alpha,
-                );
+                bg.0 = QCM_BUTTON_HOVER;
             }
-            Interaction::None => {}
+            Interaction::None => {
+                bg.0 = QCM_BUTTON_BG;
+            }
         }
     }
 }
@@ -375,16 +369,12 @@ pub fn update_hud(
 pub fn update_dialogue(
     raccoon_q: Query<&RaccoonState, Changed<RaccoonState>>,
     mut text_q: Query<&mut Text, With<DialogueBubble>>,
-    mut sprite_q: Query<&mut Sprite, With<RaccoonSprite>>,
 ) {
     let Ok(raccoon) = raccoon_q.single() else {
         return;
     };
     if let Ok(mut text) = text_q.single_mut() {
         **text = raccoon.current_dialogue.clone();
-    }
-    if let Ok(mut sprite) = sprite_q.single_mut() {
-        sprite.color = emotion_color(raccoon.emotion);
     }
 }
 

@@ -1,0 +1,37 @@
+{
+  "player": {
+    "current_level": 1,
+    "total_xp": 30,
+    "friendship_points": 7,
+    "total_words_learned": 3
+  },
+  "answered_questions": [
+    {
+      "word_id": "sillage_l1",
+      "answered_at": "2026-05-14T22:30:10.730464Z",
+      "was_correct": true,
+      "cooldown_until": null
+    },
+    {
+      "word_id": "concept_l1",
+      "answered_at": "2026-05-14T22:30:25.313511Z",
+      "was_correct": false,
+      "cooldown_until": "2026-05-17T22:30:25.313511Z"
+    },
+    {
+      "word_id": "amour_l1",
+      "answered_at": "2026-05-14T22:30:40.920761Z",
+      "was_correct": true,
+      "cooldown_until": null
+    },
+    {
+      "word_id": "tristesse_l1",
+      "answered_at": "2026-05-14T22:30:51.704169Z",
+      "was_correct": true,
+      "cooldown_until": null
+    }
+  ],
+  "unlocked_themes": [
+    "VOCABULARY"
+  ]
+}
