@@ -1,5 +1,5 @@
-//! Physique : gravité, intégration, collisions particule-piquet,
-//! particule-mur, particule-cloison, particule-particule (grille spatiale).
+//! Physique : gravité, intégration, collisions (piquets, murs, cloisons,
+//! particule-particule). Grille spatiale pour les collisions P↔P.
 
 use bevy::prelude::*;
 
@@ -18,8 +18,6 @@ impl Plugin for PhysicsPlugin {
     }
 }
 
-/// Un seul système : on fait `PHYSICS_SUBSTEPS` sous-pas pour stabiliser les
-/// piles denses dans les bacs (sinon les particules s'enfoncent dans le sol).
 fn step_physics(
     time: Res<Time<Fixed>>,
     dims: Res<BoardDims>,
@@ -28,331 +26,202 @@ fn step_physics(
     walls: Query<&Wall>,
     dividers: Query<&Divider>,
 ) {
-    let dt_total = time.delta_secs();
-    let n = PHYSICS_SUBSTEPS as f32;
-    let dt = dt_total / n;
+    let dt = time.delta_secs() / PHYSICS_SUBSTEPS as f32;
     let damping = (-LINEAR_DAMPING_PER_SEC * dt).exp();
-
-    // Pré-extraction des piquets en buffers compacts (lecture seule).
-    let peg_data: Vec<(Vec2, f32)> = pegs
-        .iter()
-        .map(|(t, p)| (t.translation.truncate(), p.radius))
-        .collect();
+    let peg_data: Vec<(Vec2, f32)> = pegs.iter().map(|(t, p)| (t.translation.truncate(), p.radius)).collect();
     let walls_vec: Vec<Wall> = walls.iter().cloned().collect();
     let dividers_vec: Vec<Divider> = dividers.iter().cloned().collect();
+    let (mut pos, mut vel, mut rad) = extract_soa(&particles);
+    for _ in 0..PHYSICS_SUBSTEPS {
+        run_substep(&mut pos, &mut vel, &rad, dt, damping, &peg_data, &dividers_vec, &walls_vec, &dims);
+    }
+    writeback_soa(&mut particles, &pos, &vel);
+}
 
-    // SoA pour les particules : on copie une fois, on travaille sur ces
-    // buffers pendant tous les sous-pas, on réécrit à la fin via l'ordre
-    // stable de la même Query.
-    let count = particles.iter().count();
-    let mut positions: Vec<Vec2> = Vec::with_capacity(count);
-    let mut velocities: Vec<Vec2> = Vec::with_capacity(count);
-    let mut radii: Vec<f32> = Vec::with_capacity(count);
+fn extract_soa(particles: &Query<(&mut Transform, &mut Velocity, &Particle)>) -> (Vec<Vec2>, Vec<Vec2>, Vec<f32>) {
+    let mut pos = Vec::new();
+    let mut vel = Vec::new();
+    let mut rad = Vec::new();
     for (t, v, p) in particles.iter() {
-        positions.push(t.translation.truncate());
-        velocities.push(v.0);
-        radii.push(p.radius);
+        pos.push(t.translation.truncate());
+        vel.push(v.0);
+        rad.push(p.radius);
     }
+    (pos, vel, rad)
+}
 
-    for _substep in 0..PHYSICS_SUBSTEPS {
-        // Gravité + intégration + damping.
-        for i in 0..positions.len() {
-            velocities[i].y -= GRAVITY * dt;
-            velocities[i] *= damping;
-            positions[i] += velocities[i] * dt;
-        }
-        // Collisions particule ↔ piquet.
-        resolve_pegs(&mut positions, &mut velocities, &radii, &peg_data);
-        // Collisions particule ↔ cloison.
-        resolve_dividers(&mut positions, &mut velocities, &radii, &dividers_vec);
-        // Collisions particule ↔ mur (et sol).
-        resolve_walls(&mut positions, &mut velocities, &radii, &walls_vec);
-        // Bornes globales (sécurité contre la fuite hors fenêtre).
-        clamp_world(&mut positions, &mut velocities, &radii, &dims);
-        // Collisions particule ↔ particule.
-        resolve_particles(&mut positions, &mut velocities, &radii);
-    }
-
-    // Réécriture vers l'ECS dans l'ordre de la query (stable).
-    for (i, (mut t, mut v, _)) in (&mut particles).into_iter().enumerate() {
-        if i >= positions.len() {
-            break;
-        }
-        t.translation.x = positions[i].x;
-        t.translation.y = positions[i].y;
-        v.0 = velocities[i];
+fn writeback_soa(particles: &mut Query<(&mut Transform, &mut Velocity, &Particle)>, pos: &[Vec2], vel: &[Vec2]) {
+    for (i, (mut t, mut v, _)) in particles.iter_mut().enumerate() {
+        if i >= pos.len() { break; }
+        t.translation.x = pos[i].x;
+        t.translation.y = pos[i].y;
+        v.0 = vel[i];
     }
 }
 
-fn resolve_pegs(
-    positions: &mut [Vec2],
-    velocities: &mut [Vec2],
-    radii: &[f32],
-    pegs: &[(Vec2, f32)],
+fn run_substep(
+    pos: &mut [Vec2], vel: &mut [Vec2], rad: &[f32],
+    dt: f32, damping: f32,
+    pegs: &[(Vec2, f32)], dividers: &[Divider], walls: &[Wall], dims: &BoardDims,
 ) {
-    for i in 0..positions.len() {
-        let r_p = radii[i];
-        for &(peg_pos, peg_r) in pegs.iter() {
-            let delta = positions[i] - peg_pos;
-            let min_d = r_p + peg_r;
-            if delta.x.abs() > min_d || delta.y.abs() > min_d {
-                continue;
-            }
-            let dist_sq = delta.length_squared();
-            if dist_sq >= min_d * min_d {
-                continue;
-            }
-            let mut normal = if dist_sq < 1e-8 {
-                // Particule pile sur le centre du piquet : pousse vers le haut.
-                Vec2::new(0.0, 1.0)
-            } else {
-                delta / dist_sq.sqrt()
-            };
-            // Petit aléa pour briser les équilibres précaires au sommet du piquet.
-            if normal.y > 0.985 {
-                let seed = (positions[i].x * 91.0 + positions[i].y * 17.0).sin();
-                normal.x += seed * PEG_JITTER;
-                normal = normal.normalize();
-            }
-            positions[i] = peg_pos + normal * (min_d + 1e-4);
-            let v = velocities[i];
-            let vn = v.dot(normal);
-            if vn < 0.0 {
-                velocities[i] = v - normal * ((1.0 + PEG_RESTITUTION) * vn);
-            }
+    integrate(pos, vel, dt, damping);
+    resolve_pegs(pos, vel, rad, pegs);
+    resolve_dividers(pos, vel, rad, dividers);
+    resolve_walls(pos, vel, rad, walls);
+    clamp_world(pos, vel, rad, dims);
+    resolve_particles(pos, vel, rad);
+}
+
+fn integrate(pos: &mut [Vec2], vel: &mut [Vec2], dt: f32, damping: f32) {
+    for i in 0..pos.len() {
+        vel[i].y -= GRAVITY * dt;
+        vel[i] *= damping;
+        pos[i] += vel[i] * dt;
+    }
+}
+
+// ────────────────────────────── Piquets ──────────────────────────────────────
+
+fn peg_normal(delta: Vec2, dist_sq: f32, pos: Vec2) -> Vec2 {
+    if dist_sq < 1e-8 { return Vec2::Y; }
+    let mut n = delta / dist_sq.sqrt();
+    if n.y > 0.985 {
+        let seed = (pos.x * 91.0 + pos.y * 17.0).sin();
+        n.x += seed * PEG_JITTER;
+        n = n.normalize();
+    }
+    n
+}
+
+fn resolve_peg_for_particle(i: usize, peg_pos: Vec2, peg_r: f32, pos: &mut [Vec2], vel: &mut [Vec2], r_p: f32) {
+    let delta = pos[i] - peg_pos;
+    let min_d = r_p + peg_r;
+    if delta.x.abs() > min_d || delta.y.abs() > min_d { return; }
+    let dist_sq = delta.length_squared();
+    if dist_sq >= min_d * min_d { return; }
+    let normal = peg_normal(delta, dist_sq, pos[i]);
+    pos[i] = peg_pos + normal * (min_d + 1e-4);
+    let vn = vel[i].dot(normal);
+    if vn < 0.0 { vel[i] -= normal * ((1.0 + PEG_RESTITUTION) * vn); }
+}
+
+fn resolve_pegs(pos: &mut [Vec2], vel: &mut [Vec2], rad: &[f32], pegs: &[(Vec2, f32)]) {
+    for i in 0..pos.len() {
+        for &(peg_pos, peg_r) in pegs {
+            resolve_peg_for_particle(i, peg_pos, peg_r, pos, vel, rad[i]);
         }
     }
 }
 
-fn resolve_dividers(
-    positions: &mut [Vec2],
-    velocities: &mut [Vec2],
-    radii: &[f32],
-    dividers: &[Divider],
-) {
-    for i in 0..positions.len() {
-        let r = radii[i];
+// ────────────────────────── Rectangles (murs & cloisons) ─────────────────────
+
+fn rect_normal(dx: f32, dy: f32, hw: f32, hh: f32, to_x: f32, to_y: f32, dist_sq: f32, r: f32) -> (Vec2, f32) {
+    if dist_sq > 1e-8 {
+        let dist = dist_sq.sqrt();
+        return (Vec2::new(to_x / dist, to_y / dist), r - dist);
+    }
+    let (px, py) = (hw - dx.abs(), hh - dy.abs());
+    if px < py { (Vec2::new(dx.signum(), 0.0), px + r) }
+    else { (Vec2::new(0.0, dy.signum()), py + r) }
+}
+
+fn resolve_rect_particle(i: usize, cx: f32, cy: f32, hw: f32, hh: f32, r: f32, pos: &mut [Vec2], vel: &mut [Vec2], rest: f32) {
+    let (dx, dy) = (pos[i].x - cx, pos[i].y - cy);
+    let (to_x, to_y) = (dx - dx.clamp(-hw, hw), dy - dy.clamp(-hh, hh));
+    let dist_sq = to_x * to_x + to_y * to_y;
+    if dist_sq >= r * r { return; }
+    let (normal, overlap) = rect_normal(dx, dy, hw, hh, to_x, to_y, dist_sq, r);
+    pos[i] += normal * (overlap + 1e-4);
+    let vn = vel[i].dot(normal);
+    if vn < 0.0 { vel[i] -= normal * ((1.0 + rest) * vn); }
+}
+
+fn resolve_dividers(pos: &mut [Vec2], vel: &mut [Vec2], rad: &[f32], dividers: &[Divider]) {
+    for i in 0..pos.len() {
         for d in dividers {
-            // Test contre le rectangle [x±DIVIDER_HALF_WIDTH] × [y_min, y_max].
-            let p = positions[i];
-            let dx = p.x - d.x;
-            let cy = (d.y_min + d.y_max) * 0.5;
-            let half_h = (d.y_max - d.y_min) * 0.5;
-            let dy = p.y - cy;
-            // Point du rectangle le plus proche de la particule.
-            let closest_x = dx.clamp(-DIVIDER_HALF_WIDTH, DIVIDER_HALF_WIDTH);
-            let closest_y = dy.clamp(-half_h, half_h);
-            let to_x = dx - closest_x;
-            let to_y = dy - closest_y;
-            let dist_sq = to_x * to_x + to_y * to_y;
-            if dist_sq >= r * r {
-                continue;
-            }
-            let (normal, overlap) = if dist_sq > 1e-8 {
-                let dist = dist_sq.sqrt();
-                (Vec2::new(to_x / dist, to_y / dist), r - dist)
-            } else {
-                let px = DIVIDER_HALF_WIDTH - dx.abs();
-                let py = half_h - dy.abs();
-                if px < py {
-                    let sx = if dx >= 0.0 { 1.0 } else { -1.0 };
-                    (Vec2::new(sx, 0.0), px + r)
-                } else {
-                    let sy = if dy >= 0.0 { 1.0 } else { -1.0 };
-                    (Vec2::new(0.0, sy), py + r)
-                }
-            };
-            positions[i].x += normal.x * (overlap + 1e-4);
-            positions[i].y += normal.y * (overlap + 1e-4);
-            let v = velocities[i];
-            let vn = v.dot(normal);
-            if vn < 0.0 {
-                velocities[i] = v - normal * ((1.0 + DIVIDER_RESTITUTION) * vn);
-            }
+            let (cy, hh) = ((d.y_min + d.y_max) * 0.5, (d.y_max - d.y_min) * 0.5);
+            resolve_rect_particle(i, d.x, cy, DIVIDER_HALF_WIDTH, hh, rad[i], pos, vel, DIVIDER_RESTITUTION);
         }
     }
 }
 
-fn resolve_walls(
-    positions: &mut [Vec2],
-    velocities: &mut [Vec2],
-    radii: &[f32],
-    walls: &[Wall],
-) {
-    for i in 0..positions.len() {
-        let r = radii[i];
+fn resolve_walls(pos: &mut [Vec2], vel: &mut [Vec2], rad: &[f32], walls: &[Wall]) {
+    for i in 0..pos.len() {
         for w in walls {
-            let p = positions[i];
-            let dx = p.x - w.center.x;
-            let dy = p.y - w.center.y;
-            let closest_x = dx.clamp(-w.half_extents.x, w.half_extents.x);
-            let closest_y = dy.clamp(-w.half_extents.y, w.half_extents.y);
-            let to_x = dx - closest_x;
-            let to_y = dy - closest_y;
-            let dist_sq = to_x * to_x + to_y * to_y;
-            if dist_sq >= r * r {
-                continue;
-            }
-            let (normal, overlap) = if dist_sq > 1e-8 {
-                let dist = dist_sq.sqrt();
-                (Vec2::new(to_x / dist, to_y / dist), r - dist)
-            } else {
-                let px = w.half_extents.x - dx.abs();
-                let py = w.half_extents.y - dy.abs();
-                if px < py {
-                    let sx = if dx >= 0.0 { 1.0 } else { -1.0 };
-                    (Vec2::new(sx, 0.0), w.half_extents.x + r - dx.abs())
-                } else {
-                    let sy = if dy >= 0.0 { 1.0 } else { -1.0 };
-                    (Vec2::new(0.0, sy), w.half_extents.y + r - dy.abs())
-                }
-            };
-            positions[i].x += normal.x * (overlap + 1e-4);
-            positions[i].y += normal.y * (overlap + 1e-4);
-            let v = velocities[i];
-            let vn = v.dot(normal);
-            if vn < 0.0 {
-                velocities[i] = v - normal * ((1.0 + w.restitution) * vn);
-            }
+            resolve_rect_particle(i, w.center.x, w.center.y, w.half_extents.x, w.half_extents.y, rad[i], pos, vel, w.restitution);
         }
     }
 }
 
-/// Empêche les particules de sortir de la fenêtre (sécurité au cas où le sol
-/// ou les murs auraient laissé filer).
-fn clamp_world(
-    positions: &mut [Vec2],
-    velocities: &mut [Vec2],
-    radii: &[f32],
-    _dims: &BoardDims,
-) {
-    let half_w = HALF_WIDTH;
-    let half_h = HALF_HEIGHT;
-    for i in 0..positions.len() {
-        let r = radii[i];
-        if positions[i].x < -half_w + r {
-            positions[i].x = -half_w + r;
-            if velocities[i].x < 0.0 {
-                velocities[i].x = -velocities[i].x * 0.2;
-            }
-        } else if positions[i].x > half_w - r {
-            positions[i].x = half_w - r;
-            if velocities[i].x > 0.0 {
-                velocities[i].x = -velocities[i].x * 0.2;
-            }
-        }
-        if positions[i].y < -half_h + r {
-            positions[i].y = -half_h + r;
-            if velocities[i].y < 0.0 {
-                velocities[i].y = -velocities[i].y * 0.2;
-            }
-        } else if positions[i].y > half_h - r {
-            positions[i].y = half_h - r;
-            if velocities[i].y > 0.0 {
-                velocities[i].y = -velocities[i].y * 0.2;
-            }
-        }
+// ────────────────────────────── Clampage ─────────────────────────────────────
+
+fn clamp_axis(p: &mut f32, v: &mut f32, lo: f32, hi: f32) {
+    if *p < lo { *p = lo; if *v < 0.0 { *v = -*v * 0.2; } }
+    else if *p > hi { *p = hi; if *v > 0.0 { *v = -*v * 0.2; } }
+}
+
+fn clamp_world(pos: &mut [Vec2], vel: &mut [Vec2], rad: &[f32], _dims: &BoardDims) {
+    for i in 0..pos.len() {
+        clamp_axis(&mut pos[i].x, &mut vel[i].x, -HALF_WIDTH + rad[i], HALF_WIDTH - rad[i]);
+        clamp_axis(&mut pos[i].y, &mut vel[i].y, -HALF_HEIGHT + rad[i], HALF_HEIGHT - rad[i]);
     }
 }
 
-// ───────────────── Particule ↔ Particule via grille spatiale ─────────────────
+// ──────────────────── Particule ↔ Particule (grille spatiale) ────────────────
 
-fn resolve_particles(positions: &mut [Vec2], velocities: &mut [Vec2], radii: &[f32]) {
-    let n = positions.len();
-    if n < 2 {
-        return;
+fn to_cell(p: Vec2, cols: i32, rows: i32, inv_cell: f32) -> usize {
+    let cx = ((p.x + HALF_WIDTH) * inv_cell) as i32;
+    let cy = ((p.y + HALF_HEIGHT) * inv_cell) as i32;
+    (cx.clamp(0, cols - 1) + cy.clamp(0, rows - 1) * cols) as usize
+}
+
+fn build_grid(pos: &[Vec2], cols: i32, rows: i32, inv_cell: f32) -> Vec<Vec<u32>> {
+    let mut grid = vec![Vec::new(); (cols * rows) as usize];
+    for (i, &p) in pos.iter().enumerate() {
+        grid[to_cell(p, cols, rows, inv_cell)].push(i as u32);
     }
-    // Taille de cellule = ~2 × rayon max (suffit pour ne tester que les voisins
-    // immédiats).
-    let mut max_r: f32 = 0.0;
-    for &r in radii {
-        if r > max_r {
-            max_r = r;
-        }
+    grid
+}
+
+fn process_cell(pos: &mut [Vec2], vel: &mut [Vec2], rad: &[f32], grid: &[Vec<u32>], idx: usize, cx: i32, cy: i32, cols: i32, rows: i32) {
+    let cell = grid[idx].clone();
+    for a in 0..cell.len() {
+        for b in (a + 1)..cell.len() { resolve_pair(cell[a] as usize, cell[b] as usize, pos, vel, rad); }
     }
+    for &(dx, dy) in &[(1i32, -1i32), (1, 0), (1, 1), (0, 1)] {
+        let (nx, ny) = (cx + dx, cy + dy);
+        if nx < 0 || ny < 0 || nx >= cols || ny >= rows { continue; }
+        let nidx = (nx + ny * cols) as usize;
+        for &i in &cell { for &j in &grid[nidx] { resolve_pair(i as usize, j as usize, pos, vel, rad); } }
+    }
+}
+
+fn resolve_particles(pos: &mut [Vec2], vel: &mut [Vec2], rad: &[f32]) {
+    if pos.len() < 2 { return; }
+    let max_r = rad.iter().cloned().fold(0.0f32, f32::max);
     let cell = (max_r * 2.0 + 1.0).max(8.0);
-    let inv_cell = 1.0 / cell;
-    let cols = ((HALF_WIDTH * 2.0) * inv_cell).ceil() as i32 + 2;
-    let rows = ((HALF_HEIGHT * 2.0) * inv_cell).ceil() as i32 + 2;
-    let total_cells = (cols * rows) as usize;
-
-    let to_cell = |p: Vec2| -> (i32, i32) {
-        let cx = ((p.x + HALF_WIDTH) * inv_cell) as i32;
-        let cy = ((p.y + HALF_HEIGHT) * inv_cell) as i32;
-        (cx.clamp(0, cols - 1), cy.clamp(0, rows - 1))
-    };
-
-    let mut grid: Vec<Vec<u32>> = vec![Vec::new(); total_cells];
-    for i in 0..n {
-        let (cx, cy) = to_cell(positions[i]);
+    let inv = 1.0 / cell;
+    let (cols, rows) = (((HALF_WIDTH * 2.0) * inv).ceil() as i32 + 2, ((HALF_HEIGHT * 2.0) * inv).ceil() as i32 + 2);
+    let grid = build_grid(pos, cols, rows, inv);
+    for cy in 0..rows { for cx in 0..cols {
         let idx = (cx + cy * cols) as usize;
-        grid[idx].push(i as u32);
-    }
-
-    // Pour chaque cellule, tester paires intra-cellule + voisins (dx>=0,
-    // dy in -1..=1 sauf dx=0&dy<0) pour éviter de traiter chaque paire deux fois.
-    for cy in 0..rows {
-        for cx in 0..cols {
-            let cell_idx = (cx + cy * cols) as usize;
-            let cell = grid[cell_idx].clone();
-            if cell.is_empty() {
-                continue;
-            }
-            // Paires intra-cellule.
-            for a in 0..cell.len() {
-                for b in (a + 1)..cell.len() {
-                    resolve_pair(cell[a] as usize, cell[b] as usize, positions, velocities, radii);
-                }
-            }
-            // Voisins : (dx, dy) avec dx+dy*cols > 0 par ordre lexical (+1,-1),(+1,0),(+1,+1),(0,+1).
-            for &(dx, dy) in &[(1, -1), (1, 0), (1, 1), (0, 1)] {
-                let nx = cx + dx;
-                let ny = cy + dy;
-                if nx < 0 || ny < 0 || nx >= cols || ny >= rows {
-                    continue;
-                }
-                let n_idx = (nx + ny * cols) as usize;
-                let neighbor = &grid[n_idx];
-                for &i in &cell {
-                    for &j in neighbor {
-                        resolve_pair(i as usize, j as usize, positions, velocities, radii);
-                    }
-                }
-            }
-        }
-    }
+        if !grid[idx].is_empty() { process_cell(pos, vel, rad, &grid, idx, cx, cy, cols, rows); }
+    }}
 }
 
 #[inline]
-fn resolve_pair(
-    i: usize,
-    j: usize,
-    positions: &mut [Vec2],
-    velocities: &mut [Vec2],
-    radii: &[f32],
-) {
-    let pi = positions[i];
-    let pj = positions[j];
-    let delta = pj - pi;
-    let r_sum = radii[i] + radii[j];
+fn resolve_pair(i: usize, j: usize, pos: &mut [Vec2], vel: &mut [Vec2], rad: &[f32]) {
+    let delta = pos[j] - pos[i];
+    let r_sum = rad[i] + rad[j];
     let dist_sq = delta.length_squared();
-    if dist_sq >= r_sum * r_sum || dist_sq < 1e-12 {
-        return;
-    }
+    if dist_sq >= r_sum * r_sum || dist_sq < 1e-12 { return; }
     let dist = dist_sq.sqrt();
-    let normal = delta / dist;
-    let overlap = r_sum - dist;
-    // Masses égales (radii similaires) : on partage la correction par moitié.
-    let half = overlap * 0.5;
-    positions[i] = pi - normal * half;
-    positions[j] = pj + normal * half;
-    let vi = velocities[i];
-    let vj = velocities[j];
-    let rel = vj - vi;
-    let vn = rel.dot(normal);
+    let n = delta / dist;
+    let half = (r_sum - dist) * 0.5;
+    pos[i] -= n * half; pos[j] += n * half;
+    let vn = (vel[j] - vel[i]).dot(n);
     if vn < 0.0 {
-        let impulse = normal * (1.0 + PARTICLE_RESTITUTION) * vn * 0.5;
-        velocities[i] = vi + impulse;
-        velocities[j] = vj - impulse;
+        let imp = n * (1.0 + PARTICLE_RESTITUTION) * vn * 0.5;
+        vel[i] += imp; vel[j] -= imp;
     }
 }

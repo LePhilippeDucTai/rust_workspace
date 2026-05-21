@@ -1,12 +1,7 @@
 //! Comptage des particules par bac + tracé de la densité gaussienne théorique.
 //!
 //! Modèle : marche aléatoire ±d à chaque rangée, d = pas_horizontal / 2.
-//! Position finale ~ N(0, σ²) avec σ = d·√N (N = nombre de rangées).
-//!
-//! Conversion densité → hauteur de pile attendue dans le bac centré sur x :
-//!   h(x) = N_total · π·r² · f(x) / packing_efficiency
-//! où f est la PDF gaussienne. Cela permet de superposer la courbe
-//! directement sur les piles physiques de particules.
+//! σ = d·√N. Hauteur de pile attendue : h(x) = N·πr²·f(x) / packing_efficiency.
 
 use bevy::prelude::*;
 use std::f32::consts::PI;
@@ -30,113 +25,61 @@ fn count_bins(
     particles: Query<&Transform, With<Particle>>,
 ) {
     let nb = config.num_bins();
-    if state.bin_counts.len() != nb {
-        state.bin_counts = vec![0; nb];
-    } else {
-        for c in state.bin_counts.iter_mut() {
-            *c = 0;
-        }
-    }
-    let s = config.peg_spacing_x();
-    let half_n = config.rows as f32 * 0.5;
-    let bin_top = dims.bin_top_y;
+    state.bin_counts = vec![0; nb];
+    let (s, half_n, bin_top) = (config.peg_spacing_x(), config.rows as f32 * 0.5, dims.bin_top_y);
     for tf in &particles {
-        if tf.translation.y > bin_top {
-            continue;
-        }
-        // x_center_i = (i - rows/2) * s  ⇒  i = x/s + rows/2
-        let idx_f = tf.translation.x / s + half_n;
-        // Bac i couvre [(i - 0.5)*s - rows/2*s, (i + 0.5)*s - rows/2*s].
-        let idx = idx_f.round() as i32;
-        if idx >= 0 && (idx as usize) < nb {
-            state.bin_counts[idx as usize] += 1;
-        }
+        if tf.translation.y > bin_top { continue; }
+        let idx = (tf.translation.x / s + half_n).round() as i32;
+        if idx >= 0 && (idx as usize) < nb { state.bin_counts[idx as usize] += 1; }
     }
 }
 
-fn draw_gaussian(
-    config: Res<BoardConfig>,
-    dims: Res<BoardDims>,
-    state: Res<SimState>,
-    mut gizmos: Gizmos,
-) {
-    if !state.show_gaussian {
-        return;
-    }
-    let total: usize = state.bin_counts.iter().sum();
-    if total < 5 {
-        return;
-    }
-    let n_total = total as f32;
-    let sigma = config.sigma_x();
-    if sigma <= 0.0 {
-        return;
-    }
-    let r = config.particle_radius;
-    let area_per_particle = PI * r * r;
-    let inv_two_sigma_sq = 1.0 / (2.0 * sigma * sigma);
-    let inv_sigma_sqrt_2pi = 1.0 / (sigma * (2.0 * PI).sqrt());
-    let scale = n_total * area_per_particle / PACKING_EFFICIENCY;
-    let baseline = dims.bin_bottom_y;
+fn gaussian_height(x: f32, scale: f32, itss: f32, isq2pi: f32) -> f32 {
+    scale * isq2pi * (-x * x * itss).exp()
+}
 
-    // Couvre tout le domaine des bacs avec une marge.
-    let half_span = config.peg_spacing_x() * (config.rows as f32 * 0.5 + 0.5);
-    let n_samples = 240;
+fn draw_curve(gizmos: &mut Gizmos, half_span: f32, baseline: f32, scale: f32, itss: f32, isq2pi: f32) {
+    let color = Color::srgb(0.45, 1.0, 0.55);
     let mut prev: Option<Vec2> = None;
-    let curve_color = Color::srgb(0.45, 1.0, 0.55);
-    for k in 0..=n_samples {
-        let t = k as f32 / n_samples as f32;
-        let x = -half_span + 2.0 * half_span * t;
-        let pdf = inv_sigma_sqrt_2pi * (-x * x * inv_two_sigma_sq).exp();
-        let h = scale * pdf;
-        let pt = Vec2::new(x, baseline + h);
-        if let Some(p0) = prev {
-            gizmos.line_2d(p0, pt, curve_color);
-        }
+    for k in 0..=240 {
+        let x = -half_span + 2.0 * half_span * k as f32 / 240.0;
+        let pt = Vec2::new(x, baseline + gaussian_height(x, scale, itss, isq2pi));
+        if let Some(p0) = prev { gizmos.line_2d(p0, pt, color); }
         prev = Some(pt);
     }
+}
 
-    // Repères ±σ, ±2σ sur la baseline.
-    let marker_color = Color::srgba(0.45, 1.0, 0.55, 0.55);
-    for &k in &[1.0, -1.0, 2.0, -2.0] {
+fn draw_sigma_markers(gizmos: &mut Gizmos, sigma: f32, baseline: f32, scale: f32, itss: f32, isq2pi: f32) {
+    let color = Color::srgba(0.45, 1.0, 0.55, 0.55);
+    for &k in &[1.0f32, -1.0, 2.0, -2.0] {
         let x = k * sigma;
-        let pdf = inv_sigma_sqrt_2pi * (-x * x * inv_two_sigma_sq).exp();
-        let h = scale * pdf;
-        gizmos.line_2d(
-            Vec2::new(x, baseline),
-            Vec2::new(x, baseline + h),
-            marker_color,
-        );
+        let h = gaussian_height(x, scale, itss, isq2pi);
+        gizmos.line_2d(Vec2::new(x, baseline), Vec2::new(x, baseline + h), color);
     }
 }
 
-/// Trace en pointillés la hauteur de pile « attendue » bac par bac à partir du
-/// comptage réel (histogramme empirique). Complète visuellement la courbe
-/// gaussienne théorique.
-fn draw_histogram(
-    config: Res<BoardConfig>,
-    dims: Res<BoardDims>,
-    state: Res<SimState>,
-    mut gizmos: Gizmos,
-) {
-    if !state.show_histogram_bars {
-        return;
-    }
+fn draw_gaussian(config: Res<BoardConfig>, dims: Res<BoardDims>, state: Res<SimState>, mut gizmos: Gizmos) {
+    if !state.show_gaussian { return; }
+    let total: usize = state.bin_counts.iter().sum();
+    if total < 5 { return; }
+    let sigma = config.sigma_x();
     let r = config.particle_radius;
-    let area = PI * r * r;
-    let s = config.peg_spacing_x();
-    let half_n = config.rows as f32 * 0.5;
-    let baseline = dims.bin_bottom_y;
-    let bar_color = Color::srgba(1.0, 0.55, 0.25, 0.75);
+    let (itss, isq2pi) = (1.0 / (2.0 * sigma * sigma), 1.0 / (sigma * (2.0 * PI).sqrt()));
+    let scale = total as f32 * PI * r * r / PACKING_EFFICIENCY;
+    let half_span = config.peg_spacing_x() * (config.rows as f32 * 0.5 + 0.5);
+    draw_curve(&mut gizmos, half_span, dims.bin_bottom_y, scale, itss, isq2pi);
+    draw_sigma_markers(&mut gizmos, sigma, dims.bin_bottom_y, scale, itss, isq2pi);
+}
+
+fn draw_histogram(config: Res<BoardConfig>, dims: Res<BoardDims>, state: Res<SimState>, mut gizmos: Gizmos) {
+    if !state.show_histogram_bars { return; }
+    let (r, s) = (config.particle_radius, config.peg_spacing_x());
+    let (half_n, baseline) = (config.rows as f32 * 0.5, dims.bin_bottom_y);
+    let (area, color) = (PI * r * r, Color::srgba(1.0, 0.55, 0.25, 0.75));
     for (i, &count) in state.bin_counts.iter().enumerate() {
-        if count == 0 {
-            continue;
-        }
+        if count == 0 { continue; }
         let cx = (i as f32 - half_n) * s;
-        let expected_h = (count as f32 * area) / (s * PACKING_EFFICIENCY);
-        let x0 = cx - s * 0.45;
-        let x1 = cx + s * 0.45;
-        let y = baseline + expected_h;
-        gizmos.line_2d(Vec2::new(x0, y), Vec2::new(x1, y), bar_color);
+        let y = baseline + count as f32 * area / (s * PACKING_EFFICIENCY);
+        gizmos.line_2d(Vec2::new(cx - s * 0.45, y), Vec2::new(cx + s * 0.45, y), color);
     }
 }

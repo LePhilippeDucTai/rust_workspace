@@ -17,7 +17,6 @@ impl Plugin for InputPlugin {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn handle_input(
     keys: Res<ButtonInput<KeyCode>>,
     mut config: ResMut<BoardConfig>,
@@ -25,38 +24,37 @@ fn handle_input(
     mut commands: Commands,
     particles: Query<Entity, With<Particle>>,
 ) {
-    if keys.just_pressed(KeyCode::Space) {
-        state.paused = !state.paused;
-    }
-    if keys.just_pressed(KeyCode::KeyG) {
-        state.show_gaussian = !state.show_gaussian;
-    }
-    if keys.just_pressed(KeyCode::KeyH) {
-        state.show_histogram_bars = !state.show_histogram_bars;
-    }
-    if keys.just_pressed(KeyCode::KeyR) {
-        // Reset doux : on garde la même config, on remet les bacs à zéro.
-        for e in &particles {
-            commands.entity(e).despawn();
-        }
-        state.spawned_count = 0;
-        state.spawn_accumulator = 0.0;
-        for c in state.bin_counts.iter_mut() {
-            *c = 0;
-        }
-    }
+    handle_toggles(&keys, &mut state);
+    handle_reset(&keys, &mut state, &mut commands, &particles);
+    handle_rows(&keys, &mut config, &mut state);
+    handle_radius(&keys, &mut config, &mut state);
+    handle_target(&keys, &mut config);
+}
 
-    // Nombre de rangées : ← / →  (reconstruit la planche).
+fn handle_toggles(keys: &ButtonInput<KeyCode>, state: &mut SimState) {
+    if keys.just_pressed(KeyCode::Space) { state.paused = !state.paused; }
+    if keys.just_pressed(KeyCode::KeyG) { state.show_gaussian = !state.show_gaussian; }
+    if keys.just_pressed(KeyCode::KeyH) { state.show_histogram_bars = !state.show_histogram_bars; }
+}
+
+fn handle_reset(keys: &ButtonInput<KeyCode>, state: &mut SimState, commands: &mut Commands, particles: &Query<Entity, With<Particle>>) {
+    if !keys.just_pressed(KeyCode::KeyR) { return; }
+    for e in particles { commands.entity(e).despawn(); }
+    state.spawned_count = 0;
+    state.spawn_accumulator = 0.0;
+    state.bin_counts.iter_mut().for_each(|c| *c = 0);
+}
+
+fn handle_rows(keys: &ButtonInput<KeyCode>, config: &mut BoardConfig, state: &mut SimState) {
     if keys.just_pressed(KeyCode::ArrowRight) && config.rows < MAX_ROWS {
-        config.rows += 1;
-        state.board_dirty = true;
+        config.rows += 1; state.board_dirty = true;
     }
     if keys.just_pressed(KeyCode::ArrowLeft) && config.rows > MIN_ROWS {
-        config.rows -= 1;
-        state.board_dirty = true;
+        config.rows -= 1; state.board_dirty = true;
     }
+}
 
-    // Rayon des particules : ↓ / ↑.
+fn handle_radius(keys: &ButtonInput<KeyCode>, config: &mut BoardConfig, state: &mut SimState) {
     if keys.just_pressed(KeyCode::ArrowUp) && config.particle_radius < MAX_PARTICLE_RADIUS {
         config.particle_radius = (config.particle_radius + 0.5).min(MAX_PARTICLE_RADIUS);
         state.board_dirty = true;
@@ -65,8 +63,9 @@ fn handle_input(
         config.particle_radius = (config.particle_radius - 0.5).max(MIN_PARTICLE_RADIUS);
         state.board_dirty = true;
     }
+}
 
-    // Nombre cible de particules : - / + (= et touche +).
+fn handle_target(keys: &ButtonInput<KeyCode>, config: &mut BoardConfig) {
     let inc = keys.just_pressed(KeyCode::Equal) || keys.just_pressed(KeyCode::NumpadAdd);
     let dec = keys.just_pressed(KeyCode::Minus) || keys.just_pressed(KeyCode::NumpadSubtract);
     if inc && config.target_particles < MAX_TARGET_PARTICLES {

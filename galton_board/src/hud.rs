@@ -1,4 +1,4 @@
-//! HUD : état de la simulation, paramètres, statistiques sur les bacs.
+//! HUD : état + paramètres + stats sur les bacs.
 
 use bevy::prelude::*;
 
@@ -15,34 +15,26 @@ impl Plugin for HudPlugin {
 }
 
 fn setup_hud(mut commands: Commands) {
+    spawn_hud_text(&mut commands);
+    spawn_stats_text(&mut commands);
+}
+
+fn spawn_hud_text(commands: &mut Commands) {
     commands.spawn((
         Text::new(""),
-        TextFont {
-            font_size: 14.0,
-            ..default()
-        },
+        TextFont { font_size: 14.0, ..default() },
         TextColor(Color::srgb(0.92, 0.94, 0.98)),
-        Node {
-            position_type: PositionType::Absolute,
-            top: Val::Px(8.0),
-            left: Val::Px(12.0),
-            ..default()
-        },
+        Node { position_type: PositionType::Absolute, top: Val::Px(8.0), left: Val::Px(12.0), ..default() },
         HudText,
     ));
+}
+
+fn spawn_stats_text(commands: &mut Commands) {
     commands.spawn((
         Text::new(""),
-        TextFont {
-            font_size: 13.0,
-            ..default()
-        },
+        TextFont { font_size: 13.0, ..default() },
         TextColor(Color::srgb(0.60, 1.0, 0.70)),
-        Node {
-            position_type: PositionType::Absolute,
-            bottom: Val::Px(8.0),
-            left: Val::Px(12.0),
-            ..default()
-        },
+        Node { position_type: PositionType::Absolute, bottom: Val::Px(8.0), left: Val::Px(12.0), ..default() },
         StatsText,
     ));
 }
@@ -57,59 +49,47 @@ fn update_hud(
 ) {
     let fps = 1.0 / time.delta_secs().max(1e-6);
     let alive = particles.iter().count();
-
     if let Ok(mut text) = hud_q.single_mut() {
-        let pause = if state.paused { "PAUSE" } else { "RUN  " };
-        **text = format!(
-            "Planche de Galton  —  {pause}  |  FPS: {fps:5.0}\n\
-             Rangées (← →) : {rows}    Bacs : {bins}    σ_x ≈ {sigma:.1} px\n\
-             Rayon particule (↑ ↓) : {radius:.1} px\n\
-             Cible (- +) : {target}    Vivantes : {alive}    Spawn : {spawned} / {target}\n\
-             [Espace] pause  [R] reset  [G] courbe gaussienne  [H] barres histogramme",
-            rows = config.rows,
-            bins = config.num_bins(),
-            sigma = config.sigma_x(),
-            radius = config.particle_radius,
-            target = config.target_particles,
-            spawned = state.spawned_count,
-        );
+        **text = hud_string(&config, &state, fps, alive);
     }
-
     if let Ok(mut text) = stats_q.single_mut() {
-        let counted: usize = state.bin_counts.iter().sum();
-        let (mean, variance) = mean_var(&state.bin_counts, &config);
-        let std = variance.sqrt();
-        let sigma_theo = config.sigma_x();
-        **text = format!(
-            "Bacs (comptage) : {counted} particules\n\
-             μ empirique : {mean:+6.2} px    σ empirique : {std:5.2} px\n\
-             σ théorique : {sigma_theo:5.2} px  (modèle binomial : d·√N, d = pas/2)",
-        );
+        **text = stats_string(&state, &config);
     }
+}
+
+fn hud_string(config: &BoardConfig, state: &SimState, fps: f32, alive: usize) -> String {
+    let pause = if state.paused { "PAUSE" } else { "RUN  " };
+    format!(
+        "Planche de Galton  —  {pause}  |  FPS: {fps:5.0}\n\
+         Rangées (← →) : {rows}    Bacs : {bins}    σ_x ≈ {sigma:.1} px\n\
+         Rayon particule (↑ ↓) : {radius:.1} px\n\
+         Cible (- +) : {target}    Vivantes : {alive}    Spawn : {spawned} / {target}\n\
+         [Espace] pause  [R] reset  [G] courbe gaussienne  [H] barres histogramme",
+        rows = config.rows, bins = config.num_bins(), sigma = config.sigma_x(),
+        radius = config.particle_radius, target = config.target_particles, spawned = state.spawned_count,
+    )
+}
+
+fn stats_string(state: &SimState, config: &BoardConfig) -> String {
+    let counted: usize = state.bin_counts.iter().sum();
+    let (mean, var) = mean_var(&state.bin_counts, config);
+    format!(
+        "Bacs (comptage) : {counted} particules\n\
+         μ empirique : {mean:+6.2} px    σ empirique : {std:5.2} px\n\
+         σ théorique : {sigma:.2} px  (modèle binomial : d·√N, d = pas/2)",
+        std = var.sqrt(), sigma = config.sigma_x(),
+    )
 }
 
 fn mean_var(counts: &[usize], cfg: &BoardConfig) -> (f32, f32) {
     let total: usize = counts.iter().sum();
-    if total == 0 {
-        return (0.0, 0.0);
-    }
+    if total == 0 { return (0.0, 0.0); }
     let n = total as f32;
-    let mut mean = 0.0;
-    for (i, &c) in counts.iter().enumerate() {
-        if c == 0 {
-            continue;
-        }
-        mean += cfg.bin_center_x(i) * c as f32;
-    }
-    mean /= n;
-    let mut var = 0.0;
-    for (i, &c) in counts.iter().enumerate() {
-        if c == 0 {
-            continue;
-        }
-        let d = cfg.bin_center_x(i) - mean;
-        var += d * d * c as f32;
-    }
-    var /= n;
+    let mean = counts.iter().enumerate()
+        .map(|(i, &c)| cfg.bin_center_x(i) * c as f32)
+        .sum::<f32>() / n;
+    let var = counts.iter().enumerate()
+        .map(|(i, &c)| { let d = cfg.bin_center_x(i) - mean; d * d * c as f32 })
+        .sum::<f32>() / n;
     (mean, var)
 }
