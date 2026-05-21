@@ -18,6 +18,7 @@ pub struct SimState {
     pub paused: bool,
     pub show_vision: bool,
     pub show_help: bool,
+    /// Temps simulé écoulé (s), avance uniquement quand la sim n'est pas en pause.
     pub elapsed: f32,
     /// Accumulateur pour le respawn progressif de la nourriture.
     pub food_respawn_acc: f32,
@@ -51,6 +52,17 @@ pub struct PopulationStats {
     pub mean_energy: f32,
     pub max_generation: u32,
     pub mean_generation: f32,
+}
+
+/// Ordonnancement des grandes étapes de la simulation (utilisé dans `FixedUpdate`).
+/// Le `chain()` global garantit que la nourriture est respawnée AVANT que les
+/// organismes ne décident où aller, puis qu'ils mangent, puis qu'ils meurent
+/// ou se reproduisent.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SimulationSet {
+    Food,
+    Behavior,
+    Lifecycle,
 }
 
 pub fn not_paused(state: Res<SimState>) -> bool {

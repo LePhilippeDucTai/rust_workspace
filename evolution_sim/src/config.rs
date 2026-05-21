@@ -101,4 +101,3 @@ pub const FOOD_TARGET: usize = 280;
 
 pub const Z_FOOD: f32 = 0.0;
 pub const Z_ORGANISM: f32 = 1.0;
-pub const Z_OVERLAY: f32 = 2.0;
