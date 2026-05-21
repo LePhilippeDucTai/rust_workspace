@@ -43,16 +43,16 @@ fn spawn_particles(
 }
 
 fn spawn_one(commands: &mut Commands, materials: &mut Assets<ColorMaterial>, mesh: &Handle<Mesh>, config: &BoardConfig, dims: &BoardDims, rng: &mut impl Rng) {
-    let (jitter, vx, hue) = (rng.gen_range(-2.0..=2.0f32), rng.gen_range(-10.0..=10.0f32), rng.gen_range(0.0..360.0f32));
+    let hue = rng.gen_range(0.0..360.0f32);
     let radius = config.particle_radius;
     commands.spawn((
         Mesh2d(mesh.clone()),
         MeshMaterial2d(materials.add(Color::hsl(hue, 0.95, 0.68))),
-        Transform::from_xyz(jitter, dims.spawn_y, 0.5),
+        Transform::from_xyz(0.0, dims.spawn_y, 0.5),
         Particle,
         RigidBody::Dynamic, Collider::ball(radius),
         Restitution::coefficient(PARTICLE_RESTITUTION), Friction::coefficient(PARTICLE_FRICTION),
         Damping { linear_damping: PARTICLE_LINEAR_DAMPING, angular_damping: PARTICLE_ANGULAR_DAMPING },
-        LockedAxes::ROTATION_LOCKED, Velocity::linear(Vec2::new(vx, -20.0)), Ccd::enabled(),
+        LockedAxes::ROTATION_LOCKED, Velocity::linear(Vec2::new(0.0, -15.0)), Ccd::enabled(),
     ));
 }
