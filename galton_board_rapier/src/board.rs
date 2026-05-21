@@ -69,7 +69,7 @@ fn build_board(commands: &mut Commands, meshes: &mut Assets<Mesh>, materials: &m
 
 fn spawn_pegs(commands: &mut Commands, meshes: &mut Assets<Mesh>, materials: &mut Assets<ColorMaterial>, cfg: &BoardConfig, dims: &BoardDims) {
     let mesh = meshes.add(Circle::new(PEG_RADIUS));
-    let color = materials.add(Color::srgb(0.70, 0.85, 0.95));
+    let color = materials.add(Color::srgb(0.88, 0.95, 1.00));
     let s_y = cfg.peg_spacing_y();
     for row in 0..cfg.rows {
         let y = dims.peg_top_y - row as f32 * s_y;
@@ -81,16 +81,16 @@ fn spawn_pegs(commands: &mut Commands, meshes: &mut Assets<Mesh>, materials: &mu
 }
 
 fn spawn_walls(commands: &mut Commands, meshes: &mut Assets<Mesh>, materials: &mut Assets<ColorMaterial>, dims: &BoardDims) {
-    let wc = materials.add(Color::srgb(0.35, 0.40, 0.55));
+    let wc = materials.add(Color::srgb(0.20, 0.28, 0.55));
     let (t, h) = (6.0f32, HALF_HEIGHT - 2.0);
     spawn_static_box(commands, meshes, &wc, Vec2::new(dims.left_wall_x - t * 0.5, 0.0), Vec2::new(t * 0.5, h));
     spawn_static_box(commands, meshes, &wc, Vec2::new(dims.right_wall_x + t * 0.5, 0.0), Vec2::new(t * 0.5, h));
-    let fc = materials.add(Color::srgb(0.45, 0.45, 0.55));
+    let fc = materials.add(Color::srgb(0.22, 0.30, 0.58));
     spawn_static_box(commands, meshes, &fc, Vec2::new(0.0, dims.bin_bottom_y - t * 0.5), Vec2::new(BOARD_WIDTH * 0.5 + t, t * 0.5));
 }
 
 fn spawn_dividers(commands: &mut Commands, meshes: &mut Assets<Mesh>, materials: &mut Assets<ColorMaterial>, cfg: &BoardConfig, dims: &BoardDims) {
-    let color = materials.add(Color::srgb(0.55, 0.55, 0.70));
+    let color = materials.add(Color::srgb(0.30, 0.38, 0.72));
     let (y_min, y_max) = (dims.bin_bottom_y, dims.bin_top_y);
     let (center_y, half_h) = ((y_min + y_max) * 0.5, (y_max - y_min) * 0.5);
     let s = cfg.peg_spacing_x();
