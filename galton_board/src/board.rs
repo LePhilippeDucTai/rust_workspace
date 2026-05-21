@@ -65,9 +65,35 @@ fn build_board(
     cfg: &BoardConfig,
     dims: &BoardDims,
 ) {
+    spawn_funnel(commands, meshes, materials, cfg, dims);
     spawn_pegs(commands, meshes, materials, cfg, dims);
     spawn_walls(commands, meshes, materials, dims);
     spawn_dividers(commands, meshes, materials, cfg, dims);
+}
+
+fn spawn_funnel(commands: &mut Commands, meshes: &mut Assets<Mesh>, materials: &mut Assets<ColorMaterial>, cfg: &BoardConfig, dims: &BoardDims) {
+    let color = materials.add(Color::srgb(0.35, 0.42, 0.60));
+    let num_steps = 10usize;
+    let start_half_gap = BOARD_WIDTH * 0.40;
+    let end_half_gap = cfg.peg_spacing_x();
+    let funnel_top = dims.spawn_y;
+    let funnel_bottom = dims.peg_top_y;
+    let total_h = funnel_top - funnel_bottom;
+    let step_h = total_h / num_steps as f32;
+    let wall_h = step_h * 0.45;
+    let half_board = BOARD_WIDTH * 0.5;
+
+    for i in 0..num_steps {
+        let t = i as f32 / (num_steps - 1) as f32;
+        let half_gap = start_half_gap + (end_half_gap - start_half_gap) * t;
+        let y = funnel_top - (i as f32 + 0.5) * step_h;
+        let wall_half_w = (half_board - half_gap) * 0.5;
+        if wall_half_w <= 0.0 { continue; }
+        let left_cx = -(half_gap + wall_half_w);
+        let right_cx = half_gap + wall_half_w;
+        spawn_wall(commands, meshes, &color, Vec2::new(left_cx, y), Vec2::new(wall_half_w, wall_h), WALL_RESTITUTION);
+        spawn_wall(commands, meshes, &color, Vec2::new(right_cx, y), Vec2::new(wall_half_w, wall_h), WALL_RESTITUTION);
+    }
 }
 
 fn spawn_pegs(commands: &mut Commands, meshes: &mut Assets<Mesh>, materials: &mut Assets<ColorMaterial>, cfg: &BoardConfig, dims: &BoardDims) {

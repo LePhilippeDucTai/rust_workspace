@@ -66,7 +66,7 @@ impl BoardDims {
             bin_bottom_y,
             left_wall_x: -half_board,
             right_wall_x: half_board,
-            spawn_y: HALF_HEIGHT - TOP_MARGIN * 0.4,
+            spawn_y: HALF_HEIGHT - 10.0,
         }
     }
 }

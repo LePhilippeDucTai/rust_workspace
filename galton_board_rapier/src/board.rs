@@ -80,32 +80,26 @@ fn build_board(
     spawn_dividers(commands, meshes, materials, cfg, dims);
 }
 
-fn spawn_funnel(
-    commands: &mut Commands,
-    meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<ColorMaterial>,
-    cfg: &BoardConfig,
-    dims: &BoardDims,
-) {
-    let funnel_color = materials.add(Color::srgb(0.25, 0.33, 0.60));
-    let num_segments = 8;
-    let start_width = BOARD_WIDTH;
-    let end_width = cfg.peg_spacing_x() * 1.5;
-    let funnel_height = dims.spawn_y - dims.peg_top_y;
-    let segment_height = funnel_height / num_segments as f32;
+fn spawn_funnel(commands: &mut Commands, meshes: &mut Assets<Mesh>, materials: &mut Assets<ColorMaterial>, cfg: &BoardConfig, dims: &BoardDims) {
+    let color = materials.add(Color::srgb(0.25, 0.33, 0.60));
+    let num_steps = 10usize;
+    let start_half_gap = BOARD_WIDTH * 0.40;
+    let end_half_gap = cfg.peg_spacing_x();
+    let total_h = dims.spawn_y - dims.peg_top_y;
+    let step_h = total_h / num_steps as f32;
+    let wall_h = step_h * 0.45;
+    let half_board = BOARD_WIDTH * 0.5;
 
-    for i in 0..num_segments {
-        let progress = (i as f32 + 1.0) / num_segments as f32;
-        let width = start_width - (start_width - end_width) * progress;
-        let y = dims.spawn_y - (i as f32 + 1.0) * segment_height;
-
-        spawn_static_box(
-            commands,
-            meshes,
-            &funnel_color,
-            Vec2::new(0.0, y),
-            Vec2::new(width * 0.5, segment_height * 0.5),
-        );
+    for i in 0..num_steps {
+        let t = i as f32 / (num_steps - 1) as f32;
+        let half_gap = start_half_gap + (end_half_gap - start_half_gap) * t;
+        let y = dims.spawn_y - (i as f32 + 0.5) * step_h;
+        let wall_half_w = (half_board - half_gap) * 0.5;
+        if wall_half_w <= 0.0 { continue; }
+        let left_cx = -(half_gap + wall_half_w);
+        let right_cx = half_gap + wall_half_w;
+        spawn_static_box(commands, meshes, &color, Vec2::new(left_cx, y), Vec2::new(wall_half_w, wall_h));
+        spawn_static_box(commands, meshes, &color, Vec2::new(right_cx, y), Vec2::new(wall_half_w, wall_h));
     }
 }
 
