@@ -34,14 +34,29 @@ fn handle_input(
 }
 
 fn handle_toggles(keys: &ButtonInput<KeyCode>, state: &mut SimState) {
-    if keys.just_pressed(KeyCode::Space) { state.paused = !state.paused; }
-    if keys.just_pressed(KeyCode::KeyG) { state.show_gaussian = !state.show_gaussian; }
-    if keys.just_pressed(KeyCode::KeyH) { state.show_histogram_bars = !state.show_histogram_bars; }
+    if keys.just_pressed(KeyCode::Space) {
+        state.paused = !state.paused;
+    }
+    if keys.just_pressed(KeyCode::KeyG) {
+        state.show_gaussian = !state.show_gaussian;
+    }
+    if keys.just_pressed(KeyCode::KeyH) {
+        state.show_histogram_bars = !state.show_histogram_bars;
+    }
 }
 
-fn handle_reset(keys: &ButtonInput<KeyCode>, state: &mut SimState, commands: &mut Commands, particles: &Query<Entity, With<Particle>>) {
-    if !keys.just_pressed(KeyCode::KeyR) { return; }
-    for e in particles { commands.entity(e).despawn(); }
+fn handle_reset(
+    keys: &ButtonInput<KeyCode>,
+    state: &mut SimState,
+    commands: &mut Commands,
+    particles: &Query<Entity, With<Particle>>,
+) {
+    if !keys.just_pressed(KeyCode::KeyR) {
+        return;
+    }
+    for e in particles {
+        commands.entity(e).despawn();
+    }
     state.spawned_count = 0;
     state.spawn_accumulator = 0.0;
     state.bin_counts.iter_mut().for_each(|c| *c = 0);
@@ -49,10 +64,12 @@ fn handle_reset(keys: &ButtonInput<KeyCode>, state: &mut SimState, commands: &mu
 
 fn handle_rows(keys: &ButtonInput<KeyCode>, config: &mut BoardConfig, state: &mut SimState) {
     if keys.just_pressed(KeyCode::ArrowRight) && config.rows < MAX_ROWS {
-        config.rows += 1; state.board_dirty = true;
+        config.rows += 1;
+        state.board_dirty = true;
     }
     if keys.just_pressed(KeyCode::ArrowLeft) && config.rows > MIN_ROWS {
-        config.rows -= 1; state.board_dirty = true;
+        config.rows -= 1;
+        state.board_dirty = true;
     }
 }
 
@@ -71,18 +88,34 @@ fn handle_target(keys: &ButtonInput<KeyCode>, config: &mut BoardConfig) {
     let inc = keys.just_pressed(KeyCode::Equal) || keys.just_pressed(KeyCode::NumpadAdd);
     let dec = keys.just_pressed(KeyCode::Minus) || keys.just_pressed(KeyCode::NumpadSubtract);
     if inc && config.target_particles < MAX_TARGET_PARTICLES {
-        let step = if config.target_particles >= 1000 { 200 } else { 100 };
+        let step = if config.target_particles >= 1000 {
+            200
+        } else {
+            100
+        };
         config.target_particles = (config.target_particles + step).min(MAX_TARGET_PARTICLES);
     }
     if dec && config.target_particles > MIN_TARGET_PARTICLES {
-        let step = if config.target_particles > 1000 { 200 } else { 100 };
-        config.target_particles = config.target_particles.saturating_sub(step).max(MIN_TARGET_PARTICLES);
+        let step = if config.target_particles > 1000 {
+            200
+        } else {
+            100
+        };
+        config.target_particles = config
+            .target_particles
+            .saturating_sub(step)
+            .max(MIN_TARGET_PARTICLES);
     }
 }
 
-fn sync_pause(state: Res<SimState>, mut rapier_cfg: Query<&mut RapierConfiguration, With<DefaultRapierContext>>) {
+fn sync_pause(
+    state: Res<SimState>,
+    mut rapier_cfg: Query<&mut RapierConfiguration, With<DefaultRapierContext>>,
+) {
     if let Ok(mut cfg) = rapier_cfg.single_mut() {
         let target = !state.paused;
-        if cfg.physics_pipeline_active != target { cfg.physics_pipeline_active = target; }
+        if cfg.physics_pipeline_active != target {
+            cfg.physics_pipeline_active = target;
+        }
     }
 }

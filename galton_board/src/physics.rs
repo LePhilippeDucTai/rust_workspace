@@ -34,7 +34,7 @@ fn step_physics(
         .collect();
     let walls_vec: Vec<Wall> = walls.iter().cloned().collect();
     let dividers_vec: Vec<Divider> = dividers.iter().cloned().collect();
-    let (mut pos, mut vel, mut rad) = extract_soa(&particles);
+    let (mut pos, mut vel, rad) = extract_soa(&particles);
     for _ in 0..PHYSICS_SUBSTEPS {
         run_substep(
             &mut pos,

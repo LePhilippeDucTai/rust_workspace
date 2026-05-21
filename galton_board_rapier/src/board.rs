@@ -46,9 +46,15 @@ fn rebuild_on_dirty(
     board_entities: Query<Entity, With<BoardEntity>>,
     particles: Query<Entity, With<Particle>>,
 ) {
-    if !state.board_dirty { return; }
-    for e in &board_entities { commands.entity(e).despawn(); }
-    for e in &particles { commands.entity(e).despawn(); }
+    if !state.board_dirty {
+        return;
+    }
+    for e in &board_entities {
+        commands.entity(e).despawn();
+    }
+    for e in &particles {
+        commands.entity(e).despawn();
+    }
     *dims = BoardDims::from_config(&config);
     reset_sim_state(&mut state, config.num_bins());
     build_board(&mut commands, &mut meshes, &mut materials, &config, &dims);
@@ -61,14 +67,26 @@ fn reset_sim_state(state: &mut SimState, num_bins: usize) {
     state.board_dirty = false;
 }
 
-fn build_board(commands: &mut Commands, meshes: &mut Assets<Mesh>, materials: &mut Assets<ColorMaterial>, cfg: &BoardConfig, dims: &BoardDims) {
+fn build_board(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<ColorMaterial>,
+    cfg: &BoardConfig,
+    dims: &BoardDims,
+) {
     spawn_funnel(commands, meshes, materials, cfg, dims);
     spawn_pegs(commands, meshes, materials, cfg, dims);
     spawn_walls(commands, meshes, materials, dims);
     spawn_dividers(commands, meshes, materials, cfg, dims);
 }
 
-fn spawn_funnel(commands: &mut Commands, meshes: &mut Assets<Mesh>, materials: &mut Assets<ColorMaterial>, cfg: &BoardConfig, dims: &BoardDims) {
+fn spawn_funnel(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<ColorMaterial>,
+    cfg: &BoardConfig,
+    dims: &BoardDims,
+) {
     let funnel_color = materials.add(Color::srgb(0.25, 0.33, 0.60));
     let num_segments = 8;
     let start_width = BOARD_WIDTH;
@@ -81,11 +99,23 @@ fn spawn_funnel(commands: &mut Commands, meshes: &mut Assets<Mesh>, materials: &
         let width = start_width - (start_width - end_width) * progress;
         let y = dims.spawn_y - (i as f32 + 1.0) * segment_height;
 
-        spawn_static_box(commands, meshes, &funnel_color, Vec2::new(0.0, y), Vec2::new(width * 0.5, segment_height * 0.5));
+        spawn_static_box(
+            commands,
+            meshes,
+            &funnel_color,
+            Vec2::new(0.0, y),
+            Vec2::new(width * 0.5, segment_height * 0.5),
+        );
     }
 }
 
-fn spawn_pegs(commands: &mut Commands, meshes: &mut Assets<Mesh>, materials: &mut Assets<ColorMaterial>, cfg: &BoardConfig, dims: &BoardDims) {
+fn spawn_pegs(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<ColorMaterial>,
+    cfg: &BoardConfig,
+    dims: &BoardDims,
+) {
     let mesh = meshes.add(Circle::new(PEG_RADIUS));
     let color = materials.add(Color::srgb(0.88, 0.95, 1.00));
     let s_y = cfg.peg_spacing_y();
@@ -93,32 +123,83 @@ fn spawn_pegs(commands: &mut Commands, meshes: &mut Assets<Mesh>, materials: &mu
         let y = dims.peg_top_y - row as f32 * s_y;
         for col in 0..=row {
             let x = cfg.peg_x(row, col);
-            commands.spawn((Mesh2d(mesh.clone()), MeshMaterial2d(color.clone()), Transform::from_xyz(x, y, 1.0), RigidBody::Fixed, Collider::ball(PEG_RADIUS), Restitution::coefficient(PEG_RESTITUTION), Friction::coefficient(PEG_FRICTION), Peg, BoardEntity));
+            commands.spawn((
+                Mesh2d(mesh.clone()),
+                MeshMaterial2d(color.clone()),
+                Transform::from_xyz(x, y, 1.0),
+                RigidBody::Fixed,
+                Collider::ball(PEG_RADIUS),
+                Restitution::coefficient(PEG_RESTITUTION),
+                Friction::coefficient(PEG_FRICTION),
+                Peg,
+                BoardEntity,
+            ));
         }
     }
 }
 
-fn spawn_walls(commands: &mut Commands, meshes: &mut Assets<Mesh>, materials: &mut Assets<ColorMaterial>, dims: &BoardDims) {
+fn spawn_walls(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<ColorMaterial>,
+    dims: &BoardDims,
+) {
     let wc = materials.add(Color::srgb(0.20, 0.28, 0.55));
     let (t, h) = (6.0f32, HALF_HEIGHT - 2.0);
-    spawn_static_box(commands, meshes, &wc, Vec2::new(dims.left_wall_x - t * 0.5, 0.0), Vec2::new(t * 0.5, h));
-    spawn_static_box(commands, meshes, &wc, Vec2::new(dims.right_wall_x + t * 0.5, 0.0), Vec2::new(t * 0.5, h));
+    spawn_static_box(
+        commands,
+        meshes,
+        &wc,
+        Vec2::new(dims.left_wall_x - t * 0.5, 0.0),
+        Vec2::new(t * 0.5, h),
+    );
+    spawn_static_box(
+        commands,
+        meshes,
+        &wc,
+        Vec2::new(dims.right_wall_x + t * 0.5, 0.0),
+        Vec2::new(t * 0.5, h),
+    );
     let fc = materials.add(Color::srgb(0.22, 0.30, 0.58));
-    spawn_static_box(commands, meshes, &fc, Vec2::new(0.0, dims.bin_bottom_y - t * 0.5), Vec2::new(BOARD_WIDTH * 0.5 + t, t * 0.5));
+    spawn_static_box(
+        commands,
+        meshes,
+        &fc,
+        Vec2::new(0.0, dims.bin_bottom_y - t * 0.5),
+        Vec2::new(BOARD_WIDTH * 0.5 + t, t * 0.5),
+    );
 }
 
-fn spawn_dividers(commands: &mut Commands, meshes: &mut Assets<Mesh>, materials: &mut Assets<ColorMaterial>, cfg: &BoardConfig, dims: &BoardDims) {
+fn spawn_dividers(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<ColorMaterial>,
+    cfg: &BoardConfig,
+    dims: &BoardDims,
+) {
     let color = materials.add(Color::srgb(0.30, 0.38, 0.72));
     let (y_min, y_max) = (dims.bin_bottom_y, dims.bin_top_y);
     let (center_y, half_h) = ((y_min + y_max) * 0.5, (y_max - y_min) * 0.5);
     let s = cfg.peg_spacing_x();
     for i in 0..cfg.rows {
         let x = cfg.bin_center_x(i) + s * 0.5;
-        spawn_static_box(commands, meshes, &color, Vec2::new(x, center_y), Vec2::new(DIVIDER_HALF_WIDTH, half_h));
+        spawn_static_box(
+            commands,
+            meshes,
+            &color,
+            Vec2::new(x, center_y),
+            Vec2::new(DIVIDER_HALF_WIDTH, half_h),
+        );
     }
 }
 
-fn spawn_static_box(commands: &mut Commands, meshes: &mut Assets<Mesh>, color: &Handle<ColorMaterial>, center: Vec2, half_extents: Vec2) {
+fn spawn_static_box(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    color: &Handle<ColorMaterial>,
+    center: Vec2,
+    half_extents: Vec2,
+) {
     let mesh = meshes.add(Rectangle::new(half_extents.x * 2.0, half_extents.y * 2.0));
     commands.spawn((
         Mesh2d(mesh),

@@ -22,9 +22,17 @@ fn setup_hud(mut commands: Commands) {
 fn spawn_hud_text(commands: &mut Commands) {
     commands.spawn((
         Text::new(""),
-        TextFont { font_size: 14.0, ..default() },
+        TextFont {
+            font_size: 14.0,
+            ..default()
+        },
         TextColor(Color::srgb(0.92, 0.94, 0.98)),
-        Node { position_type: PositionType::Absolute, top: Val::Px(8.0), left: Val::Px(12.0), ..default() },
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(8.0),
+            left: Val::Px(12.0),
+            ..default()
+        },
         HudText,
     ));
 }
@@ -32,9 +40,17 @@ fn spawn_hud_text(commands: &mut Commands) {
 fn spawn_stats_text(commands: &mut Commands) {
     commands.spawn((
         Text::new(""),
-        TextFont { font_size: 13.0, ..default() },
+        TextFont {
+            font_size: 13.0,
+            ..default()
+        },
         TextColor(Color::srgb(0.60, 1.0, 0.70)),
-        Node { position_type: PositionType::Absolute, bottom: Val::Px(8.0), left: Val::Px(12.0), ..default() },
+        Node {
+            position_type: PositionType::Absolute,
+            bottom: Val::Px(8.0),
+            left: Val::Px(12.0),
+            ..default()
+        },
         StatsText,
     ));
 }
@@ -65,8 +81,12 @@ fn hud_string(config: &BoardConfig, state: &SimState, fps: f32, alive: usize) ->
          Rayon particule (↑ ↓) : {radius:.1} px\n\
          Cible (- +) : {target}    Vivantes : {alive}    Spawn : {spawned} / {target}\n\
          [Espace] pause  [R] reset  [G] courbe gaussienne  [H] barres histogramme",
-        rows = config.rows, bins = config.num_bins(), sigma = config.sigma_x(),
-        radius = config.particle_radius, target = config.target_particles, spawned = state.spawned_count,
+        rows = config.rows,
+        bins = config.num_bins(),
+        sigma = config.sigma_x(),
+        radius = config.particle_radius,
+        target = config.target_particles,
+        spawned = state.spawned_count,
     )
 }
 
@@ -77,19 +97,31 @@ fn stats_string(state: &SimState, config: &BoardConfig) -> String {
         "Bacs (comptage) : {counted} particules\n\
          μ empirique : {mean:+6.2} px    σ empirique : {std:5.2} px\n\
          σ théorique : {sigma:.2} px  (modèle binomial : d·√N, d = pas/2)",
-        std = var.sqrt(), sigma = config.sigma_x(),
+        std = var.sqrt(),
+        sigma = config.sigma_x(),
     )
 }
 
 fn mean_var(counts: &[usize], cfg: &BoardConfig) -> (f32, f32) {
     let total: usize = counts.iter().sum();
-    if total == 0 { return (0.0, 0.0); }
+    if total == 0 {
+        return (0.0, 0.0);
+    }
     let n = total as f32;
-    let mean = counts.iter().enumerate()
+    let mean = counts
+        .iter()
+        .enumerate()
         .map(|(i, &c)| cfg.bin_center_x(i) * c as f32)
-        .sum::<f32>() / n;
-    let var = counts.iter().enumerate()
-        .map(|(i, &c)| { let d = cfg.bin_center_x(i) - mean; d * d * c as f32 })
-        .sum::<f32>() / n;
+        .sum::<f32>()
+        / n;
+    let var = counts
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| {
+            let d = cfg.bin_center_x(i) - mean;
+            d * d * c as f32
+        })
+        .sum::<f32>()
+        / n;
     (mean, var)
 }

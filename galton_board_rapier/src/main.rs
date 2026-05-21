@@ -36,12 +36,20 @@ fn main() {
             }),
             ..default()
         }))
-        .add_plugins(RapierPhysicsPlugin::<NoUserData>::pixels_per_meter(PIXELS_PER_METER))
+        .add_plugins(RapierPhysicsPlugin::<NoUserData>::pixels_per_meter(
+            PIXELS_PER_METER,
+        ))
         .insert_resource(ClearColor(Color::srgb(0.03, 0.04, 0.09)))
         .insert_resource(BoardConfig::default())
         .insert_resource(SimState::default())
         .add_systems(Startup, configure_gravity)
-        .add_plugins((BoardPlugin, SpawnPlugin, HudPlugin, InputPlugin, GaussianPlugin))
+        .add_plugins((
+            BoardPlugin,
+            SpawnPlugin,
+            HudPlugin,
+            InputPlugin,
+            GaussianPlugin,
+        ))
         .run();
 }
 
