@@ -37,10 +37,13 @@ fn gaussian_height(x: f32, scale: f32, itss: f32, isq2pi: f32) -> f32 {
 }
 
 fn draw_curve(gizmos: &mut Gizmos, half_span: f32, baseline: f32, scale: f32, itss: f32, isq2pi: f32) {
-    let color = Color::srgb(0.45, 1.0, 0.55);
     let mut prev: Option<Vec2> = None;
-    for k in 0..=240 {
-        let x = -half_span + 2.0 * half_span * k as f32 / 240.0;
+    let steps = 300u32;
+    for k in 0..=steps {
+        let t = k as f32 / steps as f32;
+        let x = -half_span + 2.0 * half_span * t;
+        let hue = 120.0 + 180.0 * t;
+        let color = Color::hsla(hue, 1.0, 0.65, 0.92);
         let pt = Vec2::new(x, baseline + gaussian_height(x, scale, itss, isq2pi));
         if let Some(p0) = prev { gizmos.line_2d(p0, pt, color); }
         prev = Some(pt);
@@ -48,8 +51,12 @@ fn draw_curve(gizmos: &mut Gizmos, half_span: f32, baseline: f32, scale: f32, it
 }
 
 fn draw_sigma_markers(gizmos: &mut Gizmos, sigma: f32, baseline: f32, scale: f32, itss: f32, isq2pi: f32) {
-    let color = Color::srgba(0.45, 1.0, 0.55, 0.55);
     for &k in &[1.0f32, -1.0, 2.0, -2.0] {
+        let color = if k.abs() < 1.5 {
+            Color::srgba(0.95, 0.95, 0.30, 0.70)
+        } else {
+            Color::srgba(0.95, 0.55, 0.20, 0.55)
+        };
         let x = k * sigma;
         let h = gaussian_height(x, scale, itss, isq2pi);
         gizmos.line_2d(Vec2::new(x, baseline), Vec2::new(x, baseline + h), color);
@@ -73,11 +80,16 @@ fn draw_histogram(config: Res<BoardConfig>, dims: Res<BoardDims>, state: Res<Sim
     if !state.show_histogram_bars { return; }
     let (r, s) = (config.particle_radius, config.peg_spacing_x());
     let (half_n, baseline) = (config.rows as f32 * 0.5, dims.bin_bottom_y);
-    let (area, color) = (PI * r * r, Color::srgba(1.0, 0.55, 0.25, 0.75));
+    let area = PI * r * r;
+    let nb = state.bin_counts.len();
     for (i, &count) in state.bin_counts.iter().enumerate() {
         if count == 0 { continue; }
         let cx = (i as f32 - half_n) * s;
         let y = baseline + count as f32 * area / (s * PACKING_EFFICIENCY);
-        gizmos.line_2d(Vec2::new(cx - s * 0.45, y), Vec2::new(cx + s * 0.45, y), color);
+        let hue = 200.0 + 120.0 * i as f32 / nb.max(1) as f32;
+        let color = Color::hsla(hue, 1.0, 0.65, 0.80);
+        gizmos.line_2d(Vec2::new(cx - s * 0.44, baseline), Vec2::new(cx - s * 0.44, y), color);
+        gizmos.line_2d(Vec2::new(cx + s * 0.44, baseline), Vec2::new(cx + s * 0.44, y), color);
+        gizmos.line_2d(Vec2::new(cx - s * 0.44, y), Vec2::new(cx + s * 0.44, y), color);
     }
 }
