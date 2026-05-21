@@ -62,9 +62,27 @@ fn reset_sim_state(state: &mut SimState, num_bins: usize) {
 }
 
 fn build_board(commands: &mut Commands, meshes: &mut Assets<Mesh>, materials: &mut Assets<ColorMaterial>, cfg: &BoardConfig, dims: &BoardDims) {
+    spawn_funnel(commands, meshes, materials, cfg, dims);
     spawn_pegs(commands, meshes, materials, cfg, dims);
     spawn_walls(commands, meshes, materials, dims);
     spawn_dividers(commands, meshes, materials, cfg, dims);
+}
+
+fn spawn_funnel(commands: &mut Commands, meshes: &mut Assets<Mesh>, materials: &mut Assets<ColorMaterial>, cfg: &BoardConfig, dims: &BoardDims) {
+    let funnel_color = materials.add(Color::srgb(0.25, 0.33, 0.60));
+    let num_segments = 8;
+    let start_width = BOARD_WIDTH;
+    let end_width = cfg.peg_spacing_x() * 1.5;
+    let funnel_height = dims.spawn_y - dims.peg_top_y;
+    let segment_height = funnel_height / num_segments as f32;
+
+    for i in 0..num_segments {
+        let progress = (i as f32 + 1.0) / num_segments as f32;
+        let width = start_width - (start_width - end_width) * progress;
+        let y = dims.spawn_y - (i as f32 + 1.0) * segment_height;
+
+        spawn_static_box(commands, meshes, &funnel_color, Vec2::new(0.0, y), Vec2::new(width * 0.5, segment_height * 0.5));
+    }
 }
 
 fn spawn_pegs(commands: &mut Commands, meshes: &mut Assets<Mesh>, materials: &mut Assets<ColorMaterial>, cfg: &BoardConfig, dims: &BoardDims) {
