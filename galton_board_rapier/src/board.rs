@@ -80,27 +80,74 @@ fn build_board(
     spawn_dividers(commands, meshes, materials, cfg, dims);
 }
 
-fn spawn_funnel(commands: &mut Commands, meshes: &mut Assets<Mesh>, materials: &mut Assets<ColorMaterial>, cfg: &BoardConfig, dims: &BoardDims) {
+/// Entonnoir : deux murs inclinés continus (un gauche, un droit) formés d'un
+/// seul cuboid rotatif chacun.  Le résultat est une vraie paroi inclinée sans
+/// escaliers ni discontinuités.
+fn spawn_funnel(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<ColorMaterial>,
+    cfg: &BoardConfig,
+    dims: &BoardDims,
+) {
     let color = materials.add(Color::srgb(0.25, 0.33, 0.60));
-    let num_steps = 10usize;
-    let start_half_gap = BOARD_WIDTH * 0.40;
-    let end_half_gap = cfg.peg_spacing_x();
-    let total_h = dims.spawn_y - dims.peg_top_y;
-    let step_h = total_h / num_steps as f32;
-    let wall_h = step_h * 0.45;
-    let half_board = BOARD_WIDTH * 0.5;
+    // Haut de l'entonnoir : presque toute la largeur de la planche.
+    let start_half_gap = BOARD_WIDTH * 0.45;
+    // Bas de l'entonnoir : 1.5× l'espacement des piquets (assez large pour
+    // laisser passer une balle sans la forcer sur l'axe du premier piquet).
+    let end_half_gap = cfg.peg_spacing_x() * 1.5;
+    // Limites verticales : juste sous le point de spawn, jusqu'à mi-chemin
+    // entre peg_top_y et la rangée suivante.
+    let y_top = dims.spawn_y - 8.0;
+    let y_bot = dims.peg_top_y + cfg.peg_spacing_y() * 0.5;
 
-    for i in 0..num_steps {
-        let t = i as f32 / (num_steps - 1) as f32;
-        let half_gap = start_half_gap + (end_half_gap - start_half_gap) * t;
-        let y = dims.spawn_y - (i as f32 + 0.5) * step_h;
-        let wall_half_w = (half_board - half_gap) * 0.5;
-        if wall_half_w <= 0.0 { continue; }
-        let left_cx = -(half_gap + wall_half_w);
-        let right_cx = half_gap + wall_half_w;
-        spawn_static_box(commands, meshes, &color, Vec2::new(left_cx, y), Vec2::new(wall_half_w, wall_h));
-        spawn_static_box(commands, meshes, &color, Vec2::new(right_cx, y), Vec2::new(wall_half_w, wall_h));
+    spawn_funnel_wall(
+        commands, meshes, &color,
+        start_half_gap, y_top,
+        end_half_gap,   y_bot,
+        5.0,
+    );
+    spawn_funnel_wall(
+        commands, meshes, &color,
+        -start_half_gap, y_top,
+        -end_half_gap,   y_bot,
+        5.0,
+    );
+}
+
+/// Crée un mur incliné entre (x1, y1) et (x2, y2) avec l'épaisseur donnée.
+#[allow(clippy::too_many_arguments)]
+fn spawn_funnel_wall(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    color: &Handle<ColorMaterial>,
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    thickness: f32,
+) {
+    let dx = x2 - x1;
+    let dy = y2 - y1;
+    let length = (dx * dx + dy * dy).sqrt();
+    if length < 1.0 {
+        return;
     }
+    let angle = dy.atan2(dx); // angle de l'axe long du rectangle
+    let cx = (x1 + x2) * 0.5;
+    let cy = (y1 + y2) * 0.5;
+    let mesh = meshes.add(Rectangle::new(length, thickness));
+    commands.spawn((
+        Mesh2d(mesh),
+        MeshMaterial2d(color.clone()),
+        Transform::from_translation(Vec3::new(cx, cy, 0.5))
+            .with_rotation(Quat::from_rotation_z(angle)),
+        RigidBody::Fixed,
+        Collider::cuboid(length * 0.5, thickness * 0.5),
+        Restitution::coefficient(WALL_RESTITUTION),
+        Friction::coefficient(WALL_FRICTION),
+        BoardEntity,
+    ));
 }
 
 fn spawn_pegs(

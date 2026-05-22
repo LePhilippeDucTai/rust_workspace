@@ -63,11 +63,18 @@ fn spawn_one(
     rng: &mut impl Rng,
 ) {
     let hue = rng.gen_range(0.0..360.0f32);
+    // Petit jitter de position et vélocité horizontale pour garantir que chaque balle
+    // frappe le premier piquet légèrement hors axe → elle peut rouler d'un côté.
+    // Sans ça (et sans LockedAxes::ROTATION_LOCKED retirée), une balle tombant pile
+    // à l'apex d'un piquet rebondit verticalement indéfiniment (pas de composante
+    // horizontale dans la normale de contact).
+    let x_jitter = rng.gen_range(-5.0..=5.0f32);
+    let vx = rng.gen_range(-25.0..=25.0f32);
     let radius = config.particle_radius;
     commands.spawn((
         Mesh2d(mesh.clone()),
         MeshMaterial2d(materials.add(Color::hsl(hue, 0.95, 0.68))),
-        Transform::from_xyz(0.0, dims.spawn_y, 0.5),
+        Transform::from_xyz(x_jitter, dims.spawn_y, 0.5),
         Particle,
         RigidBody::Dynamic,
         Collider::ball(radius),
@@ -77,8 +84,9 @@ fn spawn_one(
             linear_damping: PARTICLE_LINEAR_DAMPING,
             angular_damping: PARTICLE_ANGULAR_DAMPING,
         },
-        LockedAxes::ROTATION_LOCKED,
-        Velocity::linear(Vec2::new(0.0, -15.0)),
+        // ROTATION_LOCKED retiré : sans rotation libre, le frottement ne peut pas
+        // créer de couple pour faire rouler la balle hors de l'apex du piquet.
+        Velocity::linear(Vec2::new(vx, -20.0)),
         Ccd::enabled(),
     ));
 }
