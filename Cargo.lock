@@ -2159,6 +2159,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bevy_markov_chain"
+version = "0.1.0"
+dependencies = [
+ "bevy 0.18.1",
+ "ndarray",
+ "rand 0.8.5",
+]
+
+[[package]]
 name = "bevy_math"
 version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4919,14 +4928,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "galton_board"
-version = "0.1.0"
-dependencies = [
- "bevy 0.18.1",
- "rand 0.8.5",
-]
-
-[[package]]
 name = "galton_board_rapier"
 version = "0.1.0"
 dependencies = [
@@ -6119,6 +6120,21 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "ndarray"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "882ed72dce9365842bf196bdeedf5055305f11fc8c03dee7bb0194a6cad34841"
+dependencies = [
+ "matrixmultiply",
+ "num-complex",
+ "num-integer",
+ "num-traits",
+ "portable-atomic",
+ "portable-atomic-util",
+ "rawpointer",
 ]
 
 [[package]]
@@ -8922,7 +8938,7 @@ dependencies = [
  "ndk-sys 0.6.0+11769913",
  "objc",
  "once_cell",
- "ordered-float 4.6.0",
+ "ordered-float 5.3.0",
  "parking_lot",
  "portable-atomic",
  "portable-atomic-util",
