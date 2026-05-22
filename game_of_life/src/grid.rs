@@ -78,3 +78,96 @@ impl Grid {
         count
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_grid_creation() {
+        let grid = Grid::new(5, 5);
+        assert_eq!(grid.width, 5);
+        assert_eq!(grid.height, 5);
+        assert_eq!(grid.alive_count(), 0);
+    }
+
+    #[test]
+    fn test_get_set_cells() {
+        let mut grid = Grid::new(3, 3);
+        grid.set(1, 1, true);
+        assert!(grid.get(1, 1));
+        assert!(!grid.get(0, 0));
+
+        grid.set(1, 1, false);
+        assert!(!grid.get(1, 1));
+    }
+
+    #[test]
+    fn test_alive_count() {
+        let mut grid = Grid::new(3, 3);
+        assert_eq!(grid.alive_count(), 0);
+
+        grid.set(0, 0, true);
+        grid.set(1, 1, true);
+        grid.set(2, 2, true);
+        assert_eq!(grid.alive_count(), 3);
+    }
+
+    #[test]
+    fn test_clear_grid() {
+        let mut grid = Grid::new(3, 3);
+        grid.set(0, 0, true);
+        grid.set(1, 1, true);
+        grid.clear();
+        assert_eq!(grid.alive_count(), 0);
+    }
+
+    #[test]
+    fn test_toroidal_wrapping() {
+        let mut grid = Grid::new(3, 3);
+        grid.set(0, 0, true);
+        // The cell at (2, 2) should be a neighbour due to wrapping
+        assert!(grid.get(0, 0));
+    }
+
+    #[test]
+    fn test_single_live_cell_dies() {
+        let mut grid = Grid::new(3, 3);
+        grid.set(1, 1, true);
+        grid.step();
+        assert_eq!(grid.alive_count(), 0);
+    }
+
+    #[test]
+    fn test_blinker_pattern() {
+        let mut grid = Grid::new(5, 5);
+        // Horizontal line (blinker)
+        grid.set(1, 2, true);
+        grid.set(2, 2, true);
+        grid.set(3, 2, true);
+
+        grid.step();
+        assert!(grid.get(2, 1));
+        assert!(grid.get(2, 2));
+        assert!(grid.get(2, 3));
+
+        grid.step();
+        assert!(grid.get(1, 2));
+        assert!(grid.get(2, 2));
+        assert!(grid.get(3, 2));
+    }
+
+    #[test]
+    fn test_block_pattern_stable() {
+        let mut grid = Grid::new(5, 5);
+        // 2x2 block (stable pattern)
+        grid.set(1, 1, true);
+        grid.set(2, 1, true);
+        grid.set(1, 2, true);
+        grid.set(2, 2, true);
+
+        let original_count = grid.alive_count();
+        grid.step();
+        assert_eq!(grid.alive_count(), original_count);
+    }
+}

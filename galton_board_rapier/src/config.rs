@@ -48,3 +48,85 @@ pub const WALL_RESTITUTION: f32 = 0.20;
 pub const WALL_FRICTION: f32 = 0.25;
 
 pub const PACKING_EFFICIENCY: f32 = 0.78;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_window_dimensions() {
+        assert!(WINDOW_WIDTH > 0.0);
+        assert!(WINDOW_HEIGHT > 0.0);
+        assert_eq!(HALF_HEIGHT, WINDOW_HEIGHT * 0.5);
+    }
+
+    #[test]
+    fn test_board_layout() {
+        assert!(BOARD_WIDTH > 0.0);
+        assert!(TOP_MARGIN > 0.0);
+        assert!(BIN_ENTRY_MARGIN > 0.0);
+        assert!(BOTTOM_MARGIN > 0.0);
+    }
+
+    #[test]
+    fn test_peg_spacing_ratio() {
+        assert!(PEG_SPACING_RATIO > 0.0);
+        assert!(PEG_SPACING_RATIO < 1.0);
+    }
+
+    #[test]
+    fn test_row_count_bounds() {
+        assert!(MIN_ROWS > 0);
+        assert!(MAX_ROWS > MIN_ROWS);
+        assert!(DEFAULT_ROWS >= MIN_ROWS);
+        assert!(DEFAULT_ROWS <= MAX_ROWS);
+    }
+
+    #[test]
+    fn test_particle_radius_bounds() {
+        assert!(MIN_PARTICLE_RADIUS > 0.0);
+        assert!(MAX_PARTICLE_RADIUS > MIN_PARTICLE_RADIUS);
+        assert!(DEFAULT_PARTICLE_RADIUS >= MIN_PARTICLE_RADIUS);
+        assert!(DEFAULT_PARTICLE_RADIUS <= MAX_PARTICLE_RADIUS);
+    }
+
+    #[test]
+    fn test_particle_target_bounds() {
+        assert!(MIN_TARGET_PARTICLES > 0);
+        assert!(MAX_TARGET_PARTICLES > MIN_TARGET_PARTICLES);
+        assert!(DEFAULT_TARGET_PARTICLES >= MIN_TARGET_PARTICLES);
+        assert!(DEFAULT_TARGET_PARTICLES <= MAX_TARGET_PARTICLES);
+    }
+
+    #[test]
+    fn test_physics_parameters() {
+        assert!(SPAWN_RATE > 0.0);
+        assert!(GRAVITY_Y < 0.0);
+        assert!(PIXELS_PER_METER > 0.0);
+    }
+
+    #[test]
+    fn test_material_coefficients() {
+        assert!(PARTICLE_RESTITUTION >= 0.0 && PARTICLE_RESTITUTION <= 1.0);
+        assert!(PARTICLE_FRICTION >= 0.0 && PARTICLE_FRICTION <= 1.0);
+        assert!(PARTICLE_LINEAR_DAMPING >= 0.0 && PARTICLE_LINEAR_DAMPING <= 1.0);
+        assert!(PARTICLE_ANGULAR_DAMPING >= 0.0 && PARTICLE_ANGULAR_DAMPING <= 1.0);
+
+        assert!(PEG_RESTITUTION >= 0.0 && PEG_RESTITUTION <= 1.0);
+        assert!(PEG_FRICTION >= 0.0 && PEG_FRICTION <= 1.0);
+
+        assert!(WALL_RESTITUTION >= 0.0 && WALL_RESTITUTION <= 1.0);
+        assert!(WALL_FRICTION >= 0.0 && WALL_FRICTION <= 1.0);
+    }
+
+    #[test]
+    fn test_packing_efficiency() {
+        assert!(PACKING_EFFICIENCY > 0.0);
+        assert!(PACKING_EFFICIENCY <= 1.0);
+    }
+
+    #[test]
+    fn test_peg_and_particle_sizes() {
+        assert!(PEG_RADIUS > DEFAULT_PARTICLE_RADIUS);
+    }
+}

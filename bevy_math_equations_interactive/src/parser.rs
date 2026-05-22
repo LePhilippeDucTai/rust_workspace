@@ -245,3 +245,86 @@ pub fn parse(input: &str) -> Result<Equation, String> {
     let mut parser = Parser::new(tokens);
     parser.parse_equation()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_simple_equation() {
+        let result = parse("x = 5");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_addition() {
+        let result = parse("x + 2 = 5");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_subtraction() {
+        let result = parse("x - 3 = 10");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_multiplication() {
+        let result = parse("2 * x = 10");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_division() {
+        let result = parse("x / 2 = 5");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_power() {
+        let result = parse("x ^ 2 = 4");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_parentheses() {
+        let result = parse("(x + 2) * 3 = 15");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_sqrt() {
+        let result = parse("sqrt(x) = 5");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_negative() {
+        let result = parse("-x = 5");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_complex_expression() {
+        let result = parse("2 * x + 3 - 1 = 10");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_invalid_equation_missing_equals() {
+        let result = parse("x + 2");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_invalid_equation_extra_tokens() {
+        let result = parse("x = 5 + 3 extra");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_lexer_whitespace_handling() {
+        let result = parse("  x  =  5  ");
+        assert!(result.is_ok());
+    }
+}

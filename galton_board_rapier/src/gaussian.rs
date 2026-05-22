@@ -161,3 +161,53 @@ fn draw_histogram(
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gaussian_height_at_zero() {
+        let scale = 1.0;
+        let itss = 0.5;
+        let isq2pi = 0.3989;
+        let height = gaussian_height(0.0, scale, itss, isq2pi);
+        // At x=0, gaussian should be at maximum
+        assert!(height > 0.0);
+    }
+
+    #[test]
+    fn test_gaussian_height_symmetry() {
+        let scale = 1.0;
+        let itss = 0.5;
+        let isq2pi = 0.3989;
+        let x = 2.0;
+        let h_pos = gaussian_height(x, scale, itss, isq2pi);
+        let h_neg = gaussian_height(-x, scale, itss, isq2pi);
+        // Gaussian should be symmetric
+        assert!((h_pos - h_neg).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_gaussian_height_decreases_away_from_center() {
+        let scale = 1.0;
+        let itss = 0.5;
+        let isq2pi = 0.3989;
+        let h0 = gaussian_height(0.0, scale, itss, isq2pi);
+        let h1 = gaussian_height(1.0, scale, itss, isq2pi);
+        let h2 = gaussian_height(2.0, scale, itss, isq2pi);
+        // Gaussian should decrease as we move away from center
+        assert!(h0 > h1);
+        assert!(h1 > h2);
+    }
+
+    #[test]
+    fn test_gaussian_height_scale_factor() {
+        let itss = 0.5;
+        let isq2pi = 0.3989;
+        let h1 = gaussian_height(0.0, 1.0, itss, isq2pi);
+        let h2 = gaussian_height(0.0, 2.0, itss, isq2pi);
+        // Doubling scale should double height
+        assert!((h2 - 2.0 * h1).abs() < 0.0001);
+    }
+}
