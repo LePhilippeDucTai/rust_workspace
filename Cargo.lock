@@ -2328,6 +2328,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ef8e4b7e61dfe7719bb03c884dc270cd46a82efb40f93e9933b990c5c190c59"
 
 [[package]]
+name = "bevy_n_body_chaos"
+version = "0.1.0"
+dependencies = [
+ "bevy 0.18.1",
+ "bevy_rapier3d",
+ "rand 0.8.5",
+]
+
+[[package]]
 name = "bevy_pbr"
 version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2597,6 +2606,19 @@ dependencies = [
  "log",
  "nalgebra",
  "rapier2d",
+]
+
+[[package]]
+name = "bevy_rapier3d"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "452ac015886243646f19843c98b5da32713d2dbbe433e9fe89fb25f9d01f9bb5"
+dependencies = [
+ "bevy 0.18.1",
+ "bitflags 2.11.1",
+ "log",
+ "nalgebra",
+ "rapier3d",
 ]
 
 [[package]]
@@ -6707,6 +6729,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "parry3d"
+version = "0.26.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8598fd0fa548d469b6ca4f9e90b446434fb879c12494a91e41c341d8f0f558d8"
+dependencies = [
+ "approx",
+ "arrayvec",
+ "bitflags 2.11.1",
+ "downcast-rs 2.0.1",
+ "either",
+ "ena",
+ "foldhash 0.2.0",
+ "glamx",
+ "hashbrown 0.16.1",
+ "log",
+ "num-derive",
+ "num-traits",
+ "ordered-float 5.3.0",
+ "rstar",
+ "simba",
+ "slab",
+ "smallvec",
+ "spade",
+ "static_assertions",
+ "thiserror 2.0.12",
+]
+
+[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7096,6 +7146,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "rapier3d"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a576251c9dc2d6aff08470b7433096a04019c8b7bea9bbb7087f092c180feaea"
+dependencies = [
+ "approx",
+ "arrayvec",
+ "bit-vec 0.8.0",
+ "bitflags 2.11.1",
+ "downcast-rs 2.0.1",
+ "glamx",
+ "log",
+ "nalgebra",
+ "num-derive",
+ "num-traits",
+ "ordered-float 5.3.0",
+ "parry3d",
+ "profiling",
+ "rustc-hash 2.1.1",
+ "simba",
+ "static_assertions",
+ "thiserror 2.0.12",
+ "vec_map",
+ "wide",
+]
+
+[[package]]
 name = "raw-window-handle"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7338,6 +7415,17 @@ name = "roxmltree"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
+
+[[package]]
+name = "rstar"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "421400d13ccfd26dfa5858199c30a5d76f9c54e0dba7575273025b43c5175dbb"
+dependencies = [
+ "heapless 0.8.0",
+ "num-traits",
+ "smallvec",
+]
 
 [[package]]
 name = "runner"
