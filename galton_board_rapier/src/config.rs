@@ -8,7 +8,9 @@ pub const BOARD_WIDTH: f32 = 800.0;
 pub const TOP_MARGIN: f32 = 90.0;
 pub const BIN_ENTRY_MARGIN: f32 = 26.0;
 pub const BOTTOM_MARGIN: f32 = 28.0;
-pub const PEG_SPACING_RATIO: f32 = 0.62;
+// Triangles équilatéraux : √3/2 ≈ 0.866 — chaque piquet est centré dans
+// un canal en V symétrique, garantissant p=0.5 à chaque nœud.
+pub const PEG_SPACING_RATIO: f32 = 0.866;
 
 pub const DEFAULT_ROWS: usize = 14;
 pub const DEFAULT_PARTICLE_RADIUS: f32 = 2.8;
@@ -33,15 +35,16 @@ pub const GRAVITY_Y: f32 = -900.0;
 pub const PIXELS_PER_METER: f32 = 100.0;
 
 /// Coefficients de matière (élasticité, frottement, traînée) — bornés [0,1].
-pub const PARTICLE_RESTITUTION: f32 = 0.05;
-pub const PARTICLE_FRICTION: f32 = 0.1;
-pub const PARTICLE_LINEAR_DAMPING: f32 = 0.35;
-pub const PARTICLE_ANGULAR_DAMPING: f32 = 0.8;
+/// Valeurs calibrées sur un vrai Galton board à billes métalliques.
+pub const PARTICLE_RESTITUTION: f32 = 0.40;
+pub const PARTICLE_FRICTION: f32 = 0.05;
+pub const PARTICLE_LINEAR_DAMPING: f32 = 0.04;
+pub const PARTICLE_ANGULAR_DAMPING: f32 = 0.30;
 
-pub const PEG_RESTITUTION: f32 = 0.10;
-pub const PEG_FRICTION: f32 = 0.3;
+pub const PEG_RESTITUTION: f32 = 0.55;
+pub const PEG_FRICTION: f32 = 0.10;
 
-pub const WALL_RESTITUTION: f32 = 0.05;
-pub const WALL_FRICTION: f32 = 0.4;
+pub const WALL_RESTITUTION: f32 = 0.20;
+pub const WALL_FRICTION: f32 = 0.25;
 
 pub const PACKING_EFFICIENCY: f32 = 0.78;

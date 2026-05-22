@@ -86,8 +86,12 @@ fn spawn_one(
     // Sans ça (et sans LockedAxes::ROTATION_LOCKED retirée), une balle tombant pile
     // à l'apex d'un piquet rebondit verticalement indéfiniment (pas de composante
     // horizontale dans la normale de contact).
-    let x_jitter = rng.gen_range(-5.0..=5.0f32);
-    let vx = rng.gen_range(-25.0..=25.0f32);
+    // Petit jitter : l'entonnoir guide ensuite les billes vers le centre.
+    // Jitter de position couvrant la plage de contact du premier piquet
+    // (rayon_piquet + rayon_bille ≈ 9.8 px) pour assurer p=0.5 dès le 1er nœud.
+    // Petit vx pour briser la symétrie et varier les trajectoires suivantes.
+    let x_jitter = rng.gen_range(-7.0..=7.0f32);
+    let vx = rng.gen_range(-15.0..=15.0f32);
     let radius = config.particle_radius;
     commands.spawn((
         Mesh2d(mesh.clone()),

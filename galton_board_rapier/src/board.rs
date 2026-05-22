@@ -6,8 +6,8 @@ use bevy_rapier2d::prelude::*;
 
 use crate::components::{BoardEntity, Particle, Peg};
 use crate::config::{
-    BOARD_WIDTH, DIVIDER_HALF_WIDTH, PEG_FRICTION, PEG_RADIUS, PEG_RESTITUTION, WALL_FRICTION,
-    WALL_RESTITUTION,
+    BOARD_WIDTH, DIVIDER_HALF_WIDTH, HALF_HEIGHT, PEG_FRICTION, PEG_RADIUS, PEG_RESTITUTION,
+    WALL_FRICTION, WALL_RESTITUTION,
 };
 use crate::resources::{BoardConfig, BoardDims, SimState};
 
@@ -74,51 +74,38 @@ fn build_board(
     cfg: &BoardConfig,
     dims: &BoardDims,
 ) {
-    spawn_funnel(commands, meshes, materials, cfg, dims);
-    spawn_pegs(commands, meshes, materials, cfg, dims);
     spawn_walls(commands, meshes, materials, dims);
+    spawn_hopper(commands, meshes, materials, cfg, dims);
+    spawn_pegs(commands, meshes, materials, cfg, dims);
     spawn_dividers(commands, meshes, materials, cfg, dims);
 }
 
-/// Entonnoir : deux murs inclinés continus (un gauche, un droit) formés d'un
-/// seul cuboid rotatif chacun.  Le résultat est une vraie paroi inclinée sans
-/// escaliers ni discontinuités.
-fn spawn_funnel(
+/// Entonnoir centré en haut de la planche. Les murs diagonaux convergent
+/// depuis les bords jusqu'à une ouverture étroite centrée sur le premier piquet.
+fn spawn_hopper(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<ColorMaterial>,
     cfg: &BoardConfig,
     dims: &BoardDims,
 ) {
-    let color = materials.add(Color::srgb(0.25, 0.33, 0.60));
-    // Haut de l'entonnoir : exactement la demi-largeur de la planche, flush
-    // avec les murs latéraux — aucun gap sur les côtés.
-    let start_half_gap = BOARD_WIDTH * 0.5;
-    // Goulot légèrement agrandi : ~2.5 diamètres de particule pour éviter
-    // les blocages sans laisser passer plusieurs balles de front.
-    let end_half_gap = cfg.particle_radius * 2.5 + 2.0;
-    // Limites verticales : le mur démarre au point de spawn (plus haut),
-    // et se referme jusqu'à mi-chemin entre peg_top_y et la rangée suivante.
-    let y_top = dims.spawn_y;
-    let y_bot = dims.peg_top_y + cfg.peg_spacing_y() * 4.0;
+    let color = materials.add(Color::srgb(0.40, 0.50, 0.78));
+    // Les murs de l'entonnoir partent au-delà des murs latéraux du plateau pour
+    // supprimer tout interstice : le récipient est entièrement fermé.
+    let half_top = BOARD_WIDTH * 0.5 + 12.0;
+    // Col : 3 billes de large pour un débit correct sans bouchon.
+    let half_bot = cfg.particle_radius * 3.0;
+    // y_top > y_bot (coordonnées Bevy, +Y vers le haut).
+    let y_top = HALF_HEIGHT - 10.0;
+    // Bas de l'entonnoir : juste au-dessus du premier piquet.
+    let y_bot = dims.peg_top_y + cfg.peg_spacing_y() * 0.8;
 
-    spawn_funnel_wall(
-        commands, meshes, &color,
-        start_half_gap, y_top,
-        end_half_gap,   y_bot,
-        5.0,
-    );
-    spawn_funnel_wall(
-        commands, meshes, &color,
-        -start_half_gap, y_top,
-        -end_half_gap,   y_bot,
-        5.0,
-    );
+    spawn_diagonal_wall(commands, meshes, &color, half_top, y_top, half_bot, y_bot, 5.0);
+    spawn_diagonal_wall(commands, meshes, &color, -half_top, y_top, -half_bot, y_bot, 5.0);
 }
 
-/// Crée un mur incliné entre (x1, y1) et (x2, y2) avec l'épaisseur donnée.
 #[allow(clippy::too_many_arguments)]
-fn spawn_funnel_wall(
+fn spawn_diagonal_wall(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     color: &Handle<ColorMaterial>,
@@ -128,20 +115,17 @@ fn spawn_funnel_wall(
     y2: f32,
     thickness: f32,
 ) {
-    let dx = x2 - x1;
-    let dy = y2 - y1;
+    let (dx, dy) = (x2 - x1, y2 - y1);
     let length = (dx * dx + dy * dy).sqrt();
     if length < 1.0 {
         return;
     }
-    let angle = dy.atan2(dx); // angle de l'axe long du rectangle
-    let cx = (x1 + x2) * 0.5;
-    let cy = (y1 + y2) * 0.5;
+    let angle = dy.atan2(dx);
     let mesh = meshes.add(Rectangle::new(length, thickness));
     commands.spawn((
         Mesh2d(mesh),
         MeshMaterial2d(color.clone()),
-        Transform::from_translation(Vec3::new(cx, cy, 0.5))
+        Transform::from_translation(Vec3::new((x1 + x2) * 0.5, (y1 + y2) * 0.5, 0.5))
             .with_rotation(Quat::from_rotation_z(angle)),
         RigidBody::Fixed,
         Collider::cuboid(length * 0.5, thickness * 0.5),
@@ -189,9 +173,9 @@ fn spawn_walls(
     let wc = materials.add(Color::srgb(0.20, 0.28, 0.55));
     let t = 6.0_f32;
 
-    // Murs latéraux rectangulaires : de la zone des piquets jusqu'au sol.
-    let wall_center_y = (dims.peg_top_y + dims.bin_bottom_y) * 0.5;
-    let wall_half_h = (dims.peg_top_y - dims.bin_bottom_y) * 0.5;
+    // Murs latéraux rectangulaires : du haut de la fenêtre jusqu'au sol.
+    let wall_center_y = (HALF_HEIGHT + dims.bin_bottom_y) * 0.5;
+    let wall_half_h = (HALF_HEIGHT - dims.bin_bottom_y) * 0.5;
     spawn_static_box(
         commands,
         meshes,

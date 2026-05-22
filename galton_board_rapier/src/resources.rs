@@ -66,7 +66,8 @@ impl BoardDims {
             bin_bottom_y,
             left_wall_x: -half_board,
             right_wall_x: half_board,
-            spawn_y: HALF_HEIGHT + 80.0,
+            // Spawn à l'intérieur de l'entonnoir, près du haut (y_top ≈ HALF_HEIGHT - 10).
+            spawn_y: HALF_HEIGHT - 18.0,
         }
     }
 }
