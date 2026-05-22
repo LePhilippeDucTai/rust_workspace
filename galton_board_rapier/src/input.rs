@@ -1,7 +1,9 @@
 //! Raccourcis clavier. La pause est propagée à Rapier via la `RapierConfiguration`
 //! du contexte par défaut.
 
+use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
+use bevy::ecs::message::MessageReader;
 use bevy_rapier2d::prelude::*;
 
 use crate::components::Particle;
@@ -15,7 +17,8 @@ pub struct InputPlugin;
 
 impl Plugin for InputPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, (handle_input, sync_pause).chain());
+        app.add_systems(Update, (handle_input, sync_pause).chain())
+            .add_systems(Update, handle_zoom);
     }
 }
 
@@ -105,6 +108,32 @@ fn handle_target(keys: &ButtonInput<KeyCode>, config: &mut BoardConfig) {
             .target_particles
             .saturating_sub(step)
             .max(MIN_TARGET_PARTICLES);
+    }
+}
+
+fn handle_zoom(
+    mut scroll: MessageReader<MouseWheel>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut projection: Query<&mut Projection, With<Camera2d>>,
+) {
+    let Ok(mut proj) = projection.single_mut() else {
+        return;
+    };
+    let Projection::Orthographic(ref mut orth) = *proj else {
+        return;
+    };
+    for ev in scroll.read() {
+        let delta = match ev.unit {
+            MouseScrollUnit::Line => ev.y * 0.1,
+            MouseScrollUnit::Pixel => ev.y * 0.001,
+        };
+        orth.scale = (orth.scale * (1.0 - delta)).clamp(0.2, 5.0);
+    }
+    if keys.just_pressed(KeyCode::BracketLeft) {
+        orth.scale = (orth.scale * 0.9).max(0.2);
+    }
+    if keys.just_pressed(KeyCode::BracketRight) {
+        orth.scale = (orth.scale * 1.1).min(5.0);
     }
 }
 

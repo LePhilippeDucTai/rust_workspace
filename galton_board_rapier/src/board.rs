@@ -6,8 +6,8 @@ use bevy_rapier2d::prelude::*;
 
 use crate::components::{BoardEntity, Particle, Peg};
 use crate::config::{
-    BOARD_WIDTH, DIVIDER_HALF_WIDTH, HALF_HEIGHT, PEG_FRICTION, PEG_RADIUS, PEG_RESTITUTION,
-    WALL_FRICTION, WALL_RESTITUTION,
+    BOARD_WIDTH, DIVIDER_HALF_WIDTH, PEG_FRICTION, PEG_RADIUS, PEG_RESTITUTION, WALL_FRICTION,
+    WALL_RESTITUTION,
 };
 use crate::resources::{BoardConfig, BoardDims, SimState};
 
@@ -100,7 +100,7 @@ fn spawn_funnel(
     // Limites verticales : le mur démarre au point de spawn (plus haut),
     // et se referme jusqu'à mi-chemin entre peg_top_y et la rangée suivante.
     let y_top = dims.spawn_y;
-    let y_bot = dims.peg_top_y + cfg.peg_spacing_y() * 0.5;
+    let y_bot = dims.peg_top_y + cfg.peg_spacing_y() * 4.0;
 
     spawn_funnel_wall(
         commands, meshes, &color,
@@ -187,21 +187,27 @@ fn spawn_walls(
     dims: &BoardDims,
 ) {
     let wc = materials.add(Color::srgb(0.20, 0.28, 0.55));
-    let (t, h) = (6.0f32, HALF_HEIGHT - 2.0);
+    let t = 6.0_f32;
+
+    // Murs latéraux rectangulaires : de la zone des piquets jusqu'au sol.
+    let wall_center_y = (dims.peg_top_y + dims.bin_bottom_y) * 0.5;
+    let wall_half_h = (dims.peg_top_y - dims.bin_bottom_y) * 0.5;
     spawn_static_box(
         commands,
         meshes,
         &wc,
-        Vec2::new(dims.left_wall_x - t * 0.5, 0.0),
-        Vec2::new(t * 0.5, h),
+        Vec2::new(dims.left_wall_x - t * 0.5, wall_center_y),
+        Vec2::new(t * 0.5, wall_half_h),
     );
     spawn_static_box(
         commands,
         meshes,
         &wc,
-        Vec2::new(dims.right_wall_x + t * 0.5, 0.0),
-        Vec2::new(t * 0.5, h),
+        Vec2::new(dims.right_wall_x + t * 0.5, wall_center_y),
+        Vec2::new(t * 0.5, wall_half_h),
     );
+
+    // Sol (couvre la zone des bacs).
     let fc = materials.add(Color::srgb(0.22, 0.30, 0.58));
     spawn_static_box(
         commands,

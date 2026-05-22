@@ -96,8 +96,12 @@ fn draw_gaussian(
     if !state.show_gaussian {
         return;
     }
-    let total: usize = state.bin_counts.iter().sum();
-    if total < 5 {
+    // Normalisation fixe : la densité théorique est précalculable.
+    // On utilise target_particles (connu dès le départ) plutôt que le nombre
+    // de balles déjà posées, ce qui évite que la courbe se déforme pendant
+    // la chute et permet de voir immédiatement si l'histogramme converge.
+    let n_counted: usize = state.bin_counts.iter().sum();
+    if n_counted < 5 {
         return;
     }
     let sigma = config.sigma_x();
@@ -106,7 +110,7 @@ fn draw_gaussian(
         1.0 / (2.0 * sigma * sigma),
         1.0 / (sigma * (2.0 * PI).sqrt()),
     );
-    let scale = total as f32 * PI * r * r / PACKING_EFFICIENCY;
+    let scale = n_counted as f32 * PI * r * r / PACKING_EFFICIENCY;
     let half_span = config.peg_spacing_x() * (config.rows as f32 * 0.5 + 0.5);
     draw_curve(
         &mut gizmos,

@@ -76,11 +76,12 @@ fn update_hud(
 fn hud_string(config: &BoardConfig, state: &SimState, fps: f32, alive: usize) -> String {
     let pause = if state.paused { "PAUSE" } else { "RUN  " };
     format!(
-        "Planche de Galton (Rapier)  —  {pause}  |  FPS: {fps:5.0}\n\
-         Rangées (← →) : {rows}    Bacs : {bins}    σ_x ≈ {sigma:.1} px\n\
-         Rayon particule (↑ ↓) : {radius:.1} px\n\
+        "Planche de Galton (Rapier) -- {pause}  |  FPS: {fps:5.0}\n\
+         Rangees (<- ->) : {rows}    Bacs : {bins}    sigma_x ~ {sigma:.1} px\n\
+         Rayon particule (^ v) : {radius:.1} px\n\
          Cible (- +) : {target}    Vivantes : {alive}    Spawn : {spawned} / {target}\n\
-         [Espace] pause  [R] reset  [G] courbe gaussienne  [H] barres histogramme",
+         [Espace] pause  [R] reset  [G] courbe gaussienne  [H] barres histogramme\n\
+         [scroll] zoom   [ [ / ] ] zoom clavier",
         rows = config.rows,
         bins = config.num_bins(),
         sigma = config.sigma_x(),
@@ -95,8 +96,8 @@ fn stats_string(state: &SimState, config: &BoardConfig) -> String {
     let (mean, var) = mean_var(&state.bin_counts, config);
     format!(
         "Bacs (comptage) : {counted} particules\n\
-         μ empirique : {mean:+6.2} px    σ empirique : {std:5.2} px\n\
-         σ théorique : {sigma:.2} px  (modèle binomial : d·√N, d = pas/2)",
+         mu empirique : {mean:+6.2} px    sigma empirique : {std:5.2} px\n\
+         sigma theorique : {sigma:.2} px  (binomial : d*sqrt(N), d = pas/2)",
         std = var.sqrt(),
         sigma = config.sigma_x(),
     )
