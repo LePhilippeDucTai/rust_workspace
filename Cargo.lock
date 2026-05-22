@@ -4919,14 +4919,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "galton_board"
-version = "0.1.0"
-dependencies = [
- "bevy 0.18.1",
- "rand 0.8.5",
-]
-
-[[package]]
 name = "galton_board_rapier"
 version = "0.1.0"
 dependencies = [
