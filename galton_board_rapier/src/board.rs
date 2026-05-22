@@ -92,13 +92,14 @@ fn spawn_funnel(
 ) {
     let color = materials.add(Color::srgb(0.25, 0.33, 0.60));
     // Haut de l'entonnoir : presque toute la largeur de la planche.
-    let start_half_gap = BOARD_WIDTH * 0.45;
-    // Bas de l'entonnoir : 1.5× l'espacement des piquets (assez large pour
-    // laisser passer une balle sans la forcer sur l'axe du premier piquet).
-    let end_half_gap = cfg.peg_spacing_x() * 1.5;
-    // Limites verticales : juste sous le point de spawn, jusqu'à mi-chemin
-    // entre peg_top_y et la rangée suivante.
-    let y_top = dims.spawn_y - 8.0;
+    let start_half_gap = BOARD_WIDTH * 0.48;
+    // Goulot : juste assez large pour une seule particule à la fois.
+    // gap = 2 × end_half_gap ≈ 2 × (r + 2) → une balle passe (2r + 4),
+    // deux côte à côte non (4r = 11.2 > gap).
+    let end_half_gap = cfg.particle_radius + 2.0;
+    // Limites verticales : le mur démarre au point de spawn (plus haut),
+    // et se referme jusqu'à mi-chemin entre peg_top_y et la rangée suivante.
+    let y_top = dims.spawn_y;
     let y_bot = dims.peg_top_y + cfg.peg_spacing_y() * 0.5;
 
     spawn_funnel_wall(

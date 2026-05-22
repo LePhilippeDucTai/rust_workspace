@@ -34,7 +34,7 @@ pub const PIXELS_PER_METER: f32 = 100.0;
 
 /// Coefficients de matière (élasticité, frottement, traînée) — bornés [0,1].
 pub const PARTICLE_RESTITUTION: f32 = 0.35;
-pub const PARTICLE_FRICTION: f32 = 0.4;
+pub const PARTICLE_FRICTION: f32 = 0.0;
 pub const PARTICLE_LINEAR_DAMPING: f32 = 0.15;
 pub const PARTICLE_ANGULAR_DAMPING: f32 = 0.6;
 
