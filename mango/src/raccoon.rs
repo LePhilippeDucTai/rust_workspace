@@ -1,11 +1,6 @@
 use crate::data::ProgressionData;
 
-pub fn pick_dialogue(
-    data: &ProgressionData,
-    level: u32,
-    friendship: u32,
-    context: &str,
-) -> String {
+pub fn pick_dialogue(data: &ProgressionData, level: u32, friendship: u32, context: &str) -> String {
     let mut best: Option<&crate::data::DialogueLine> = None;
     for line in &data.dialogues {
         if line.context != context {
@@ -31,4 +26,3 @@ pub fn pick_dialogue(
     best.map(|l| l.text.clone())
         .unwrap_or_else(|| "...".to_string())
 }
-

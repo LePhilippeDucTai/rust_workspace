@@ -57,7 +57,10 @@ fn main() {
         .add_message::<CorrectAnswer>()
         .add_message::<IncorrectAnswer>()
         .add_message::<LevelUpEvent>()
-        .add_systems(Startup, (ui::setup_scene, initialize_player_from_save).chain())
+        .add_systems(
+            Startup,
+            (ui::setup_scene, initialize_player_from_save).chain(),
+        )
         .add_systems(Startup, jumpstart_state.after(initialize_player_from_save))
         .add_systems(
             Update,
@@ -116,10 +119,7 @@ fn jumpstart_state(mut next_state: ResMut<NextState<GamePhase>>) {
     next_state.set(GamePhase::WaitingForQuestion);
 }
 
-fn on_enter_waiting(
-    state: Res<State<GamePhase>>,
-    mut wait_timer: ResMut<WaitTimer>,
-) {
+fn on_enter_waiting(state: Res<State<GamePhase>>, mut wait_timer: ResMut<WaitTimer>) {
     if state.is_changed() && *state.get() == GamePhase::WaitingForQuestion {
         wait_timer.0 = Timer::from_seconds(1.2, TimerMode::Once);
     }

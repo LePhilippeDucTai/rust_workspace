@@ -54,7 +54,10 @@ fn setup_scene(
         Mesh2d(meshes.add(Circle::new(radius))),
         MeshMaterial2d(materials.add(Color::srgb(0.5, 0.5, 0.5))),
         Transform::from_xyz(0.0, 0.0, 0.0),
-        Ball { radius, mass: radius },
+        Ball {
+            radius,
+            mass: radius,
+        },
         Velocity(Vec2::new(angle.cos(), angle.sin()) * INITIAL_SPEED),
         ColorCycler,
     ));

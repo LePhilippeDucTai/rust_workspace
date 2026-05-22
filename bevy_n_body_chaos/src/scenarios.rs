@@ -77,27 +77,27 @@ pub fn pythagorean() -> Scenario {
 /// Circumradius R=11.55, ω=0.612 rad/s pour G=1000, m=1, a=20.
 pub fn lagrange_triangle() -> Scenario {
     let r = 11.547_f32; // R = a/sqrt(3), a=20
-    let v = 7.07_f32;  // ω*R = 0.6124 * 11.547
-    let dz = 0.8_f32;  // léger biais z pour rendre l'orbite 3D visuellement
+    let v = 7.07_f32; // ω*R = 0.6124 * 11.547
+    let dz = 0.8_f32; // léger biais z pour rendre l'orbite 3D visuellement
     Scenario {
         name: "Triangle de Lagrange (3D)",
         bodies: vec![
             BodyInit {
                 mass: 1.0,
-                position:  Vec3::new(0.0,   r,    dz),
-                velocity:  Vec3::new(-v,     0.0,  0.0),
+                position: Vec3::new(0.0, r, dz),
+                velocity: Vec3::new(-v, 0.0, 0.0),
                 color: Color::hsl(180.0, 0.9, 0.65),
             },
             BodyInit {
                 mass: 1.0,
-                position:  Vec3::new(r * 0.866,  -r * 0.5, -dz * 0.5),
-                velocity:  Vec3::new(v * 0.5,     v * 0.866, 0.0),
+                position: Vec3::new(r * 0.866, -r * 0.5, -dz * 0.5),
+                velocity: Vec3::new(v * 0.5, v * 0.866, 0.0),
                 color: Color::hsl(300.0, 0.9, 0.65),
             },
             BodyInit {
                 mass: 1.0,
-                position:  Vec3::new(-r * 0.866, -r * 0.5, -dz * 0.5),
-                velocity:  Vec3::new(v * 0.5,    -v * 0.866, 0.0),
+                position: Vec3::new(-r * 0.866, -r * 0.5, -dz * 0.5),
+                velocity: Vec3::new(v * 0.5, -v * 0.866, 0.0),
                 color: Color::hsl(60.0, 0.9, 0.65),
             },
         ],
@@ -108,28 +108,38 @@ pub fn lagrange_triangle() -> Scenario {
 /// Trois corps 3D aléatoires, impulsion totale nulle (barycentre fixe).
 pub fn random_3d() -> Scenario {
     let mut rng = rand::thread_rng();
-    let hues = [rng.gen_range(0.0_f32..360.0), rng.gen_range(0.0..360.0), rng.gen_range(0.0..360.0)];
+    let hues = [
+        rng.gen_range(0.0_f32..360.0),
+        rng.gen_range(0.0..360.0),
+        rng.gen_range(0.0..360.0),
+    ];
     let masses: Vec<f32> = (0..3).map(|_| rng.gen_range(0.5_f32..3.0)).collect();
     let positions: Vec<Vec3> = (0..3)
-        .map(|_| Vec3::new(
-            rng.gen_range(-10.0_f32..10.0),
-            rng.gen_range(-10.0..10.0),
-            rng.gen_range(-5.0..5.0),
-        ))
+        .map(|_| {
+            Vec3::new(
+                rng.gen_range(-10.0_f32..10.0),
+                rng.gen_range(-10.0..10.0),
+                rng.gen_range(-5.0..5.0),
+            )
+        })
         .collect();
     let mut velocities: Vec<Vec3> = (0..3)
-        .map(|_| Vec3::new(
-            rng.gen_range(-3.0_f32..3.0),
-            rng.gen_range(-3.0..3.0),
-            rng.gen_range(-1.5..1.5),
-        ))
+        .map(|_| {
+            Vec3::new(
+                rng.gen_range(-3.0_f32..3.0),
+                rng.gen_range(-3.0..3.0),
+                rng.gen_range(-1.5..1.5),
+            )
+        })
         .collect();
 
     // Annuler l'impulsion totale pour garder le centre de masse fixe.
     let total_mass: f32 = masses.iter().sum();
     let total_p: Vec3 = velocities.iter().zip(&masses).map(|(v, &m)| *v * m).sum();
     let cm_vel = total_p / total_mass;
-    for v in &mut velocities { *v -= cm_vel; }
+    for v in &mut velocities {
+        *v -= cm_vel;
+    }
 
     Scenario {
         name: "Aléatoire 3D",
@@ -146,5 +156,10 @@ pub fn random_3d() -> Scenario {
 }
 
 pub fn all_scenarios() -> Vec<Scenario> {
-    vec![figure_eight(), pythagorean(), lagrange_triangle(), random_3d()]
+    vec![
+        figure_eight(),
+        pythagorean(),
+        lagrange_triangle(),
+        random_3d(),
+    ]
 }

@@ -2,7 +2,7 @@ use crate::ast::*;
 use bevy::prelude::Vec2;
 
 pub const FONT_SIZE: f32 = 42.0;
-pub const SMALL_FONT: f32 = 28.0;  // superscripts, root index
+pub const SMALL_FONT: f32 = 28.0; // superscripts, root index
 pub const TINY_FONT: f32 = 20.0;
 #[allow(dead_code)]
 pub const EQ_SIGN_GAP: f32 = 28.0;
@@ -47,14 +47,9 @@ pub struct LayoutNode {
 #[derive(Clone, Debug)]
 pub enum NodeKind {
     /// Plain text glyph(s)
-    Text {
-        content: String,
-        font_size: f32,
-    },
+    Text { content: String, font_size: f32 },
     /// Horizontal list of nodes, aligned on baseline
-    HList {
-        children: Vec<LayoutNode>,
-    },
+    HList { children: Vec<LayoutNode> },
     /// Fraction: numerator over denominator
     Fraction {
         numerator: Box<LayoutNode>,
@@ -63,7 +58,7 @@ pub enum NodeKind {
     },
     /// Square root or n-th root
     Radical {
-        index: Option<Box<LayoutNode>>,  // None for sqrt
+        index: Option<Box<LayoutNode>>, // None for sqrt
         radicand: Box<LayoutNode>,
     },
     /// Base with optional superscript / subscript
@@ -72,9 +67,7 @@ pub enum NodeKind {
         sup: Option<Box<LayoutNode>>,
     },
     /// Parenthesised group with scaling brackets
-    Parenthesised {
-        inner: Box<LayoutNode>,
-    },
+    Parenthesised { inner: Box<LayoutNode> },
     /// Vertical drop-insertion indicator (rendered as a thin line)
     DropIndicator,
 }
@@ -102,7 +95,11 @@ impl LayoutNode {
                     x += child.width;
                 }
             }
-            NodeKind::Fraction { numerator, denominator, bar_thickness } => {
+            NodeKind::Fraction {
+                numerator,
+                denominator,
+                bar_thickness,
+            } => {
                 let bar_y = origin.y; // fraction bar sits on the math axis
                 let bar_half = *bar_thickness * 0.5;
                 let num_y = bar_y + bar_half + FRAC_BAR_PADDING + numerator.depth;
@@ -116,7 +113,10 @@ impl LayoutNode {
                 radicand.place(Vec2::new(rad_x, origin.y));
                 if let Some(idx) = index {
                     // Place index at top-left of the radical sign, slightly raised
-                    idx.place(Vec2::new(origin.x, origin.y + radicand.height - idx.depth * 0.5));
+                    idx.place(Vec2::new(
+                        origin.x,
+                        origin.y + radicand.height - idx.depth * 0.5,
+                    ));
                 }
             }
             NodeKind::Script { base, sup } => {
@@ -148,19 +148,29 @@ impl LayoutNode {
                 });
             }
             NodeKind::HList { children } => {
-                for c in children { c.collect_texts(out); }
+                for c in children {
+                    c.collect_texts(out);
+                }
             }
-            NodeKind::Fraction { numerator, denominator, .. } => {
+            NodeKind::Fraction {
+                numerator,
+                denominator,
+                ..
+            } => {
                 numerator.collect_texts(out);
                 denominator.collect_texts(out);
             }
             NodeKind::Radical { index, radicand } => {
-                if let Some(idx) = index { idx.collect_texts(out); }
+                if let Some(idx) = index {
+                    idx.collect_texts(out);
+                }
                 radicand.collect_texts(out);
             }
             NodeKind::Script { base, sup } => {
                 base.collect_texts(out);
-                if let Some(s) = sup { s.collect_texts(out); }
+                if let Some(s) = sup {
+                    s.collect_texts(out);
+                }
             }
             NodeKind::Parenthesised { inner } => {
                 inner.collect_texts(out);
@@ -172,7 +182,11 @@ impl LayoutNode {
     /// Collect fraction bars (line segments) for rendering
     pub fn collect_lines(&self, out: &mut Vec<LineAtom>) {
         match &self.kind {
-            NodeKind::Fraction { numerator: _, denominator: _, bar_thickness } => {
+            NodeKind::Fraction {
+                numerator: _,
+                denominator: _,
+                bar_thickness,
+            } => {
                 let bar_y = self.origin.y;
                 out.push(LineAtom {
                     x: self.origin.x + 4.0,
@@ -195,11 +209,15 @@ impl LayoutNode {
                 });
             }
             NodeKind::HList { children } => {
-                for c in children { c.collect_lines(out); }
+                for c in children {
+                    c.collect_lines(out);
+                }
             }
             NodeKind::Script { base, sup } => {
                 base.collect_lines(out);
-                if let Some(s) = sup { s.collect_lines(out); }
+                if let Some(s) = sup {
+                    s.collect_lines(out);
+                }
             }
             NodeKind::Parenthesised { inner } => {
                 inner.collect_lines(out);
@@ -220,7 +238,9 @@ impl LayoutNode {
                 });
             }
             NodeKind::HList { children } => {
-                for c in children { c.collect_drop_indicators(out); }
+                for c in children {
+                    c.collect_drop_indicators(out);
+                }
             }
             _ => {}
         }
@@ -239,19 +259,23 @@ impl LayoutNode {
         match &self.kind {
             NodeKind::HList { children } => {
                 for c in children {
-                    if let Some(tr) = c.term_at(pt) { return Some(tr); }
+                    if let Some(tr) = c.term_at(pt) {
+                        return Some(tr);
+                    }
                 }
                 None
             }
-            NodeKind::Fraction { numerator, denominator, .. } => {
-                numerator.term_at(pt).or_else(|| denominator.term_at(pt))
-            }
-            NodeKind::Radical { radicand, index } => {
-                radicand.term_at(pt).or_else(|| index.as_ref().and_then(|i| i.term_at(pt)))
-            }
-            NodeKind::Script { base, sup } => {
-                base.term_at(pt).or_else(|| sup.as_ref().and_then(|s| s.term_at(pt)))
-            }
+            NodeKind::Fraction {
+                numerator,
+                denominator,
+                ..
+            } => numerator.term_at(pt).or_else(|| denominator.term_at(pt)),
+            NodeKind::Radical { radicand, index } => radicand
+                .term_at(pt)
+                .or_else(|| index.as_ref().and_then(|i| i.term_at(pt))),
+            NodeKind::Script { base, sup } => base
+                .term_at(pt)
+                .or_else(|| sup.as_ref().and_then(|s| s.term_at(pt))),
             NodeKind::Parenthesised { inner } => inner.term_at(pt),
             _ => None,
         }
@@ -375,7 +399,10 @@ fn make_script(base: LayoutNode, sup: LayoutNode) -> LayoutNode {
         width,
         height,
         depth,
-        kind: NodeKind::Script { base: Box::new(base), sup: Some(Box::new(sup)) },
+        kind: NodeKind::Script {
+            base: Box::new(base),
+            sup: Some(Box::new(sup)),
+        },
         origin: Vec2::ZERO,
         term_ref: None,
     }
@@ -389,7 +416,9 @@ fn make_paren(inner: LayoutNode) -> LayoutNode {
         width,
         height: inner.height + 4.0,
         depth: inner.depth + 4.0,
-        kind: NodeKind::Parenthesised { inner: Box::new(inner) },
+        kind: NodeKind::Parenthesised {
+            inner: Box::new(inner),
+        },
         origin: Vec2::ZERO,
         term_ref: None,
     }
@@ -401,7 +430,10 @@ fn needs_parens_in_product(expr: &Expr) -> bool {
 }
 
 fn needs_parens_in_power(expr: &Expr) -> bool {
-    matches!(expr, Expr::Add(_) | Expr::Mul(_) | Expr::Neg(_) | Expr::Div(_, _))
+    matches!(
+        expr,
+        Expr::Add(_) | Expr::Mul(_) | Expr::Neg(_) | Expr::Div(_, _)
+    )
 }
 
 pub fn layout_expr(expr: &Expr, size: f32) -> LayoutNode {
@@ -420,7 +452,11 @@ pub fn layout_expr(expr: &Expr, size: f32) -> LayoutNode {
             let minus = make_text("−", size);
             let inner_node = layout_expr(inner, size);
             let need_p = matches!(inner.as_ref(), Expr::Add(_));
-            let inner_node = if need_p { make_paren(inner_node) } else { inner_node };
+            let inner_node = if need_p {
+                make_paren(inner_node)
+            } else {
+                inner_node
+            };
             hlist(vec![minus, inner_node])
         }
 
@@ -466,7 +502,11 @@ pub fn layout_expr(expr: &Expr, size: f32) -> LayoutNode {
         Expr::Pow(base, exp) => {
             let b = layout_expr(base, size);
             let e = layout_expr(exp, SMALL_FONT.min(size * 0.65));
-            let b = if needs_parens_in_power(base) { make_paren(b) } else { b };
+            let b = if needs_parens_in_power(base) {
+                make_paren(b)
+            } else {
+                b
+            };
             make_script(b, e)
         }
 
@@ -529,7 +569,14 @@ pub fn layout_equation(eq: &Equation) -> EquationLayout {
         Vec2::new(start_x + total_w + pad, baseline_y + max_h + pad),
     );
 
-    EquationLayout { lhs, rhs, eq_sign: eq_s, baseline_y, bbox, drop_indicators }
+    EquationLayout {
+        lhs,
+        rhs,
+        eq_sign: eq_s,
+        baseline_y,
+        bbox,
+        drop_indicators,
+    }
 }
 
 /// Layout one side of the equation, inserting drop-indicator nodes between draggable terms
@@ -571,7 +618,11 @@ fn layout_side(eq: &Equation, side: Side) -> LayoutNode {
                 }
 
                 let inner = layout_expr(factor, FONT_SIZE);
-                let inner = if needs_parens_in_product(factor) { make_paren(inner) } else { inner };
+                let inner = if needs_parens_in_product(factor) {
+                    make_paren(inner)
+                } else {
+                    inner
+                };
                 let mut node = inner;
                 node.term_ref = Some((side, i));
                 node = with_horizontal_pad(node, TERM_GAP * 0.5);
@@ -619,7 +670,10 @@ fn with_horizontal_pad(mut node: LayoutNode, pad: f32) -> LayoutNode {
         width: pad,
         height: node.height,
         depth: node.depth,
-        kind: NodeKind::Text { content: String::new(), font_size: FONT_SIZE },
+        kind: NodeKind::Text {
+            content: String::new(),
+            font_size: FONT_SIZE,
+        },
         origin: Vec2::ZERO,
         term_ref: None,
     };
@@ -627,7 +681,10 @@ fn with_horizontal_pad(mut node: LayoutNode, pad: f32) -> LayoutNode {
         width: pad,
         height: node.height,
         depth: node.depth,
-        kind: NodeKind::Text { content: String::new(), font_size: FONT_SIZE },
+        kind: NodeKind::Text {
+            content: String::new(),
+            font_size: FONT_SIZE,
+        },
         origin: Vec2::ZERO,
         term_ref: None,
     };

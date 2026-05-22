@@ -100,8 +100,12 @@ fn spawn_hopper(
     // Bas de l'entonnoir : juste au-dessus du premier piquet.
     let y_bot = dims.peg_top_y + cfg.peg_spacing_y() * 0.8;
 
-    spawn_diagonal_wall(commands, meshes, &color, half_top, y_top, half_bot, y_bot, 5.0);
-    spawn_diagonal_wall(commands, meshes, &color, -half_top, y_top, -half_bot, y_bot, 5.0);
+    spawn_diagonal_wall(
+        commands, meshes, &color, half_top, y_top, half_bot, y_bot, 5.0,
+    );
+    spawn_diagonal_wall(
+        commands, meshes, &color, -half_top, y_top, -half_bot, y_bot, 5.0,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]

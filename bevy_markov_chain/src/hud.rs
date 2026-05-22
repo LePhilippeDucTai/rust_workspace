@@ -17,7 +17,10 @@ impl Plugin for HudPlugin {
 fn setup_hud(mut commands: Commands) {
     commands.spawn((
         Text::new(""),
-        TextFont { font_size: 14.0, ..default() },
+        TextFont {
+            font_size: 14.0,
+            ..default()
+        },
         TextColor(Color::srgb(0.92, 0.92, 0.96)),
         Node {
             position_type: PositionType::Absolute,
@@ -30,7 +33,10 @@ fn setup_hud(mut commands: Commands) {
 
     commands.spawn((
         Text::new(""),
-        TextFont { font_size: 14.0, ..default() },
+        TextFont {
+            font_size: 14.0,
+            ..default()
+        },
         TextColor(Color::srgb(0.85, 1.0, 0.85)),
         Node {
             position_type: PositionType::Absolute,

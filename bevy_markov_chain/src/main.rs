@@ -22,7 +22,7 @@ use crate::hud::HudPlugin;
 use crate::input::InputPlugin;
 use crate::markov::default_chain;
 use crate::resources::{Chain, EmpiricalDistribution, NodePositions, SimSettings};
-use crate::simulation::{agent_color_system, spawn_agent, SimulationPlugin};
+use crate::simulation::{SimulationPlugin, agent_color_system, spawn_agent};
 use crate::visualization::VisualizationPlugin;
 
 fn main() {
@@ -45,7 +45,12 @@ fn main() {
         .insert_resource(positions)
         .insert_resource(SimSettings::default())
         .insert_resource(EmpiricalDistribution::new(n))
-        .add_plugins((SimulationPlugin, VisualizationPlugin, HudPlugin, InputPlugin))
+        .add_plugins((
+            SimulationPlugin,
+            VisualizationPlugin,
+            HudPlugin,
+            InputPlugin,
+        ))
         .add_systems(Startup, setup_scene)
         .add_systems(Update, agent_color_system)
         .run();

@@ -21,7 +21,10 @@ pub struct MarkovChain {
 impl MarkovChain {
     pub fn new(transition: Array2<f64>) -> Self {
         let stationary = compute_stationary(&transition);
-        Self { transition, stationary }
+        Self {
+            transition,
+            stationary,
+        }
     }
 
     pub fn num_states(&self) -> usize {

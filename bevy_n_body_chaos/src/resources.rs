@@ -1,5 +1,5 @@
-use bevy::prelude::*;
 use crate::config::G;
+use bevy::prelude::*;
 
 #[derive(Resource)]
 pub struct SimSettings {
@@ -11,7 +11,12 @@ pub struct SimSettings {
 
 impl Default for SimSettings {
     fn default() -> Self {
-        Self { g: G, paused: false, scenario_idx: 0, reset_requested: false }
+        Self {
+            g: G,
+            paused: false,
+            scenario_idx: 0,
+            reset_requested: false,
+        }
     }
 }
 

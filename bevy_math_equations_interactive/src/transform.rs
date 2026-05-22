@@ -23,7 +23,11 @@ pub fn move_term(
     };
 
     if from_idx >= terms.len() {
-        return Err(format!("Term index {} out of range ({})", from_idx, terms.len()));
+        return Err(format!(
+            "Term index {} out of range ({})",
+            from_idx,
+            terms.len()
+        ));
     }
 
     if from_side == to_side {
@@ -34,7 +38,9 @@ pub fn move_term(
 
     match group {
         TermGroup::Additive => move_additive(eq, from_side, from_idx, to_side, to_pos, term),
-        TermGroup::Multiplicative => move_multiplicative(eq, from_side, from_idx, to_side, to_pos, term),
+        TermGroup::Multiplicative => {
+            move_multiplicative(eq, from_side, from_idx, to_side, to_pos, term)
+        }
     }
 }
 

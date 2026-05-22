@@ -22,7 +22,9 @@ struct Lexer<'a> {
 
 impl<'a> Lexer<'a> {
     fn new(input: &'a str) -> Self {
-        Self { chars: input.chars().peekable() }
+        Self {
+            chars: input.chars().peekable(),
+        }
     }
 
     fn skip_ws(&mut self) {
@@ -35,25 +37,60 @@ impl<'a> Lexer<'a> {
         self.skip_ws();
         match self.chars.peek().copied() {
             None => Ok(Token::Eof),
-            Some('+') => { self.chars.next(); Ok(Token::Plus) }
-            Some('-') => { self.chars.next(); Ok(Token::Minus) }
-            Some('*') => { self.chars.next(); Ok(Token::Star) }
-            Some('/') => { self.chars.next(); Ok(Token::Slash) }
-            Some('^') => { self.chars.next(); Ok(Token::Caret) }
-            Some('(') => { self.chars.next(); Ok(Token::LParen) }
-            Some(')') => { self.chars.next(); Ok(Token::RParen) }
-            Some(',') => { self.chars.next(); Ok(Token::Comma) }
-            Some('=') => { self.chars.next(); Ok(Token::Equals) }
+            Some('+') => {
+                self.chars.next();
+                Ok(Token::Plus)
+            }
+            Some('-') => {
+                self.chars.next();
+                Ok(Token::Minus)
+            }
+            Some('*') => {
+                self.chars.next();
+                Ok(Token::Star)
+            }
+            Some('/') => {
+                self.chars.next();
+                Ok(Token::Slash)
+            }
+            Some('^') => {
+                self.chars.next();
+                Ok(Token::Caret)
+            }
+            Some('(') => {
+                self.chars.next();
+                Ok(Token::LParen)
+            }
+            Some(')') => {
+                self.chars.next();
+                Ok(Token::RParen)
+            }
+            Some(',') => {
+                self.chars.next();
+                Ok(Token::Comma)
+            }
+            Some('=') => {
+                self.chars.next();
+                Ok(Token::Equals)
+            }
             Some(c) if c.is_ascii_digit() || c == '.' => {
                 let mut s = String::new();
-                while self.chars.peek().map_or(false, |c| c.is_ascii_digit() || *c == '.') {
+                while self
+                    .chars
+                    .peek()
+                    .map_or(false, |c| c.is_ascii_digit() || *c == '.')
+                {
                     s.push(self.chars.next().unwrap());
                 }
                 s.parse::<f64>().map(Token::Num).map_err(|e| e.to_string())
             }
             Some(c) if c.is_alphabetic() || c == '_' => {
                 let mut s = String::new();
-                while self.chars.peek().map_or(false, |c| c.is_alphanumeric() || *c == '_') {
+                while self
+                    .chars
+                    .peek()
+                    .map_or(false, |c| c.is_alphanumeric() || *c == '_')
+                {
                     s.push(self.chars.next().unwrap());
                 }
                 Ok(Token::Ident(s))
@@ -68,7 +105,9 @@ impl<'a> Lexer<'a> {
             let tok = self.next_token()?;
             let done = tok == Token::Eof;
             tokens.push(tok);
-            if done { break; }
+            if done {
+                break;
+            }
         }
         Ok(tokens)
     }

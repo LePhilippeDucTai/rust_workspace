@@ -4,12 +4,12 @@ pub enum Expr {
     Num(f64),
     Var(String),
     Neg(Box<Expr>),
-    Add(Vec<Expr>),               // subtraction = Neg child
-    Mul(Vec<Expr>),               // all factors in numerator
-    Div(Box<Expr>, Box<Expr>),    // fraction: num / den
-    Pow(Box<Expr>, Box<Expr>),    // base ^ exponent
-    Sqrt(Box<Expr>),              // √x
-    Root(Box<Expr>, Box<Expr>),   // ⁿ√x : Root(n, x)
+    Add(Vec<Expr>),             // subtraction = Neg child
+    Mul(Vec<Expr>),             // all factors in numerator
+    Div(Box<Expr>, Box<Expr>),  // fraction: num / den
+    Pow(Box<Expr>, Box<Expr>),  // base ^ exponent
+    Sqrt(Box<Expr>),            // √x
+    Root(Box<Expr>, Box<Expr>), // ⁿ√x : Root(n, x)
 }
 
 #[derive(Clone, Debug)]

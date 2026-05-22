@@ -9,7 +9,9 @@ mod simulation;
 
 use bevy::prelude::*;
 
-use config::{GRID_HEIGHT, GRID_WIDTH, INITIAL_DENSITY, SIMULATION_HZ, WINDOW_HEIGHT, WINDOW_WIDTH};
+use config::{
+    GRID_HEIGHT, GRID_WIDTH, INITIAL_DENSITY, SIMULATION_HZ, WINDOW_HEIGHT, WINDOW_WIDTH,
+};
 use grid::Grid;
 use hud::HudPlugin;
 use input::InputPlugin;

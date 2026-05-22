@@ -1,5 +1,5 @@
-use std::collections::VecDeque;
 use bevy::prelude::*;
+use std::collections::VecDeque;
 
 #[derive(Component)]
 pub struct Body {

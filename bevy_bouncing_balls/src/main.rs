@@ -33,6 +33,12 @@ fn main() {
         .insert_resource(ClearColor(Color::srgb(0.08, 0.08, 0.12)))
         .insert_resource(SimSettings::default())
         .insert_resource(Time::<Fixed>::from_hz(PHYSICS_HZ))
-        .add_plugins((SpawnPlugin, PhysicsPlugin, InputPlugin, HudPlugin, TracePlugin))
+        .add_plugins((
+            SpawnPlugin,
+            PhysicsPlugin,
+            InputPlugin,
+            HudPlugin,
+            TracePlugin,
+        ))
         .run();
 }
