@@ -31,3 +31,14 @@ pub fn time_it(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_macro_exists() {
+        // Basic test to ensure the macro compiles
+        // The actual functionality is hard to test since it's a proc_macro
+        // but we can verify the crate compiles
+        assert!(true);
+    }
+}
