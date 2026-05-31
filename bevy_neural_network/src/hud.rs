@@ -26,8 +26,10 @@ fn setup_hud(mut commands: Commands) {
             position_type: PositionType::Absolute,
             top: Val::Px(8.0),
             left: Val::Px(10.0),
+            padding: UiRect::all(Val::Px(8.0)),
             ..default()
         },
+        BackgroundColor(Color::srgba(0.02, 0.02, 0.05, 0.55)),
         StatsText,
     ));
 
@@ -42,8 +44,10 @@ fn setup_hud(mut commands: Commands) {
             position_type: PositionType::Absolute,
             bottom: Val::Px(8.0),
             left: Val::Px(10.0),
+            padding: UiRect::all(Val::Px(8.0)),
             ..default()
         },
+        BackgroundColor(Color::srgba(0.02, 0.02, 0.05, 0.55)),
         HudText,
     ));
 }

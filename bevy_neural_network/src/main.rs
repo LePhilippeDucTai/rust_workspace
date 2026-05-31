@@ -20,7 +20,10 @@ mod network;
 mod training;
 mod visualization;
 
+use bevy::core_pipeline::tonemapping::Tonemapping;
+use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
+use bevy::render::view::Hdr;
 
 use crate::config::{WINDOW_HEIGHT, WINDOW_WIDTH};
 use crate::dataset::{Dataset, DatasetKind};
@@ -70,5 +73,15 @@ fn main() {
 }
 
 fn setup_camera(mut commands: Commands) {
-    commands.spawn(Camera2d);
+    // Caméra HDR + Bloom : tout ce qui est émissif (valeurs de couleur > 1.0)
+    // rayonne, donnant aux neurones et aux impulsions un véritable halo lumineux.
+    commands.spawn((
+        Camera2d,
+        Hdr,
+        Tonemapping::AcesFitted,
+        Bloom {
+            intensity: 0.28,
+            ..Bloom::NATURAL
+        },
+    ));
 }

@@ -24,7 +24,7 @@ pub const LOSS_RECT: Rect = Rect {
 };
 
 /// Résolution de la texture de la frontière de décision.
-pub const BOUND_RES: u32 = 96;
+pub const BOUND_RES: u32 = 160;
 
 /// Nombre de pas SGD effectués par image en mode turbo.
 pub const STEPS_PER_TURBO: usize = 150;

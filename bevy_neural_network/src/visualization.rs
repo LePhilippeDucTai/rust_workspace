@@ -14,7 +14,9 @@ use bevy::asset::RenderAssetUsages;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
 use crate::components::{BoundarySprite, NeuronIndex, NeuronViz};
-use crate::config::{BOUND_RES, DATA_RECT, LOSS_RECT, NETWORK_RECT, lerp};
+use crate::config::{
+    BOUND_RES, DATA_RECT, LOSS_RECT, NETWORK_RECT, WINDOW_HEIGHT, WINDOW_WIDTH, lerp,
+};
 use crate::dataset::DatasetKind;
 use crate::layout::{neuron_pos, neuron_radius};
 use crate::training::{Anim, Data, GraphDirty, LossHist, Net, Phase};
@@ -28,7 +30,10 @@ pub struct BoundaryTimer(pub f32);
 impl Plugin for VisualizationPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(BoundaryTimer(0.0))
-            .add_systems(Startup, setup_boundary_sprite)
+            .add_systems(
+                Startup,
+                (setup_background, setup_boundary_sprite, setup_gizmo_config),
+            )
             .add_systems(
                 Update,
                 (
@@ -57,26 +62,81 @@ fn lerp_col(a: (f32, f32, f32), b: (f32, f32, f32), t: f32) -> Color {
     )
 }
 
-/// Couleur divergente d'une valeur dans [-1, 1] : bleu (négatif) → sombre (0)
-/// → orange (positif). Sert aux activations des neurones.
-fn val_color(v: f32) -> Color {
-    let t = (v.clamp(-1.0, 1.0) + 1.0) / 2.0;
-    if t < 0.5 {
-        lerp_col((0.25, 0.55, 1.0), (0.12, 0.12, 0.16), t / 0.5)
+/// Couleur émissive (HDR) d'un neurone selon son activation dans [-1, 1] :
+/// sombre près de 0, et d'autant plus lumineux (donc « halo » via le bloom) que
+/// l'activation est saturée — bleu si négative, orange si positive.
+fn neuron_color(v: f32) -> Color {
+    let m = v.abs().clamp(0.0, 1.0);
+    let k = m * m;
+    let hue = if v >= 0.0 {
+        (1.0, 0.5, 0.18)
     } else {
-        lerp_col((0.12, 0.12, 0.16), (1.0, 0.55, 0.2), (t - 0.5) / 0.5)
+        (0.32, 0.6, 1.0)
+    };
+    let base = 0.05;
+    let glow = 2.8 * k;
+    LinearRgba::new(
+        base + hue.0 * glow,
+        base + hue.1 * glow,
+        base + hue.2 * glow,
+        1.0,
+    )
+    .into()
+}
+
+/// Couleur émissive d'un poids : bleu si négatif, orange si positif. Plus le
+/// poids est fort, plus l'arête est brillante et opaque (et rayonne).
+fn weight_color(w: f32) -> Color {
+    let m = (w.abs() / 1.2).clamp(0.0, 1.0);
+    let g = 0.2 + 1.7 * m;
+    let a = 0.10 + 0.6 * m;
+    if w >= 0.0 {
+        LinearRgba::new(1.0 * g, 0.45 * g, 0.16 * g, a).into()
+    } else {
+        LinearRgba::new(0.22 * g, 0.5 * g, 1.0 * g, a).into()
     }
 }
 
-/// Couleur d'un poids : bleu si négatif, orange si positif, opacité ∝ |poids|.
-fn weight_color(w: f32) -> Color {
-    let m = (w.abs()).clamp(0.0, 1.5) / 1.5;
-    let a = 0.05 + 0.55 * m;
-    if w >= 0.0 {
-        Color::srgba(1.0, 0.5, 0.2, a)
-    } else {
-        Color::srgba(0.3, 0.6, 1.0, a)
+/// Largeur des traits gizmos (arêtes, impulsions, courbes, cadres).
+fn setup_gizmo_config(mut store: ResMut<GizmoConfigStore>) {
+    let (config, _) = store.config_mut::<DefaultGizmoConfigGroup>();
+    config.line.width = 2.2;
+}
+
+/// Fond en vignette radiale : centre légèrement éclairé, bords sombres, pour
+/// donner de la profondeur à la scène.
+fn setup_background(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
+    let (w, h) = (192u32, 130u32);
+    let mut image = Image::new_fill(
+        Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &[0, 0, 0, 255],
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    for py in 0..h {
+        for px in 0..w {
+            let nx = px as f32 / (w - 1) as f32 - 0.5;
+            let ny = py as f32 / (h - 1) as f32 - 0.5;
+            let d = ((nx * nx + ny * ny).sqrt() / 0.7071).clamp(0.0, 1.0);
+            let v = 1.0 - d;
+            let c = lerp_col((0.02, 0.02, 0.045), (0.10, 0.10, 0.17), v);
+            let _ = image.set_color_at(px, py, c);
+        }
     }
+    let handle = images.add(image);
+    commands.spawn((
+        Sprite {
+            image: handle,
+            custom_size: Some(Vec2::new(WINDOW_WIDTH, WINDOW_HEIGHT)),
+            ..default()
+        },
+        Transform::from_xyz(0.0, 0.0, -10.0),
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -129,7 +189,7 @@ fn update_neuron_colors(
         }
         let v = net.0.a[ni.layer][ni.idx];
         if let Some(m) = materials.get_mut(&mh.0) {
-            m.color = val_color(v);
+            m.color = neuron_color(v);
         }
     }
 }
@@ -157,8 +217,11 @@ fn draw_pulses(net: Res<Net>, anim: Res<Anim>, mut gizmos: Gizmos) {
     if l < 2 {
         return;
     }
-    let fwd = Color::srgb(0.4, 0.95, 1.0);
-    let bwd = Color::srgb(1.0, 0.7, 0.3);
+    // Couleurs HDR (valeurs > 1) : les impulsions deviennent de véritables
+    // traînées de lumière grâce au bloom.
+    let fwd = LinearRgba::new(0.7, 3.0, 3.8, 1.0);
+    let bwd = LinearRgba::new(3.8, 2.0, 0.7, 1.0);
+    let r = neuron_radius(sizes);
 
     // Segment de couches actuellement traversé, et sens de l'impulsion.
     let (m, forward) = match anim.phase {
@@ -169,37 +232,49 @@ fn draw_pulses(net: Res<Net>, anim: Res<Anim>, mut gizmos: Gizmos) {
         }
         Phase::Update => {
             // Flash : on illumine tous les neurones brièvement.
-            let glow = Color::srgba(1.0, 1.0, 1.0, 1.0 - anim.t);
+            let f = (1.0 - anim.t).max(0.0);
+            let glow: Color = LinearRgba::new(2.6 * f, 2.6 * f, 3.0 * f, 1.0).into();
             for layer in 0..l {
                 for idx in 0..sizes[layer] {
                     let p = neuron_pos(layer, idx, sizes);
-                    gizmos.circle_2d(Isometry2d::from_translation(p), neuron_radius(sizes) + 4.0, glow);
+                    gizmos.circle_2d(Isometry2d::from_translation(p), r + 4.0, glow);
                 }
             }
             return;
         }
     };
 
-    // Surbrillance des neurones source du segment actif.
+    // Halo des neurones source du segment actif.
     let src = if forward { m } else { m + 1 };
-    let glow = Color::srgb(1.0, 1.0, 1.0);
+    let glow: Color = LinearRgba::new(2.2, 2.4, 3.0, 1.0).into();
     for idx in 0..sizes[src] {
         let p = neuron_pos(src, idx, sizes);
-        gizmos.circle_2d(Isometry2d::from_translation(p), neuron_radius(sizes) + 3.0, glow);
+        gizmos.circle_2d(Isometry2d::from_translation(p), r + 3.0, glow);
     }
 
-    // Impulsions qui glissent le long des arêtes du segment.
-    let col = if forward { fwd } else { bwd };
+    // Impulsions avec traînée (afterimage) le long des arêtes du segment.
+    const TRAIL: usize = 5;
     for i in 0..sizes[m] {
         for j in 0..sizes[m + 1] {
             let a = neuron_pos(m, i, sizes);
             let b = neuron_pos(m + 1, j, sizes);
-            let p = if forward {
-                a.lerp(b, anim.t)
-            } else {
-                b.lerp(a, anim.t)
-            };
-            gizmos.circle_2d(Isometry2d::from_translation(p), 3.5, col);
+            for k in 0..TRAIL {
+                let tt = anim.t - k as f32 * 0.06;
+                if !(0.0..=1.0).contains(&tt) {
+                    continue;
+                }
+                let fade = 1.0 - k as f32 / TRAIL as f32;
+                let base = if forward { fwd } else { bwd };
+                let col: Color =
+                    LinearRgba::new(base.red * fade, base.green * fade, base.blue * fade, 1.0)
+                        .into();
+                let p = if forward {
+                    a.lerp(b, tt)
+                } else {
+                    b.lerp(a, tt)
+                };
+                gizmos.circle_2d(Isometry2d::from_translation(p), 1.5 + 3.0 * fade, col);
+            }
         }
     }
 }
@@ -301,7 +376,8 @@ fn draw_input_space(net: Res<Net>, data: Res<Data>, anim: Res<Anim>, mut gizmos:
             let v = s.y[0].clamp(-1.0, 1.0);
             data_to_world(s.x[0], v)
         });
-        gizmos.linestrip_2d(target_pts, Color::srgb(0.4, 0.8, 0.5));
+        let target_col: Color = LinearRgba::new(0.5, 1.6, 0.8, 1.0).into();
+        gizmos.linestrip_2d(target_pts, target_col);
 
         let steps = 80;
         let pred_pts = (0..steps).map(|k| {
@@ -309,27 +385,27 @@ fn draw_input_space(net: Res<Net>, data: Res<Data>, anim: Res<Anim>, mut gizmos:
             let o = net.0.forward_pure(&[ix])[0].clamp(-1.0, 1.0);
             data_to_world(ix, o)
         });
-        gizmos.linestrip_2d(pred_pts, Color::srgb(1.0, 0.75, 0.3));
+        let pred_col: Color = LinearRgba::new(3.0, 2.0, 0.7, 1.0).into();
+        gizmos.linestrip_2d(pred_pts, pred_col);
 
         for s in &data.0.samples {
             let p = data_to_world(s.x[0], s.y[0].clamp(-1.0, 1.0));
-            gizmos.circle_2d(Isometry2d::from_translation(p), 2.5, Color::srgb(0.5, 0.9, 0.6));
+            gizmos.circle_2d(Isometry2d::from_translation(p), 2.5, target_col);
         }
         return;
     }
 
     // Classification : points colorés par classe, échantillon actif entouré.
     let active = anim.active % data.0.samples.len().max(1);
+    let col_a: Color = LinearRgba::new(0.4, 2.0, 2.6, 1.0).into();
+    let col_b: Color = LinearRgba::new(2.6, 0.7, 1.6, 1.0).into();
+    let ring: Color = LinearRgba::new(3.0, 3.0, 3.0, 1.0).into();
     for (k, s) in data.0.samples.iter().enumerate() {
         let p = data_to_world(s.x[0], s.x[1]);
-        let col = if s.class == 0 {
-            Color::srgb(0.35, 0.95, 1.0)
-        } else {
-            Color::srgb(1.0, 0.5, 0.8)
-        };
+        let col = if s.class == 0 { col_a } else { col_b };
         gizmos.circle_2d(Isometry2d::from_translation(p), 3.0, col);
         if k == active {
-            gizmos.circle_2d(Isometry2d::from_translation(p), 6.5, Color::WHITE);
+            gizmos.circle_2d(Isometry2d::from_translation(p), 7.0, ring);
         }
     }
 }
@@ -350,7 +426,8 @@ fn draw_loss_curve(loss: Res<LossHist>, mut gizmos: Gizmos) {
         let y = lerp(rect.min.y, rect.max.y, (v / max_v).clamp(0.0, 1.0));
         Vec2::new(x, y)
     });
-    gizmos.linestrip_2d(pts, Color::srgb(0.95, 0.85, 0.3));
+    let loss_col: Color = LinearRgba::new(3.0, 2.4, 0.5, 1.0).into();
+    gizmos.linestrip_2d(pts, loss_col);
 }
 
 fn draw_frames(data: Res<Data>, mut gizmos: Gizmos) {
