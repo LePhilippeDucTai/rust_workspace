@@ -1,6 +1,6 @@
+use bevy::math::Isometry2d;
 use bevy::prelude::*;
-use rand::Rng;
-use rand_distr::Normal;
+use rand_distr::{Distribution, Normal};
 use std::collections::VecDeque;
 
 const WINDOW_WIDTH: f32 = 1200.0;
@@ -35,7 +35,7 @@ fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                resolution: (WINDOW_WIDTH, WINDOW_HEIGHT).into(),
+                resolution: (WINDOW_WIDTH as u32, WINDOW_HEIGHT as u32).into(),
                 title: "2D Brownian Motion Animation".to_string(),
                 ..default()
             }),
@@ -191,9 +191,8 @@ fn draw_trajectory(
         }
 
         if let Some(&pos) = particle.history.back() {
-            gizmos.circle(
-                Vec3::new(pos.x, pos.y, 0.05),
-                Direction3d::Z,
+            gizmos.circle_2d(
+                Isometry2d::from_translation(pos),
                 3.0,
                 Color::srgb(1.0, 0.2, 0.2),
             );
@@ -204,9 +203,8 @@ fn draw_trajectory(
 fn draw_envelope(mut gizmos: Gizmos, state: Res<SimulationState>) {
     let radius = (state.time * DIFFUSION).sqrt();
 
-    gizmos.circle(
-        Vec3::new(0.0, 0.0, 0.0),
-        Direction3d::Z,
+    gizmos.circle_2d(
+        Isometry2d::from_translation(Vec2::ZERO),
         radius,
         Color::srgba(0.3, 0.6, 0.9, 0.15),
     );
@@ -214,9 +212,8 @@ fn draw_envelope(mut gizmos: Gizmos, state: Res<SimulationState>) {
     for i in 0..12 {
         let angle = (i as f32 / 12.0) * std::f32::consts::TAU;
         let pos = Vec2::new(angle.cos(), angle.sin()) * radius;
-        gizmos.circle(
-            Vec3::new(pos.x, pos.y, 0.02),
-            Direction3d::Z,
+        gizmos.circle_2d(
+            Isometry2d::from_translation(pos),
             1.5,
             Color::srgba(0.3, 0.6, 0.9, 0.3),
         );
@@ -273,13 +270,9 @@ fn draw_grid(mut gizmos: Gizmos, state: Res<SimulationState>) {
 }
 
 fn draw_hud(
-    mut gizmos: Gizmos,
     state: Res<SimulationState>,
     stats: Res<SimStats>,
 ) {
-    let hud_y = WINDOW_HEIGHT / 2.0 - 20.0;
-    let hud_x = -WINDOW_WIDTH / 2.0 + 20.0;
-
     let time_text = format!("Time: {:.2}", state.time);
     let distance_text = format!("Current distance: {:.2}", stats.current_distance);
     let theory_text = format!("Theoretical √t: {:.2}", stats.theoretical_radius);
