@@ -56,8 +56,7 @@ impl Grid {
             for x in 0..self.width {
                 let alive = self.get(x, y);
                 let n = self.count_neighbours(x, y);
-                next[y * self.width + x] =
-                    matches!((alive, n), (true, 2) | (true, 3) | (false, 3));
+                next[y * self.width + x] = matches!((alive, n), (true, 2) | (true, 3) | (false, 3));
             }
         }
         self.cells = next;

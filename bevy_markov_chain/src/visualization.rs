@@ -3,9 +3,7 @@
 use bevy::prelude::*;
 
 use crate::components::{HistBar, HistTarget, NodeLabel, NodeMarker};
-use crate::config::{
-    HIST_BOTTOM_Y, HIST_CENTER_X, HIST_HEIGHT, HIST_WIDTH, NODE_RADIUS,
-};
+use crate::config::{HIST_BOTTOM_Y, HIST_CENTER_X, HIST_HEIGHT, HIST_WIDTH, NODE_RADIUS};
 use crate::resources::{Chain, EmpiricalDistribution, NodePositions};
 use crate::simulation::state_color;
 
@@ -44,7 +42,10 @@ fn setup_nodes(
 
         commands.spawn((
             Text2d::new(format!("{i}")),
-            TextFont { font_size: 26.0, ..default() },
+            TextFont {
+                font_size: 26.0,
+                ..default()
+            },
             TextColor(Color::srgb(0.05, 0.05, 0.08)),
             Transform::from_xyz(pos.x, pos.y, 1.5),
             NodeLabel,
@@ -109,16 +110,16 @@ fn setup_histogram(
     // Titre.
     commands.spawn((
         Text2d::new("Distribution: empirique vs stationnaire pi"),
-        TextFont { font_size: 16.0, ..default() },
+        TextFont {
+            font_size: 16.0,
+            ..default()
+        },
         TextColor(Color::srgb(0.92, 0.92, 0.96)),
         Transform::from_xyz(frame_x, HIST_BOTTOM_Y + HIST_HEIGHT + 28.0, 0.0),
     ));
 
     for i in 0..n {
-        let x = HIST_CENTER_X - HIST_WIDTH * 0.5
-            + gap
-            + (i as f32) * (bar_w + gap)
-            + bar_w * 0.5;
+        let x = HIST_CENTER_X - HIST_WIDTH * 0.5 + gap + (i as f32) * (bar_w + gap) + bar_w * 0.5;
         let color = state_color(i);
 
         // Barre empirique (hauteur ajustée dynamiquement).
@@ -142,7 +143,10 @@ fn setup_histogram(
         // Étiquette d'état sous la barre.
         commands.spawn((
             Text2d::new(format!("{i}")),
-            TextFont { font_size: 14.0, ..default() },
+            TextFont {
+                font_size: 14.0,
+                ..default()
+            },
             TextColor(Color::srgb(0.85, 0.85, 0.92)),
             Transform::from_xyz(x, HIST_BOTTOM_Y - 14.0, 0.0),
         ));
@@ -150,7 +154,10 @@ fn setup_histogram(
         // Valeur numérique de π_i.
         commands.spawn((
             Text2d::new(format!("π={:.3}", pi)),
-            TextFont { font_size: 11.0, ..default() },
+            TextFont {
+                font_size: 11.0,
+                ..default()
+            },
             TextColor(Color::srgba(0.95, 0.40, 0.40, 1.0)),
             Transform::from_xyz(x, HIST_BOTTOM_Y - 28.0, 0.0),
         ));
@@ -159,7 +166,10 @@ fn setup_histogram(
     // Légende.
     commands.spawn((
         Text2d::new("rouge = pi theorique (distribution stationnaire)"),
-        TextFont { font_size: 11.0, ..default() },
+        TextFont {
+            font_size: 11.0,
+            ..default()
+        },
         TextColor(Color::srgba(0.95, 0.40, 0.40, 1.0)),
         Transform::from_xyz(frame_x, HIST_BOTTOM_Y - 48.0, 0.0),
     ));

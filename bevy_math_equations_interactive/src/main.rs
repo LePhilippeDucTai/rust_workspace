@@ -1,12 +1,12 @@
 use bevy::prelude::*;
 
-mod ast;
-mod parser;
-mod transform;
-mod layout;
 mod animation;
-mod render;
+mod ast;
 mod interaction;
+mod layout;
+mod parser;
+mod render;
+mod transform;
 
 fn main() {
     App::new()

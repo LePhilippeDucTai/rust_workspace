@@ -4,7 +4,7 @@ use bevy_rapier3d::prelude::*;
 use crate::components::{Body, OrbitCamera, Trail};
 use crate::config::BODY_RADIUS;
 use crate::resources::SimSettings;
-use crate::scenarios::{all_scenarios, BodyInit};
+use crate::scenarios::{BodyInit, all_scenarios};
 
 pub struct SimulationPlugin;
 
@@ -47,14 +47,23 @@ fn spawn_body(
         Mesh3d(mesh),
         MeshMaterial3d(mat),
         Transform::from_translation(init.position),
-        Body { mass: init.mass, base_color: init.color },
+        Body {
+            mass: init.mass,
+            base_color: init.color,
+        },
         Trail::default(),
         RigidBody::Dynamic,
         Collider::ball(BODY_RADIUS * init.mass.cbrt()),
         GravityScale(0.0),
-        Damping { linear_damping: 0.0, angular_damping: 0.0 },
+        Damping {
+            linear_damping: 0.0,
+            angular_damping: 0.0,
+        },
         ExternalForce::default(),
-        Velocity { linear: init.velocity, angular: Vec3::ZERO },
+        Velocity {
+            linear: init.velocity,
+            angular: Vec3::ZERO,
+        },
     ));
 }
 
@@ -67,7 +76,12 @@ fn spawn_camera(commands: &mut Commands, distance: f32) {
     commands.spawn((
         Camera3d::default(),
         Transform::from_translation(pos).looking_at(Vec3::ZERO, Vec3::Y),
-        OrbitCamera { yaw, pitch, distance, target: Vec3::ZERO },
+        OrbitCamera {
+            yaw,
+            pitch,
+            distance,
+            target: Vec3::ZERO,
+        },
     ));
 
     commands.spawn((

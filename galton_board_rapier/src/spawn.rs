@@ -7,8 +7,8 @@ use rand::Rng;
 
 use crate::components::Particle;
 use crate::config::{
-    BOARD_WIDTH, HALF_HEIGHT, PARTICLE_ANGULAR_DAMPING, PARTICLE_FRICTION,
-    PARTICLE_LINEAR_DAMPING, PARTICLE_RESTITUTION, SPAWN_RATE,
+    BOARD_WIDTH, HALF_HEIGHT, PARTICLE_ANGULAR_DAMPING, PARTICLE_FRICTION, PARTICLE_LINEAR_DAMPING,
+    PARTICLE_RESTITUTION, SPAWN_RATE,
 };
 use crate::resources::{BoardConfig, BoardDims, SimState};
 
@@ -23,10 +23,7 @@ impl Plugin for SpawnPlugin {
 /// Supprime les particules qui sont tombées hors écran (échappées
 /// latéralement de la chambre ouverte des piquets). Sans cela, ces balles
 /// chuteraient indéfiniment et accumuleraient en mémoire.
-fn despawn_escaped(
-    mut commands: Commands,
-    particles: Query<(Entity, &Transform), With<Particle>>,
-) {
+fn despawn_escaped(mut commands: Commands, particles: Query<(Entity, &Transform), With<Particle>>) {
     let y_threshold = -HALF_HEIGHT - 60.0;
     // Marge latérale : supprime les balles qui débordent hors de la planche
     // (zone ouverte des piquets) pour éviter leur accumulation infinie.

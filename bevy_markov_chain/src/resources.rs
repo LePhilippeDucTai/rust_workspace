@@ -38,7 +38,10 @@ pub struct EmpiricalDistribution {
 
 impl EmpiricalDistribution {
     pub fn new(n: usize) -> Self {
-        Self { counts: vec![0.0; n], total: 0.0 }
+        Self {
+            counts: vec![0.0; n],
+            total: 0.0,
+        }
     }
 }
 

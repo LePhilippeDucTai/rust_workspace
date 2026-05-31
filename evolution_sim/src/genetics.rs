@@ -37,7 +37,13 @@ pub fn random_founder_genome<R: Rng>(rng: &mut R) -> Genome {
     Genome {
         speed: sample_truncated(rng, SPEED_INIT_MEAN, SPEED_INIT_STD, SPEED_MIN, SPEED_MAX),
         size: sample_truncated(rng, SIZE_INIT_MEAN, SIZE_INIT_STD, SIZE_MIN, SIZE_MAX),
-        vision_range: sample_truncated(rng, VISION_INIT_MEAN, VISION_INIT_STD, VISION_MIN, VISION_MAX),
+        vision_range: sample_truncated(
+            rng,
+            VISION_INIT_MEAN,
+            VISION_INIT_STD,
+            VISION_MIN,
+            VISION_MAX,
+        ),
     }
 }
 
@@ -72,8 +78,16 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
         for _ in 0..1000 {
             let g = random_founder_genome(&mut rng);
-            assert!(g.speed >= SPEED_MIN && g.speed <= SPEED_MAX, "speed out of bounds: {}", g.speed);
-            assert!(g.size >= SIZE_MIN && g.size <= SIZE_MAX, "size out of bounds: {}", g.size);
+            assert!(
+                g.speed >= SPEED_MIN && g.speed <= SPEED_MAX,
+                "speed out of bounds: {}",
+                g.speed
+            );
+            assert!(
+                g.size >= SIZE_MIN && g.size <= SIZE_MAX,
+                "size out of bounds: {}",
+                g.size
+            );
             assert!(
                 g.vision_range >= VISION_MIN && g.vision_range <= VISION_MAX,
                 "vision out of bounds: {}",

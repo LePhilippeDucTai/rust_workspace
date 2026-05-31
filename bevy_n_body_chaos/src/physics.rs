@@ -55,7 +55,10 @@ fn compute_energy(
         .map(|(b, t, v)| (b.mass, t.translation, v.linear))
         .collect();
 
-    energy.ke = data.iter().map(|(m, _, v)| 0.5 * m * v.length_squared()).sum();
+    energy.ke = data
+        .iter()
+        .map(|(m, _, v)| 0.5 * m * v.length_squared())
+        .sum();
 
     let mut pe = 0.0_f32;
     for i in 0..data.len() {

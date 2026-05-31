@@ -32,10 +32,7 @@ pub fn pick_next_question(
         .filter(|w| w.level_unlock <= player_level)
         .filter(|w| save.unlocked_themes.contains(&w.theme))
         .filter(|w| {
-            let answered = save
-                .answered_questions
-                .iter()
-                .find(|a| a.word_id == w.id);
+            let answered = save.answered_questions.iter().find(|a| a.word_id == w.id);
             match answered {
                 None => true,
                 Some(a) => match a.cooldown_until {
@@ -290,12 +287,8 @@ pub fn waiting_system(
         Some(q) => {
             if let Ok(mut raccoon) = raccoon_q.single_mut() {
                 raccoon.emotion = EmotionState::Confused;
-                raccoon.current_dialogue = pick_dialogue(
-                    &data,
-                    player.level,
-                    player.friendship_points,
-                    "on_question",
-                );
+                raccoon.current_dialogue =
+                    pick_dialogue(&data, player.level, player.friendship_points, "on_question");
             }
             commands.spawn(q);
             next_state.set(GamePhase::QuestionDisplayed);
@@ -310,4 +303,3 @@ pub fn waiting_system(
         }
     }
 }
-

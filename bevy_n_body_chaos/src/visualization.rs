@@ -13,15 +13,17 @@ impl Plugin for VisualizationPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
             Update,
-            (update_trail, update_body_emissive, draw_trails, orbit_camera),
+            (
+                update_trail,
+                update_body_emissive,
+                draw_trails,
+                orbit_camera,
+            ),
         );
     }
 }
 
-fn update_trail(
-    mut query: Query<(&Transform, &mut Trail)>,
-    settings: Res<SimSettings>,
-) {
+fn update_trail(mut query: Query<(&Transform, &mut Trail)>, settings: Res<SimSettings>) {
     if settings.paused {
         return;
     }

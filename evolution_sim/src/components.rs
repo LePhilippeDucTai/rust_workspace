@@ -23,7 +23,10 @@ pub struct Organism {
 
 impl Organism {
     pub fn founder() -> Self {
-        Self { generation: 0, time_since_reproduction: 0.0 }
+        Self {
+            generation: 0,
+            time_since_reproduction: 0.0,
+        }
     }
 
     pub fn child_of(parent: &Organism) -> Self {

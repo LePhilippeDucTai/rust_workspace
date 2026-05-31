@@ -8,7 +8,7 @@ use bevy::prelude::*;
 
 use crate::components::Food;
 use crate::config::{FOOD_RESPAWN_RATE, FOOD_TARGET};
-use crate::resources::{not_paused, RenderAssets, SimState, SimulationSet};
+use crate::resources::{RenderAssets, SimState, SimulationSet, not_paused};
 use crate::spawn::{random_world_position, spawn_food};
 
 pub struct FoodPlugin;
@@ -17,9 +17,7 @@ impl Plugin for FoodPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
             FixedUpdate,
-            respawn_food
-                .in_set(SimulationSet::Food)
-                .run_if(not_paused),
+            respawn_food.in_set(SimulationSet::Food).run_if(not_paused),
         );
     }
 }

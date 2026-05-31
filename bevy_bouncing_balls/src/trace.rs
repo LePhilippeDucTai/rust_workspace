@@ -114,7 +114,11 @@ fn draw_trace_trail(trace: Res<TraceData>, mut gizmos: Gizmos) {
     for i in 1..count {
         let t = i as f32 / count as f32;
         let alpha = t * 0.80 + 0.05;
-        gizmos.line_2d(display[i - 1], display[i], Color::srgba(0.25, 0.85, 1.0, alpha));
+        gizmos.line_2d(
+            display[i - 1],
+            display[i],
+            Color::srgba(0.25, 0.85, 1.0, alpha),
+        );
     }
     if let Some(&pos) = display.last() {
         gizmos.circle_2d(pos, 7.0, Color::WHITE);
@@ -166,8 +170,20 @@ fn update_trace_hud(
          Q  :    1%      5%     25%     50%     75%     95%     99%\n\
          X  : {:6.1}  {:6.1}  {:6.1}  {:6.1}  {:6.1}  {:6.1}  {:6.1}\n\
          Y  : {:6.1}  {:6.1}  {:6.1}  {:6.1}  {:6.1}  {:6.1}  {:6.1}",
-        xq[0], xq[1], xq[2], xq[3], xq[4], xq[5], xq[6],
-        yq[0], yq[1], yq[2], yq[3], yq[4], yq[5], yq[6],
+        xq[0],
+        xq[1],
+        xq[2],
+        xq[3],
+        xq[4],
+        xq[5],
+        xq[6],
+        yq[0],
+        yq[1],
+        yq[2],
+        yq[3],
+        yq[4],
+        yq[5],
+        yq[6],
     );
 }
 

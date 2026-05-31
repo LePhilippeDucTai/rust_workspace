@@ -81,14 +81,23 @@ pub fn spawn_organism(
     assets: &RenderAssets,
     spawn: OrganismSpawn,
 ) {
-    let OrganismSpawn { position, genome, organism, energy, velocity } = spawn;
+    let OrganismSpawn {
+        position,
+        genome,
+        organism,
+        energy,
+        velocity,
+    } = spawn;
     let color = color_for_genome(&genome, organism.generation);
     let material = materials.add(color);
     commands.spawn((
         Mesh2d(assets.unit_circle.clone()),
         MeshMaterial2d(material),
-        Transform::from_xyz(position.x, position.y, Z_ORGANISM)
-            .with_scale(Vec3::new(genome.size, genome.size, 1.0)),
+        Transform::from_xyz(position.x, position.y, Z_ORGANISM).with_scale(Vec3::new(
+            genome.size,
+            genome.size,
+            1.0,
+        )),
         organism,
         genome,
         Energy(energy),

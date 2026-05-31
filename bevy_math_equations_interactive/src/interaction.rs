@@ -1,27 +1,29 @@
-use bevy::prelude::*;
-use bevy::input::keyboard::{Key, KeyboardInput};
-use bevy::input::ButtonState;
 use crate::ast::{Equation, Side};
 use crate::parser::parse;
+use crate::render::{DraggableTerm, DropIndicator, EquationDirty, MathFont};
 use crate::transform::move_term;
-use crate::render::{EquationDirty, MathFont, DraggableTerm, DropIndicator};
+use bevy::input::keyboard::{Key, KeyboardInput};
+use bevy::input::ButtonState;
+use bevy::prelude::*;
 
 pub struct InteractionPlugin;
 
 impl Plugin for InteractionPlugin {
     fn build(&self, app: &mut App) {
-        app
-            .init_state::<AppState>()
+        app.init_state::<AppState>()
             .init_resource::<EquationRes>()
             .init_resource::<DragState>()
             .init_resource::<EquationDirty>()
-            .add_systems(Update, (
-                handle_keyboard,
-                handle_mouse.after(handle_keyboard),
-                update_drag_ghost.after(handle_mouse),
-                update_hover_highlight.after(handle_mouse),
-                update_drop_indicators.after(handle_mouse),
-            ));
+            .add_systems(
+                Update,
+                (
+                    handle_keyboard,
+                    handle_mouse.after(handle_keyboard),
+                    update_drag_ghost.after(handle_mouse),
+                    update_hover_highlight.after(handle_mouse),
+                    update_drop_indicators.after(handle_mouse),
+                ),
+            );
     }
 }
 
@@ -65,13 +67,17 @@ fn handle_keyboard(
     app_state: Res<State<AppState>>,
 ) {
     for ev in key_events.read() {
-        if ev.state != ButtonState::Pressed { continue; }
+        if ev.state != ButtonState::Pressed {
+            continue;
+        }
 
         match *app_state.get() {
             AppState::Input => match &ev.logical_key {
                 Key::Enter => {
                     let text = eq_res.input_text.trim().to_string();
-                    if text.is_empty() { continue; }
+                    if text.is_empty() {
+                        continue;
+                    }
                     match parse(&text) {
                         Ok(eq) => {
                             eq_res.equation = Some(eq);
@@ -84,8 +90,12 @@ fn handle_keyboard(
                         }
                     }
                 }
-                Key::Backspace => { eq_res.input_text.pop(); }
-                Key::Space => { eq_res.input_text.push(' '); }
+                Key::Backspace => {
+                    eq_res.input_text.pop();
+                }
+                Key::Space => {
+                    eq_res.input_text.push(' ');
+                }
                 Key::Character(c) => {
                     for ch in c.chars() {
                         if !ch.is_control() {
@@ -129,10 +139,16 @@ fn handle_mouse(
     app_state: Res<State<AppState>>,
     _font: Res<MathFont>,
 ) {
-    if *app_state.get() != AppState::Display { return; }
+    if *app_state.get() != AppState::Display {
+        return;
+    }
 
-    let Ok(window) = windows.get_single() else { return };
-    let Ok((camera, cam_transform)) = camera_q.get_single() else { return };
+    let Ok(window) = windows.get_single() else {
+        return;
+    };
+    let Ok((camera, cam_transform)) = camera_q.get_single() else {
+        return;
+    };
 
     if let Some(cursor_px) = window.cursor_position() {
         if let Ok(world) = camera.viewport_to_world_2d(cam_transform, cursor_px) {
@@ -149,8 +165,10 @@ fn handle_mouse(
             let size = sprite.custom_size.unwrap_or(Vec2::ONE);
             let center = transform.translation.truncate();
             let half = size * 0.5;
-            if cursor.x >= center.x - half.x && cursor.x <= center.x + half.x
-                && cursor.y >= center.y - half.y && cursor.y <= center.y + half.y
+            if cursor.x >= center.x - half.x
+                && cursor.x <= center.x + half.x
+                && cursor.y >= center.y - half.y
+                && cursor.y <= center.y + half.y
             {
                 drag_state.dragging = Some((dt.side, dt.index));
                 drag_state.drag_offset = center - cursor;
@@ -197,7 +215,9 @@ fn handle_mouse(
             dirty.0 = true;
         }
         // Remove ghost
-        for e in ghost_q.iter() { commands.entity(e).despawn(); }
+        for e in ghost_q.iter() {
+            commands.entity(e).despawn();
+        }
     }
 }
 
@@ -209,14 +229,20 @@ fn update_drag_ghost(
     ghost_q: Query<Entity, With<DragGhost>>,
 ) {
     if drag_state.dragging.is_none() {
-        for e in ghost_q.iter() { commands.entity(e).despawn(); }
+        for e in ghost_q.iter() {
+            commands.entity(e).despawn();
+        }
         return;
     }
     let (side, idx) = drag_state.dragging.unwrap();
-    let Some(ref eq) = eq_res.equation else { return };
+    let Some(ref eq) = eq_res.equation else {
+        return;
+    };
 
     // Despawn old ghost
-    for e in ghost_q.iter() { commands.entity(e).despawn(); }
+    for e in ghost_q.iter() {
+        commands.entity(e).despawn();
+    }
 
     let cursor = drag_state.cursor_world + drag_state.drag_offset;
 
@@ -239,7 +265,11 @@ fn update_drag_ghost(
             for atom in texts {
                 commands.spawn((
                     Text2d::new(atom.text),
-                    TextFont { font: font.handle.clone(), font_size: atom.font_size, ..default() },
+                    TextFont {
+                        font: font.handle.clone(),
+                        font_size: atom.font_size,
+                        ..default()
+                    },
                     TextColor(Color::srgba(0.6, 0.85, 1.0, 0.92)),
                     Transform::from_xyz(atom.pos.x, atom.pos.y, 20.0),
                     DragGhost,

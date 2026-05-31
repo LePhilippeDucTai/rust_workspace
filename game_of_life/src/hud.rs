@@ -42,7 +42,9 @@ fn update_hud(
     if !sim.is_changed() && !grid.is_changed() {
         return;
     }
-    let Ok(mut text) = text_q.single_mut() else { return };
+    let Ok(mut text) = text_q.single_mut() else {
+        return;
+    };
     let hz = fixed_time.timestep().as_secs_f64().recip();
     let status = if sim.paused { "PAUSED " } else { "RUNNING" };
     **text = format!(

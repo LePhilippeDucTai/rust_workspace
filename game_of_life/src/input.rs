@@ -68,10 +68,18 @@ fn handle_mouse(
         return;
     }
 
-    let Ok(window) = window_q.single() else { return };
-    let Ok((camera, cam_tf)) = camera_q.single() else { return };
-    let Some(cursor) = window.cursor_position() else { return };
-    let Ok(world) = camera.viewport_to_world_2d(cam_tf, cursor) else { return };
+    let Ok(window) = window_q.single() else {
+        return;
+    };
+    let Ok((camera, cam_tf)) = camera_q.single() else {
+        return;
+    };
+    let Some(cursor) = window.cursor_position() else {
+        return;
+    };
+    let Ok(world) = camera.viewport_to_world_2d(cam_tf, cursor) else {
+        return;
+    };
 
     let half_w = GRID_WIDTH as f32 * CELL_SIZE / 2.0;
     let half_h = GRID_HEIGHT as f32 * CELL_SIZE / 2.0;

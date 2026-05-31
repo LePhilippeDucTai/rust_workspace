@@ -11,7 +11,7 @@ use crate::config::{
     SOFT_POPULATION_CAP,
 };
 use crate::genetics::mutate_genome;
-use crate::resources::{not_paused, RenderAssets, SimState, SimulationSet};
+use crate::resources::{RenderAssets, SimState, SimulationSet, not_paused};
 use crate::spawn::{OrganismSpawn, random_velocity, spawn_organism};
 
 pub struct LifecyclePlugin;

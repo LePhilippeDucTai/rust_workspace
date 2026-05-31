@@ -15,7 +15,10 @@ impl Plugin for HudPlugin {
 fn setup_hud(mut commands: Commands) {
     commands.spawn((
         Text::new(""),
-        TextFont { font_size: 14.0, ..default() },
+        TextFont {
+            font_size: 14.0,
+            ..default()
+        },
         TextColor(Color::srgb(0.9, 0.92, 1.0)),
         Node {
             position_type: PositionType::Absolute,
@@ -33,10 +36,20 @@ fn update_hud(
     time: Res<Time>,
     mut q: Query<&mut Text, With<HudText>>,
 ) {
-    let Ok(mut text) = q.single_mut() else { return; };
+    let Ok(mut text) = q.single_mut() else {
+        return;
+    };
     let fps = 1.0 / time.delta_secs().max(1e-6);
-    let scenario_names = ["Figure en 8", "Triangle Pythagorique", "Triangle de Lagrange", "Aléatoire 3D"];
-    let name = scenario_names.get(settings.scenario_idx).copied().unwrap_or("?");
+    let scenario_names = [
+        "Figure en 8",
+        "Triangle Pythagorique",
+        "Triangle de Lagrange",
+        "Aléatoire 3D",
+    ];
+    let name = scenario_names
+        .get(settings.scenario_idx)
+        .copied()
+        .unwrap_or("?");
     let state = if settings.paused { "PAUSE" } else { "  RUN" };
     let total_e = energy.ke + energy.pe;
     **text = format!(

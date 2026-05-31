@@ -1,9 +1,9 @@
 //! Raccourcis clavier. La pause est propagée à Rapier via la `RapierConfiguration`
 //! du contexte par défaut.
 
+use bevy::ecs::message::MessageReader;
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
-use bevy::ecs::message::MessageReader;
 use bevy_rapier2d::prelude::*;
 
 use crate::components::Particle;

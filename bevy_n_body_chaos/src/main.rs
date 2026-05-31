@@ -39,17 +39,24 @@ fn main() {
         }))
         .add_plugins(RapierPhysicsPlugin::<NoUserData>::default())
         .insert_resource(ClearColor(Color::srgb(0.02, 0.02, 0.06)))
-        .insert_resource(GlobalAmbientLight { color: Color::WHITE, brightness: 120.0, affects_lightmapped_meshes: true })
+        .insert_resource(GlobalAmbientLight {
+            color: Color::WHITE,
+            brightness: 120.0,
+            affects_lightmapped_meshes: true,
+        })
         .insert_resource(SimSettings::default())
         .insert_resource(Energy::default())
         .add_systems(Startup, disable_rapier_gravity)
-        .add_plugins((SimulationPlugin, PhysicsPlugin, VisualizationPlugin, HudPlugin))
+        .add_plugins((
+            SimulationPlugin,
+            PhysicsPlugin,
+            VisualizationPlugin,
+            HudPlugin,
+        ))
         .run();
 }
 
-fn disable_rapier_gravity(
-    mut q: Query<&mut RapierConfiguration, With<DefaultRapierContext>>,
-) {
+fn disable_rapier_gravity(mut q: Query<&mut RapierConfiguration, With<DefaultRapierContext>>) {
     if let Ok(mut cfg) = q.single_mut() {
         cfg.gravity = Vec3::ZERO;
     }

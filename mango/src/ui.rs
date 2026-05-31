@@ -302,8 +302,7 @@ pub fn clear_qcm_on_feedback(
     if !state.is_changed() {
         return;
     }
-    if *state.get() != GamePhase::FeedbackShowing && *state.get() != GamePhase::WaitingForQuestion
-    {
+    if *state.get() != GamePhase::FeedbackShowing && *state.get() != GamePhase::WaitingForQuestion {
         return;
     }
     for ent in &container_q {
@@ -317,10 +316,7 @@ pub fn clear_qcm_on_feedback(
 }
 
 pub fn button_interaction_system(
-    mut interactions: Query<
-        (&Interaction, &QcmButton, &mut BackgroundColor),
-        Changed<Interaction>,
-    >,
+    mut interactions: Query<(&Interaction, &QcmButton, &mut BackgroundColor), Changed<Interaction>>,
     mut events: MessageWriter<AnswerSelected>,
 ) {
     for (interaction, button, mut bg) in &mut interactions {

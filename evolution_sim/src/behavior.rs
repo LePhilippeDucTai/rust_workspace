@@ -23,7 +23,7 @@ use crate::config::{
     BASAL_COST_PER_SEC, ENERGY_MAX, FOOD_ENERGY, MOVEMENT_COST_COEF, SIZE_METABOLIC_COEF,
     STEERING_RATE, VISION_COST_COEF, WANDER_TURN_RATE, WORLD_HALF_HEIGHT, WORLD_HALF_WIDTH,
 };
-use crate::resources::{not_paused, SimulationSet};
+use crate::resources::{SimulationSet, not_paused};
 
 pub struct BehaviorPlugin;
 
