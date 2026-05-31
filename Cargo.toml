@@ -1,6 +1,6 @@
 [workspace]
 resolver="2"
-members = [ "bevy_bouncing_balls", "bevy_game", "bevy_markov_chain", "bevy_mcmc", "bevy_math_equations_interactive", "bevy_n_body_chaos", "bevy_percolation", "bevy_sph_fluid", "evolution_sim", "galton_board_rapier", "game_of_life", "leetcode", "mango", "math", "runner","sudoku", "time_it"]
+members = [ "bevy_bouncing_balls", "bevy_brownian_motion", "bevy_game", "bevy_markov_chain", "bevy_mcmc", "bevy_math_equations_interactive", "bevy_n_body_chaos", "bevy_percolation", "bevy_sph_fluid", "evolution_sim", "galton_board_rapier", "game_of_life", "leetcode", "mango", "math", "runner","sudoku", "time_it"]
 
 [profile.dev.package.bevy_math_equations]
 opt-level = 1

@@ -981,6 +981,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bevy_brownian_motion"
+version = "0.1.0"
+dependencies = [
+ "bevy 0.18.1",
+ "rand 0.8.5",
+ "rand_distr 0.4.3",
+]
+
+[[package]]
 name = "bevy_camera"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
