@@ -105,25 +105,25 @@ impl Sim {
             if y == GRID_H - 1 {
                 percolates = true;
             }
-            // 4-voisinage
-            let mut push_if = |nx: usize, ny: usize, sim: &mut Sim, st: &mut Vec<usize>| {
-                let ni = Self::idx(nx, ny);
-                if sim.open[ni] && !sim.top_connected[ni] {
-                    sim.top_connected[ni] = true;
-                    st.push(ni);
-                }
-            };
+            // 4-voisinage : on empile chaque voisin ouvert non encore visité.
+            let mut neighbors: [Option<usize>; 4] = [None; 4];
             if x > 0 {
-                push_if(x - 1, y, self, &mut stack);
+                neighbors[0] = Some(Self::idx(x - 1, y));
             }
             if x + 1 < GRID_W {
-                push_if(x + 1, y, self, &mut stack);
+                neighbors[1] = Some(Self::idx(x + 1, y));
             }
             if y > 0 {
-                push_if(x, y - 1, self, &mut stack);
+                neighbors[2] = Some(Self::idx(x, y - 1));
             }
             if y + 1 < GRID_H {
-                push_if(x, y + 1, self, &mut stack);
+                neighbors[3] = Some(Self::idx(x, y + 1));
+            }
+            for ni in neighbors.into_iter().flatten() {
+                if self.open[ni] && !self.top_connected[ni] {
+                    self.top_connected[ni] = true;
+                    stack.push(ni);
+                }
             }
         }
 
@@ -150,18 +150,20 @@ struct Cell {
 
 fn main() {
     App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "Percolation de sites — Bevy".to_string(),
-                resolution: (
-                    GRID_W as f32 * (CELL_SIZE + GAP) + 40.0,
-                    GRID_H as f32 * (CELL_SIZE + GAP) + 40.0,
-                )
-                    .into(),
+        .add_plugins(
+            DefaultPlugins.set(WindowPlugin {
+                primary_window: Some(Window {
+                    title: "Percolation de sites — Bevy".to_string(),
+                    resolution: (
+                        (GRID_W as f32 * (CELL_SIZE + GAP) + 40.0) as u32,
+                        (GRID_H as f32 * (CELL_SIZE + GAP) + 40.0) as u32,
+                    )
+                        .into(),
+                    ..default()
+                }),
                 ..default()
             }),
-            ..default()
-        }))
+        )
         .insert_resource(ClearColor(Color::srgb(0.05, 0.05, 0.08)))
         .insert_resource(init_sim())
         .add_systems(Startup, setup)
@@ -252,7 +254,10 @@ fn handle_input(keys: Res<ButtonInput<KeyCode>>, mut sim: ResMut<Sim>) {
     }
     if keys.just_pressed(KeyCode::KeyA) {
         sim.auto = !sim.auto;
-        info!("Balayage automatique : {}", if sim.auto { "ON" } else { "OFF" });
+        info!(
+            "Balayage automatique : {}",
+            if sim.auto { "ON" } else { "OFF" }
+        );
     }
 
     let new_sample = keys.just_pressed(KeyCode::Space) || keys.just_pressed(KeyCode::KeyR);
