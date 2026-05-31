@@ -5,4 +5,3 @@ edition = "2024"
 
 [dependencies]
 bevy = "0.18.1"
-rand = "0.8"

@@ -2445,6 +2445,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bevy_percolation"
+version = "0.1.0"
+dependencies = [
+ "bevy 0.18.1",
+]
+
+[[package]]
 name = "bevy_picking"
 version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
