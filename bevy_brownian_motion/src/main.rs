@@ -399,11 +399,7 @@ fn draw_grid(mut gizmos: Gizmos) {
 // HUD
 // ---------------------------------------------------------------------------
 
-fn update_hud(
-    sim: Res<Sim>,
-    view: Res<View>,
-    mut text_q: Query<&mut Text, With<HudText>>,
-) {
+fn update_hud(sim: Res<Sim>, view: Res<View>, mut text_q: Query<&mut Text, With<HudText>>) {
     let Ok(mut text) = text_q.single_mut() else {
         return;
     };
