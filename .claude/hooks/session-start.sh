@@ -9,6 +9,10 @@ if [ "${CLAUDE_CODE_REMOTE:-}" != "true" ]; then
   exit 0
 fi
 
+# Mode asynchrone : la session démarre pendant que l'installation tourne en
+# arrière-plan (démarrage plus rapide). Le JSON doit être la première sortie.
+echo '{"async": true, "asyncTimeout": 300000}'
+
 SUDO=""
 if [ "$(id -u)" -ne 0 ]; then
   SUDO="sudo"
