@@ -1,6 +1,6 @@
 ---
 name: sasrs-impl
-description: Avance le projet sas_interpreter (interpréteur SAS en Rust/Polars) d'un cran — reprend le jalon courant là où PROGRESS.md s'est arrêté, implémente les prochains fichiers dans l'ordre, valide par cargo test, committe et pousse chaque incrément validé. Conçue pour être invoquée en boucle (/loop) jusqu'à complétion des jalons M1–M8.
+description: Avance le projet sas_interpreter (interpréteur SAS en Rust/Polars) jusqu'à la fin du jalon courant — itère sur TOUTES les cases non cochées du jalon, une par une (ou un groupe ⫽ à la fois), committe ET pousse après chaque validation avant de passer à la suivante. S'arrête en fin de jalon ou si les limites de contexte approchent.
 ---
 
 # sasrs-impl — exécuter le prochain incrément du jalon courant
@@ -23,10 +23,12 @@ développement : la branche courante du repo, normalement
    ou committer l'en-cours avant tout), `git pull origin <branche>`, puis
    `cargo test -p sas_interpreter` pour vérifier que la base est verte. Base rouge =
    la réparer D'ABORD (c'est l'incrément du jour).
-2. **Sélection** : premières cases non cochées du jalon courant dans PROGRESS.md, dans
-   l'ordre (il encode les dépendances). Prendre un LOT RAISONNABLE : 1 fichier difficile
-   (marqué Fable/Opus élevé) OU 2–3 fichiers faciles/parallélisables (marqués ⫽).
-   Ne pas viser tout le jalon en une invocation.
+2. **Sélection** : identifier la PROCHAINE case non cochée du jalon courant dans
+   PROGRESS.md, dans l'ordre du fichier (il encode les dépendances). Si plusieurs cases
+   consécutives sont marquées ⫽ (fichiers indépendants), les regrouper en un seul lot
+   parallèle ; sinon prendre un seul fichier à la fois. L'objectif de l'invocation est
+   de couvrir TOUTES les cases du jalon courant — ne pas s'arrêter après un seul fichier
+   tant que des cases restent et que le contexte le permet (voir garde-fous).
 3. **Implémentation** : pour chaque fichier du lot, déléguer à un sous-agent via le tool
    Agent avec le paramètre `model` suggéré par PROGRESS.md/PLAN.md (`sonnet`, `opus`,
    `fable` — les fichiers marqués Fable peuvent aussi être faits directement par
@@ -42,12 +44,23 @@ développement : la branche courante du repo, normalement
    - `cargo test -p sas_interpreter` complet, zéro warning nouveau ;
    - rejeter/faire corriger ce qui ne passe pas la revue.
 5. **Commit + push IMMÉDIATEMENT après validation** (protection contre la perte de
-   session) : cocher les cases dans PROGRESS.md (+ passer les fichiers à ✅ dans la
-   table de PLAN.md quand un fichier est terminé), inclure PROGRESS.md/PLAN.md dans le
-   MÊME commit que le code, message clair (`sasrs M1: implement parser/expr (Pratt SAS
-   precedence)`), puis `git push -u origin <branche>` (échec réseau : réessayer 4 fois,
-   backoff 2/4/8/16 s). Un commit par fichier validé ou par petit lot cohérent — jamais
-   de gros commit fourre-tout, jamais de code non validé.
+   session et mise à jour du PR GitHub) : cocher les cases dans PROGRESS.md (+ passer
+   les fichiers à ✅ dans la table de PLAN.md quand un fichier est terminé), inclure
+   PROGRESS.md/PLAN.md dans le MÊME commit que le code, message clair (`sasrs M1:
+   implement parser/expr (Pratt SAS precedence)`), puis `git push -u origin <branche>`
+   (échec réseau : réessayer 4 fois, backoff 2/4/8/16 s). Un commit par fichier validé
+   ou par groupe ⫽ cohérent — jamais de gros commit fourre-tout, jamais de code non
+   validé. **Ne jamais commencer le fichier ou groupe suivant sans avoir committé ET
+   poussé le précédent.**
+5b. **Boucle interne — cases restantes du jalon** : après chaque commit+push réussi,
+    retourner à l'étape 2 et sélectionner la prochaine case non cochée du MÊME jalon.
+    Répéter les étapes 2→3→4→5→5b jusqu'à l'une des conditions d'arrêt suivantes :
+    - toutes les cases du jalon courant sont cochées → passer à l'étape 6 ;
+    - les limites de contexte ou d'utilisation approchent → terminer proprement (étape 5
+      pour l'en-cours) et rapporter à l'étape 7 ;
+    - un blocage nécessite une décision utilisateur → rapporter à l'étape 7.
+    Ne jamais rompre la boucle silencieusement : toute sortie anticipée DOIT apparaître
+    dans le rapport de fin d'invocation (étape 7).
 6. **Fin de jalon** : quand toutes les cases du jalon sont cochées, dérouler sa ligne
    "DoD"/fixtures (snapshots insta : générer, VÉRIFIER À LA MAIN la plausibilité SAS de
    chaque snapshot avant `cargo insta accept`, committer les .snap), mettre à jour

@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/Users/philippele/rust_projects/rust_workspace/.codex/hooks/session-start.sh'"
+          }
+        ]
+      }
+    ]
+  }
+}
