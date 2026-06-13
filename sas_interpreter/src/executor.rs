@@ -30,12 +30,477 @@
 //! lexer. Le code retour est dérivé des compteurs du LogWriter par
 //! lib.rs (0 propre / 1 warnings / 2 erreurs).
 
-#![allow(unused_variables, dead_code)]
-
+use crate::ast::GlobalStmt;
+use crate::datastep;
 use crate::error::Result;
+use crate::log::StepTimer;
+use crate::parser::{Block, StatementStream};
+use crate::procs;
 use crate::session::Session;
 use crate::source::SourceFile;
+use std::path::PathBuf;
 
+/// M11.5/M11.7 : expansion macro INTERFOLIÉE segment par segment (toujours
+/// active désormais — il n'y a plus de feature `macros`).
+///
+/// On découpe le source ORIGINAL en segments bruts (`RawSegmenter`, coupe sur
+/// `run;`/`quit;` de niveau supérieur). Pour CHAQUE segment, dans l'ordre :
+/// 1. écho des lignes ORIGINALES du segment (numérotation préservée — cf.
+///    divergence ci-dessous) ;
+/// 2. `expand_open_code` du texte brut du segment avec l'état VIVANT de
+///    l'engine (les `%let`/symput des segments antérieurs sont donc visibles) ;
+/// 3. lexing/parsing/exécution du texte expansé via un `StatementStream`
+///    transitoire.
+///
+/// Comme le drain de `CALL SYMPUT` a lieu à la fin de l'étape (donc à la fin
+/// du segment qui contient le `run;`), un `&var` du segment SUIVANT voit bien
+/// la valeur posée par le symput — c'est l'objectif de M11.5.
+///
+/// # Écho de numéros de ligne — préservation
+/// L'écho reste BLOC PAR BLOC, comme le build par défaut : pour chaque bloc
+/// du segment expansé, on écho­te les lignes de son span via
+/// `seg_src.lines_of_span(span)`. Le compteur de lignes du `LogWriter`
+/// (`src_line`) avance naturellement d'un segment à l'autre. Lorsqu'un
+/// segment n'a subi AUCUNE expansion (cas des fixtures sans macro :
+/// `expand_open_code` est l'identité), le texte du segment est
+/// caractère-pour-caractère la tranche correspondante du source original,
+/// donc l'écho et la numérotation sont IDENTIQUES au chemin mono-source de
+/// M11.1. La seule divergence POSSIBLE concerne un segment dont l'expansion
+/// macro change le nombre/contenu des lignes : on écho­te alors le texte
+/// EXPANSÉ de ce segment (pas l'original). C'est sans incidence sur les
+/// fixtures de snapshot (aucune n'emploie de macro), et sans fixture dédiée
+/// pour ce cas.
 pub fn run_program(src: &SourceFile, session: &mut Session) -> Result<()> {
-    todo!("cf. plan en tête de fichier")
+    use crate::preprocess::RawSegmenter;
+
+    let orig = src;
+    let mut seg = RawSegmenter::new(&orig.text);
+    while let Some((start, end)) = seg.next_segment() {
+        let raw = &orig.text[start..end];
+        // Expansion avec l'état vivant (visibilité des symput antérieurs).
+        let expanded = session.macro_engine.expand_open_code(raw);
+        let seg_src = SourceFile::new(expanded);
+        let mut stream = match StatementStream::new(&seg_src) {
+            Ok(s) => s,
+            Err(e) => {
+                session.log.error(&e.to_string());
+                continue;
+            }
+        };
+        while let Some((block, span)) = stream.next_block() {
+            let lines = seg_src.lines_of_span(span);
+            let line_texts: Vec<&str> = lines.iter().map(|(_, text)| *text).collect();
+            session.log.echo_source(&line_texts);
+            run_one_block(block, session);
+        }
+    }
+    Ok(())
+}
+
+/// Exécute UN bloc déjà lexé/parsé (commun aux deux builds). L'écho de source
+/// est fait par l'appelant (différemment selon le build).
+fn run_one_block(block: Result<Block>, session: &mut Session) {
+    match block {
+        Err(e) => {
+            // La récupération de flux est déjà faite par le stream.
+            session.log.error(&e.to_string());
+        }
+        Ok(Block::Empty) => {}
+        Ok(Block::Global(stmt)) => exec_global(&stmt, session),
+        Ok(Block::DataStep(ast)) => exec_data_step(&ast, session),
+        Ok(Block::Proc { name, ast }) => {
+            if let Err(e) = procs::execute_proc(&name, &ast, session) {
+                session.log.error(&e.to_string());
+                session
+                    .log
+                    .note("The SAS System stopped processing this step because of errors.");
+            }
+        }
+    }
+}
+
+fn exec_global(stmt: &GlobalStmt, session: &mut Session) {
+    match stmt {
+        GlobalStmt::Libname { libref, path } => {
+            // M13 : routage cloud. Quand la feature `s3` est active et que le
+            // chemin commence par `s3://`, on enregistre une `S3Library`
+            // (bucket/prefix) au lieu d'une `DirLibrary`. Le chemin affiché
+            // reste l'URI tel quel (pas de résolution relative, pas d'absolu de
+            // tempdir → snapshots stables). Sous le build par défaut ce bloc
+            // n'est pas compilé : un chemin `s3://...` est traité comme
+            // aujourd'hui (résolu comme un répertoire local, qui n'existe pas →
+            // erreur runtime habituelle).
+            #[cfg(feature = "s3")]
+            if path.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("s3://")) {
+                match session.libs.assign_uri(libref, path) {
+                    Ok(()) => session.log.note(&format!(
+                        "Libref {} was successfully assigned as follows:\n      Engine:        PARQUET\n      Physical Name: {path}",
+                        libref.to_uppercase()
+                    )),
+                    Err(e) => session.log.error(&e.to_string()),
+                }
+                return;
+            }
+
+            let p = PathBuf::from(path);
+            let abs = if p.is_absolute() {
+                p
+            } else {
+                session.base_dir.join(p)
+            };
+            // Sous --deterministic, le chemin affiché est celui du source
+            // (un chemin absolu de tempdir casserait les snapshots).
+            let shown = if session.deterministic {
+                path.clone()
+            } else {
+                abs.display().to_string()
+            };
+            match session.libs.assign(libref, abs) {
+                Ok(()) => session.log.note(&format!(
+                    "Libref {} was successfully assigned as follows:\n      Engine:        PARQUET\n      Physical Name: {shown}",
+                    libref.to_uppercase()
+                )),
+                Err(e) => session.log.error(&e.to_string()),
+            }
+        }
+        GlobalStmt::LibnameClear { libref } => match session.libs.clear(libref) {
+            Ok(()) => session.log.note(&format!(
+                "Libref {} has been deassigned.",
+                libref.to_uppercase()
+            )),
+            Err(e) => session.log.error(&e.to_string()),
+        },
+        GlobalStmt::Title { n, text } => {
+            // M1 : seul TITLE1 est rendu par le listing ; les autres niveaux
+            // sont acceptés sans effet.
+            if *n == 1 {
+                session.listing.title = text.clone();
+            }
+        }
+        GlobalStmt::Options(opts) => {
+            for (name, value) in opts {
+                if name.eq_ignore_ascii_case("ls") || name.eq_ignore_ascii_case("linesize") {
+                    match value.as_deref().and_then(|v| v.parse::<usize>().ok()) {
+                        Some(v) if (40..=256).contains(&v) => {
+                            session.options.ls = v;
+                            session.listing.ls = v;
+                        }
+                        _ => session.log.error(&format!(
+                            "The value {} is not a valid LINESIZE value (40..256).",
+                            value.as_deref().unwrap_or("")
+                        )),
+                    }
+                } else if name.eq_ignore_ascii_case("obs") {
+                    // OBS=MAX (or unset) → no limit; OBS=n → process up to obs n.
+                    match value.as_deref() {
+                        Some(v) if v.eq_ignore_ascii_case("max") => session.options.obs = None,
+                        Some(v) => match v.parse::<usize>() {
+                            Ok(n) => session.options.obs = Some(n),
+                            Err(_) => session.log.error(&format!(
+                                "The value {v} is not a valid OBS value."
+                            )),
+                        },
+                        None => session.options.obs = None,
+                    }
+                } else if name.eq_ignore_ascii_case("firstobs") {
+                    // FIRSTOBS=MAX is unusual; treat any non-number as an error.
+                    match value.as_deref() {
+                        Some(v) if v.eq_ignore_ascii_case("max") => {
+                            session.options.firstobs = usize::MAX
+                        }
+                        Some(v) => match v.parse::<usize>() {
+                            Ok(n) if n >= 1 => session.options.firstobs = n,
+                            _ => session.log.error(&format!(
+                                "The value {v} is not a valid FIRSTOBS value."
+                            )),
+                        },
+                        None => {}
+                    }
+                } else {
+                    session.log.warning(&format!(
+                        "Option {} is not yet supported.",
+                        name.to_uppercase()
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn exec_data_step(ast: &crate::ast::DataStepAst, session: &mut Session) {
+    let timer = StepTimer::start();
+    let compiled = datastep::compile(ast, session);
+    match compiled {
+        Err(e) => {
+            session.log.error(&e.to_string());
+            session
+                .log
+                .note("The SAS System stopped processing this step because of errors.");
+        }
+        Ok(prog) => {
+            if let Err(e) = datastep::exec::execute(prog, session) {
+                session.log.error(&e.to_string());
+                session
+                    .log
+                    .note("The SAS System stopped processing this step because of errors.");
+            }
+        }
+    }
+    // SAS imprime la NOTE de timing même quand l'étape a échoué.
+    session.log.step_used("DATA statement", &timer);
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{run, RunOptions};
+
+    fn run_det(src: &str) -> crate::RunOutcome {
+        run(
+            src,
+            RunOptions {
+                work_dir: None,
+                base_dir: None,
+                deterministic: true,
+                vectorize: false,
+            },
+        )
+    }
+
+    #[test]
+    fn end_to_end_data_then_print() {
+        let out = run_det(
+            "title 'Essai';\n\
+             data a; x = 1; y = 'ab'; run;\n\
+             proc print data=a; run;\n",
+        );
+        assert_eq!(out.exit_code, 0, "log was:\n{}", out.log);
+        // Écho numéroté du source.
+        assert!(out.log.contains("1     title 'Essai';"), "{}", out.log);
+        assert!(out.log.contains("data a; x = 1; y = 'ab'; run;"));
+        // NOTEs de l'étape DATA.
+        assert!(out
+            .log
+            .contains("The data set WORK.A has 1 observations and 2 variables."));
+        assert!(out.log.contains("DATA statement used (Total process time):"));
+        assert!(out.log.contains("real time           0.00 seconds"));
+        // PROC PRINT : timing + listing avec titre.
+        assert!(out.log.contains("PROCEDURE PRINT used (Total process time):"));
+        assert!(out.listing.contains("Essai"), "{}", out.listing);
+        assert!(out.listing.contains("Obs"));
+    }
+
+    #[test]
+    fn error_recovery_continues_session() {
+        let out = run_det(
+            "frobnicate;\n\
+             data a; x = 1; run;\n",
+        );
+        assert_eq!(out.exit_code, 2);
+        assert!(out.log.contains("ERROR: Statement 'FROBNICATE' is not valid"));
+        // L'étape suivante s'exécute malgré l'erreur.
+        assert!(out
+            .log
+            .contains("The data set WORK.A has 1 observations and 1 variables."));
+    }
+
+    #[test]
+    fn unknown_proc_errors_and_continues() {
+        let out = run_det(
+            "proc nosuchproc data=a; run;\n\
+             data b; x = 1; run;\n",
+        );
+        assert_eq!(out.exit_code, 2);
+        assert!(out.log.contains("ERROR: Procedure NOSUCHPROC not found."));
+        assert!(out
+            .log
+            .contains("The data set WORK.B has 1 observations and 1 variables."));
+    }
+
+    #[test]
+    fn missing_input_dataset_stops_step_with_notes() {
+        let out = run_det("data a; set nosuch; run;");
+        assert_eq!(out.exit_code, 2);
+        assert!(out.log.contains("ERROR: File WORK.NOSUCH.DATA does not exist."));
+        assert!(out
+            .log
+            .contains("The SAS System stopped processing this step because of errors."));
+        // Timing imprimé malgré l'erreur.
+        assert!(out.log.contains("DATA statement used (Total process time):"));
+    }
+
+    #[test]
+    fn options_ls_applied_and_unknown_option_warns() {
+        let out = run_det("options ls=120 nocenter;");
+        assert_eq!(out.exit_code, 1, "{}", out.log);
+        assert!(out.log.contains("WARNING: Option NOCENTER is not yet supported."));
+    }
+
+    #[test]
+    fn options_firstobs_and_obs_window_input() {
+        // Build a 5-row data set, then read it with FIRSTOBS=2 OBS=4 → obs 2..4
+        // (3 observations). The window applies to the physical SET input.
+        let out = run_det(
+            "data a; do i = 1 to 5; output; end; run;\n\
+             options firstobs=2 obs=4;\n\
+             data b; set a; run;\n",
+        );
+        assert_eq!(out.exit_code, 0, "{}", out.log);
+        assert!(
+            out.log
+                .contains("The data set WORK.A has 5 observations and 1 variables."),
+            "{}",
+            out.log
+        );
+        assert!(
+            out.log
+                .contains("The data set WORK.B has 3 observations and 1 variables."),
+            "{}",
+            out.log
+        );
+    }
+
+    #[test]
+    fn libname_relative_resolution_and_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("dat")).unwrap();
+        let out = run(
+            "libname mylib 'dat';\nlibname mylib clear;\n",
+            RunOptions {
+                work_dir: None,
+                base_dir: Some(dir.path().to_path_buf()),
+                deterministic: true,
+                vectorize: false,
+            },
+        );
+        assert_eq!(out.exit_code, 0, "{}", out.log);
+        assert!(out
+            .log
+            .contains("Libref MYLIB was successfully assigned as follows:"));
+        assert!(out.log.contains("Physical Name:"));
+        assert!(out.log.contains("Libref MYLIB has been deassigned."));
+    }
+
+    #[test]
+    fn data_null_no_listing_no_dataset_note() {
+        let out = run_det("data _null_; x = 1; run;");
+        assert_eq!(out.exit_code, 0);
+        assert!(!out.log.contains("has 1 observations"));
+        assert!(out.listing.is_empty());
+    }
+
+    /// M11.1 : l'expansion macro est conduite par l'executor (état dans
+    /// `Session::macro_engine`). Un programme avec `%let`/`&var` doit produire
+    /// EXACTEMENT le même résultat que son équivalent sans macro.
+    #[test]
+    fn macro_let_ref_runs_through_executor() {
+        let with_macro = run_det(
+            "%let lib=work; data &lib..a; x=1; run; proc print data=&lib..a; run;",
+        );
+        let without_macro = run_det(
+            "data work.a; x=1; run; proc print data=work.a; run;",
+        );
+        assert_eq!(with_macro.exit_code, 0, "log was:\n{}", with_macro.log);
+        assert_eq!(
+            with_macro.listing, without_macro.listing,
+            "macro listing differs:\nMACRO:\n{}\nPLAIN:\n{}",
+            with_macro.listing, without_macro.listing
+        );
+        // Les NOTEs de l'étape DATA / PROC doivent correspondre.
+        assert!(with_macro
+            .log
+            .contains("The data set WORK.A has 1 observations and 1 variables."));
+        assert!(with_macro
+            .log
+            .contains("There were 1 observations read from the data set WORK.A."));
+    }
+
+    /// M11.5 : `CALL SYMPUT` dans une étape pose un symbole macro visible
+    /// dans le SEGMENT SUIVANT (le drain a lieu au `run;`). Ici on s'en sert
+    /// pour nommer un dataset de l'étape d'après.
+    #[test]
+    fn symput_visible_in_next_segment_as_dataset_name() {
+        let out = run_det(
+            "data _null_; call symput('answer','42'); run;\n\
+             data tbl_&answer; x=1; run;\n\
+             proc print data=tbl_&answer; run;\n",
+        );
+        assert_eq!(out.exit_code, 0, "log was:\n{}", out.log);
+        // Le dataset a bien été nommé WORK.TBL_42 (symbole résolu).
+        assert!(
+            out.log
+                .contains("The data set WORK.TBL_42 has 1 observations and 1 variables."),
+            "log was:\n{}",
+            out.log
+        );
+        assert!(out
+            .log
+            .contains("There were 1 observations read from the data set WORK.TBL_42."));
+    }
+
+    /// M11.5 : formatage NUMÉRIQUE d'un symput — `42` (et non `          42`).
+    #[test]
+    fn symput_numeric_value_left_aligned_best12() {
+        let out = run_det(
+            "data _null_; call symput('n', 42); run;\n\
+             data tbl_&n; x=1; run;\n",
+        );
+        assert_eq!(out.exit_code, 0, "log was:\n{}", out.log);
+        assert!(
+            out.log
+                .contains("The data set WORK.TBL_42 has 1 observations and 1 variables."),
+            "log was:\n{}",
+            out.log
+        );
+    }
+
+    /// M11.5 : SYMGET lit un `%let` antérieur (table macro → DATA step).
+    #[test]
+    fn symget_reads_prior_let() {
+        let out = run_det(
+            "%let x = 5;\n\
+             data a; v = symget('x'); run;\n\
+             proc print data=a; run;\n",
+        );
+        assert_eq!(out.exit_code, 0, "log was:\n{}", out.log);
+        // v est une variable caractère = "5".
+        assert!(out.listing.contains('5'), "listing was:\n{}", out.listing);
+        assert!(out
+            .log
+            .contains("The data set WORK.A has 1 observations and 1 variables."));
+    }
+
+    /// M11.5 : un symput n'est PAS visible DANS LA MÊME étape. SYMGET lit
+    /// l'instantané de DÉBUT d'étape : un `symput('w', ...)` plus tôt dans la
+    /// MÊME étape ne s'y reflète pas (le drain n'a lieu qu'au `run;`). Ici
+    /// `w` n'existe pas au début de l'étape → symget rend une valeur vide,
+    /// alors que l'étape SUIVANTE la verrait.
+    #[test]
+    fn symput_not_visible_in_same_step() {
+        let out = run_det(
+            "data a; call symput('w','99'); seen = symget('w'); run;\n\
+             data b; later = symget('w'); run;\n\
+             proc print data=b; run;\n",
+        );
+        assert_eq!(out.exit_code, 0, "log was:\n{}", out.log);
+        // Étape A : `seen` est vide (symput pas encore drainé) → 0 obs avec
+        // valeur non vide ; on vérifie surtout que B voit bien 99.
+        assert!(
+            out.listing.contains("99"),
+            "step B should see w=99 via symget; listing was:\n{}",
+            out.listing
+        );
+    }
+
+    #[test]
+    fn proc_print_uses_last_dataset() {
+        let out = run_det(
+            "data zz; v = 3.5; run;\n\
+             proc print; run;\n",
+        );
+        assert_eq!(out.exit_code, 0, "{}", out.log);
+        assert!(out
+            .log
+            .contains("There were 1 observations read from the data set WORK.ZZ."));
+        assert!(out.listing.contains("3.5"));
+    }
 }

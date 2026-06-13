@@ -24,7 +24,6 @@ pub mod sql;
 pub mod token;
 pub mod value;
 
-use preprocess::{IdentityMacroStage, TextStage};
 use session::Session;
 use source::SourceFile;
 use std::path::PathBuf;
@@ -38,6 +37,9 @@ pub struct RunOptions {
     /// Fige les temps (et toute sortie non reproductible) pour les
     /// snapshots de test.
     pub deterministic: bool,
+    /// Active le fast-path vectorisé OPTIONNEL des étapes DATA simples
+    /// (cf. `datastep::fastpath`). OFF par défaut.
+    pub vectorize: bool,
 }
 
 impl Default for RunOptions {
@@ -46,6 +48,7 @@ impl Default for RunOptions {
             work_dir: None,
             base_dir: None,
             deterministic: false,
+            vectorize: false,
         }
     }
 }
@@ -74,11 +77,12 @@ pub fn run(source_text: &str, opts: RunOptions) -> RunOutcome {
             };
         }
     };
+    session.vectorize = opts.vectorize;
 
-    // Emplacement réservé du processeur macro : identité tant que la
-    // phase macro n'est pas implémentée.
-    let preprocessed = IdentityMacroStage.process(source_text);
-    let src = SourceFile::new(preprocessed);
+    // M11.1 : l'expansion macro n'est plus pilotée ici. L'état macro vit dans
+    // `Session::macro_engine` et l'expansion est désormais conduite par
+    // l'`executor` (cf. `run_program`). Le source brut est passé tel quel.
+    let src = SourceFile::new(source_text.to_string());
 
     if let Err(e) = executor::run_program(&src, &mut session) {
         session.log.error(&e.to_string());

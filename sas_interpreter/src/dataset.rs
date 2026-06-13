@@ -57,6 +57,48 @@ impl SasDataset {
             vars.push(meta);
         }
 
+        // Métadonnées SAS (format/label) persistées dans un sidecar JSON :
+        // le Parquet ne porte que types et données ; format et libellé (qui,
+        // en SAS, ne sont QUE de l'affichage) survivent au round-trip via ce
+        // fichier annexe. Absent → on garde les VarMeta dérivés du Parquet
+        // (rétro-compatible : datasets écrits sans format/label).
+        if let Some(meta_map) = read_sidecar(path) {
+            for v in &mut vars {
+                if let Some(saved) = meta_map.get(&v.name.to_uppercase()) {
+                    // Le format/libellé sauvegardé l'emporte (y compris pour
+                    // remplacer le DATE9. inféré d'une colonne Date physique).
+                    if saved.format.is_some() {
+                        v.format = saved.format.clone();
+                    }
+                    if saved.label.is_some() {
+                        v.label = saved.label.clone();
+                    }
+                }
+            }
+        }
+
+        let df = DataFrame::new(columns)?;
+        Ok((SasDataset { df, vars }, notes))
+    }
+
+    /// Coerce an arbitrary DataFrame (e.g. a PROC SQL result, which may carry
+    /// u32/i64/bool/Float64/String columns from aggregates and joins) into the
+    /// strict SAS type model: numeric → f64, character → string. Reuses the
+    /// same per-column coercion as `read_parquet` so VarMeta inference is
+    /// identical. Returns the dataset plus any NOTE/WARNING lines.
+    pub fn from_dataframe(df: DataFrame) -> Result<(SasDataset, Vec<String>)> {
+        let mut notes = Vec::new();
+        let mut columns: Vec<Column> = Vec::with_capacity(df.width());
+        let mut vars = Vec::with_capacity(df.width());
+
+        for col in df.get_columns() {
+            let name = col.name().to_string();
+            let s = col.as_materialized_series();
+            let (series, meta) = coerce_series(&name, s, &mut notes)?;
+            columns.push(series.into());
+            vars.push(meta);
+        }
+
         let df = DataFrame::new(columns)?;
         Ok((SasDataset { df, vars }, notes))
     }
@@ -65,8 +107,64 @@ impl SasDataset {
         let mut file = File::create(path)?;
         let mut df = self.df.clone();
         ParquetWriter::new(&mut file).finish(&mut df)?;
+        write_sidecar(path, &self.vars)?;
         Ok(())
     }
+}
+
+/// Métadonnée SAS persistée par variable (format/libellé). Le type et la
+/// longueur se redéduisent du Parquet ; seuls format et libellé doivent être
+/// conservés à part.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedMeta {
+    format: Option<String>,
+    label: Option<String>,
+}
+
+/// Chemin du sidecar JSON associé à un fichier parquet (`t.parquet` →
+/// `t.parquet.sasmeta.json`).
+fn sidecar_path(path: &Path) -> std::path::PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(".sasmeta.json");
+    std::path::PathBuf::from(s)
+}
+
+/// Écrit le sidecar de métadonnées si AU MOINS une variable porte un format
+/// ou un libellé ; sinon, supprime un sidecar éventuellement obsolète (et
+/// n'en crée aucun — round-trip identique pour les datasets sans
+/// format/label, stabilité des snapshots existants).
+fn write_sidecar(path: &Path, vars: &[VarMeta]) -> Result<()> {
+    let has_meta = vars.iter().any(|v| v.format.is_some() || v.label.is_some());
+    let sc = sidecar_path(path);
+    if !has_meta {
+        let _ = std::fs::remove_file(&sc);
+        return Ok(());
+    }
+    let map: std::collections::HashMap<String, SavedMeta> = vars
+        .iter()
+        .map(|v| {
+            (
+                v.name.to_uppercase(),
+                SavedMeta {
+                    format: v.format.clone(),
+                    label: v.label.clone(),
+                },
+            )
+        })
+        .collect();
+    let json = serde_json::to_string(&map)
+        .map_err(|e| SasError::runtime(format!("failed to serialize SAS metadata: {e}")))?;
+    std::fs::write(&sc, json)?;
+    Ok(())
+}
+
+/// Lit le sidecar de métadonnées s'il existe (nom UPPERCASE → métadonnée).
+/// Toute erreur de lecture/parsing est silencieusement ignorée (on retombe
+/// sur les VarMeta dérivés du Parquet).
+fn read_sidecar(path: &Path) -> Option<std::collections::HashMap<String, SavedMeta>> {
+    let sc = sidecar_path(path);
+    let data = std::fs::read_to_string(&sc).ok()?;
+    serde_json::from_str(&data).ok()
 }
 
 fn coerce_series(name: &str, s: &Series, notes: &mut Vec<String>) -> Result<(Series, VarMeta)> {
@@ -171,4 +269,71 @@ fn coerce_series(name: &str, s: &Series, notes: &mut Vec<String>) -> Result<(Ser
     };
 
     Ok((series.with_name(name.into()), num_meta(None)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::missing::{decode_nan, encode_special};
+    use crate::value::MissingKind;
+    use polars::df;
+
+    fn num_meta(name: &str) -> VarMeta {
+        VarMeta {
+            name: name.to_string(),
+            ty: VarType::Num,
+            length: 8,
+            format: None,
+            label: None,
+        }
+    }
+
+    /// Garantie centrale des missings spéciaux : le NaN-payload survit
+    /// BIT À BIT à write_parquet → read_parquet (parquet stocke les
+    /// doubles tels quels ; Polars ne canonicalise pas le NaN). Si ce
+    /// test casse un jour (canonicalisation), c'est un blocage à
+    /// remonter — pas à contourner par un encodage parallèle.
+    #[test]
+    fn parquet_roundtrip_preserves_special_missing_nan_payloads() {
+        let kinds = [
+            MissingKind::Letter(0),  // .A
+            MissingKind::Underscore, // ._
+            MissingKind::Letter(25), // .Z
+        ];
+        let vals: Vec<Option<f64>> = kinds
+            .iter()
+            .map(|k| Some(encode_special(*k)))
+            .chain([None, Some(1.5)]) // `.` ordinaire = null, et un nombre.
+            .collect();
+        let df = df!("x" => &vals).unwrap();
+        let ds = SasDataset {
+            df,
+            vars: vec![num_meta("x")],
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.parquet");
+        ds.write_parquet(&path).unwrap();
+        let (back, notes) = SasDataset::read_parquet(&path).unwrap();
+        assert!(notes.is_empty(), "unexpected coercion notes: {notes:?}");
+
+        let col = back.df.column("x").unwrap().f64().unwrap();
+        // `.` ordinaire : null Polars — et UN SEUL null dans la colonne
+        // (les spéciaux ne sont PAS des nulls).
+        assert_eq!(col.null_count(), 1);
+        assert_eq!(col.get(3), None);
+        // Spéciaux : des NaN (pas des nulls) dont le payload est intact.
+        for (i, kind) in kinds.iter().enumerate() {
+            let v = col.get(i).expect("special missing must not be null");
+            assert!(v.is_nan());
+            assert_eq!(
+                v.to_bits(),
+                encode_special(*kind).to_bits(),
+                "parquet canonicalized the NaN payload for {kind:?}"
+            );
+            assert_eq!(decode_nan(v), *kind);
+        }
+        // Et un nombre ordinaire passe inchangé.
+        assert_eq!(col.get(4), Some(1.5));
+    }
 }

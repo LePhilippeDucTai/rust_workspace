@@ -70,19 +70,19 @@ l'inverse est déconseillé pour les fichiers marqués Fable.
 
 | Fichier | État | Modèle | Effort | Contenu |
 |---|---|---|---|---|
-| `src/parser/mod.rs` | 🦴 | **Opus** | élevé | `StatementStream`, découpeur de blocs, récupération d'erreur — c'est la pièce architecturale (couture macro + grammaires par proc) |
-| `src/parser/expr.rs` | 🦴 | **Opus** | élevé | Pratt avec la précédence SAS *inhabituelle* (`NOT` lie fort, `**` droite-associatif), littéraux date, missings spéciaux `.a` |
-| `src/parser/datastep.rs` | 🦴 | **Opus** | moyen | statements M1 (SET/assign/IF/DO/OUTPUT/KEEP/DROP/STOP), erreurs "not yet implemented" propres |
-| `src/parser/global.rs` | 🦴 | **Sonnet** | faible | LIBNAME / TITLE / OPTIONS |
-| `src/datastep/pdv.rs` | 🦴 | **Sonnet** | moyen | PDV : lookup insensible casse, troncature longueur char, reset non-retenues |
-| `src/datastep/mod.rs` | 🦴 | **Fable** | élevé | compilation : PDV en ordre de première référence, inférence type/longueur, KEEP/DROP, output implicite — sémantique SAS dense |
-| `src/datastep/exec.rs` | 🦴 | **Fable** | élevé | boucle implicite (fin d'étape AU MILIEU de l'itération sur EOF), flux NextIter/EndStep, builders de sortie, NOTEs exactes |
-| `src/datastep/eval.rs` | 🦴 | **Opus** | moyen-élevé | coercitions, propagation missing, comparaisons via `sas_cmp`, notes de conversion |
-| `src/datastep/functions.rs` | 🦴 | **Sonnet** | moyen | dispatch table-driven ~25 fonctions (SUM ignore les missings !), tests table-driven |
-| `src/executor.rs` | 🦴 | **Opus** | moyen | boucle blocs→exécution, exécution des statements globaux, timing |
-| `src/procs/mod.rs` | 🦴 | **Sonnet** | faible | registre parse/execute des procs |
-| `src/procs/print.rs` | 🦴 | **Sonnet** | moyen | PROC PRINT (Obs/VAR/NOOBS, alignements, _LAST_) |
-| `tests/snapshot.rs` | ✅* | **Sonnet** | faible | *écrit mais `#[ignore]` — retirer l'ignore à la fin de M1, `cargo insta review`, vérifier les 3 fixtures m1/ |
+| `src/parser/mod.rs` | ✅ | **Opus** | élevé | `StatementStream`, découpeur de blocs, récupération d'erreur — c'est la pièce architecturale (couture macro + grammaires par proc) |
+| `src/parser/expr.rs` | ✅ | **Opus** | élevé | Pratt avec la précédence SAS *inhabituelle* (`NOT` lie fort, `**` droite-associatif), littéraux date, missings spéciaux `.a` |
+| `src/parser/datastep.rs` | ✅ | **Opus** | moyen | statements M1 (SET/assign/IF/DO/OUTPUT/KEEP/DROP/STOP), erreurs "not yet implemented" propres |
+| `src/parser/global.rs` | ✅ | **Sonnet** | faible | LIBNAME / TITLE / OPTIONS |
+| `src/datastep/pdv.rs` | ✅ | **Sonnet** | moyen | PDV : lookup insensible casse, troncature longueur char, reset non-retenues |
+| `src/datastep/mod.rs` | ✅ | **Fable** | élevé | compilation : PDV en ordre de première référence, inférence type/longueur, KEEP/DROP, output implicite — sémantique SAS dense |
+| `src/datastep/exec.rs` | ✅ | **Fable** | élevé | boucle implicite (fin d'étape AU MILIEU de l'itération sur EOF), flux NextIter/EndStep, builders de sortie, NOTEs exactes |
+| `src/datastep/eval.rs` | ✅ | **Opus** | moyen-élevé | coercitions, propagation missing, comparaisons via `sas_cmp`, notes de conversion |
+| `src/datastep/functions.rs` | ✅ | **Sonnet** | moyen | dispatch table-driven ~25 fonctions (SUM ignore les missings !), tests table-driven |
+| `src/executor.rs` | ✅ | **Opus** | moyen | boucle blocs→exécution, exécution des statements globaux, timing |
+| `src/procs/mod.rs` | ✅ | **Sonnet** | faible | registre parse/execute des procs |
+| `src/procs/print.rs` | ✅ | **Sonnet** | moyen | PROC PRINT (Obs/VAR/NOOBS, alignements, _LAST_) |
+| `tests/snapshot.rs` | ✅ | **Sonnet** | faible | actif — les 3 fixtures m1/ sont verrouillées (log + listing + exit), vérifiées à la main |
 
 **Definition of done M1** : `cargo test -p sas_interpreter` vert avec les snapshots activés ;
 `sasrs tests/fixtures/m1/set_filter.sas` affiche les ados de CLASS avec une log plausible.
@@ -97,7 +97,7 @@ l'inverse est déconseillé pour les fichiers marqués Fable.
 | `src/formats/mod.rs` | M4 | **Sonnet** | moyen | FormatSpec, catalogue, résolution user→builtin→fallback |
 | `src/formats/builtin.rs` | M4 | **Sonnet** | moyen-élevé | table-driven, beaucoup de cas ; informat `5.2` piège des décimales implicites |
 | `src/formats/userdef.rs` + `src/procs/format.rs` | M4 | **Sonnet** | moyen | plages low-<high, OTHER |
-| Persistance VarMeta dans les métadonnées KV parquet (`dataset.rs`) | M4 | **Opus** | moyen | clé `"sas_meta"` JSON ; API KV isolée dans dataset.rs |
+| Persistance VarMeta (`dataset.rs`) | M4 | **Opus** | moyen | ✅ FAIT (box 2). Polars 0.46 `ParquetWriter` n'expose **aucune** API KV parquet → format/label persistés dans un sidecar JSON `<table>.parquet.sasmeta.json` (écrit seulement si une var porte un format/label → round-trip identique sinon, snapshots stables). API isolée dans `dataset.rs`. |
 | `src/procs/contents.rs` | M4 | **Sonnet** | faible | métadonnées seulement |
 | `src/procs/means.rs` | M5 | **Opus** | élevé | combinatoire `_TYPE_`/`_FREQ_` de CLASS |
 | `src/procs/freq.rs` | M5 | **Opus** | moyen | 1 et 2 voies, option MISSING |
@@ -109,8 +109,46 @@ l'inverse est déconseillé pour les fichiers marqués Fable.
 | `src/procs/append.rs` | M7 | **Sonnet** | moyen | règles FORCE |
 | `src/procs/datasets.rs` | M7 | **Sonnet** | moyen | run-group, delete/change ; ajouter `rename` au trait LibraryProvider |
 | Préprocesseur macro (`preprocess.rs`) : %let, &var, %macro/%mend, %if/%do, CALL SYMPUT | M8 | **Fable** | élevé | la couture existe ; commencer par un spike %let derrière un feature flag |
-| `S3Library` derrière feature `s3` | M8 | **Opus** | moyen | même trait, scan/sink cloud Polars |
-| Fast-path vectorisé des steps simples (SET+assign+IF → LazyFrame) | M8 | **Fable** | élevé | optionnel, derrière la même interface StepProgram |
+| `S3Library` derrière feature `s3` | M8 | ✅ | moyen | même trait `LibraryProvider`, scan parquet via URI `s3://` ; non branché ; cloud réel = features Polars `cloud`/`aws` (suite) |
+| `src/datastep/fastpath.rs` — fast-path vectorisé des steps simples (SET+assign → LazyFrame) | M8 | ✅ | élevé | opt-in (`Session.vectorize`/`--vectorize`), OFF par défaut ; v1 = SET simple + assignations numériques (littéraux/copies/+−*), prouvé équivalent au chemin ligne-à-ligne (tests bit-à-bit + log) ; subsetting IF / `/` / `**` / char repliés sur la boucle |
+
+### Jalons M9–M11 (extension — roadmap dans PROGRESS.md)
+
+| Fichier / tâche | Jalon | Modèle | Effort | Notes |
+|---|---|---|---|---|
+| `src/procs/common.rs` | M9 | ✅ | moyen | `decode_column`/`sample_std`/`partition_numeric`/`group_by_keys` extraits (verbatim) ; means/freq/univariate/sort/transpose/append rebranchés ; refactor pur, sorties inchangées (`resolve_input` laissé par-proc) |
+| `src/procs/corr.rs` | M9 | ✅ | moyen | Pearson (VAR/WITH), Simple Statistics, matrice r + `Prob>|r|` (t-CDF via betai), N appariés ; NOSIMPLE/NOPROB/NOCORR ; OUT= = erreur (suite) ; réutilise common |
+| `src/procs/rank.rs` | M9 | ✅ | moyen | VAR/RANKS, GROUPS=, TIES=(MEAN/LOW/HIGH/DENSE), DESCENDING, OUT= ; collation `sas_cmp`, missing→missing ; BY + méthodes alt. = erreur (suite) |
+| `src/procs/tabulate.rs` | M9 | ✅ | élevé | v1 listing : CLASS/VAR, `table` 1–2 dims (empilement/croisement/parenthèses), stats N/NMISS/SUM/MEAN/MIN/MAX/STD ; en-têtes plats, 3ᵉ dim + croisements 2 VAR/stats + PCTN/formats différés (erreurs) |
+| `src/procs/report.rs` | M9 | ✅ | élevé | v1 listing : COLUMN + DEFINE (DISPLAY/ORDER/GROUP/ANALYSIS+stat) ; détail ou sommaire groupé ; ACROSS/COMPUTE/BREAK/RBREAK/LINE/WHERE/OUT= différés (erreurs) |
+| BY-group + WEIGHT + CI dans means/univariate ; CHISQ + options FREQ | M10 | **Opus** | élevé | étend les procs M5 ; `partition_weighted`, quantile t, χ² Pearson |
+| `src/macros/` (depuis `preprocess.rs`) — processeur macro complet | M11 | **Fable** | élevé | voir §Macro M11 ci-dessous ; 7 unités incrémentales |
+
+### Macro M11 — architecture (décision actée)
+
+Modèle choisi : **expansion texte→texte PRE-lexer, interfoliée** avec la boucle de
+`executor::run_program`, état dans `Session` (pas de transformeur de tokens : les corps
+de `%macro` contiennent du texte SAS arbitraire, et `%str`/`%nrstr` masquent des caractères
+au scanner — naturellement un travail au niveau texte ; c'est aussi le modèle réel de SAS).
+
+- **État** : nouveau `pub macro_engine: MacroEngine` sur `Session` (construit dans `Session::new`
+  depuis `deterministic`). `MacroEngine { symbols: SymbolTable{global, scopes}, macros: HashMap<String,MacroDef>, deterministic, guard }`.
+- **Seam** : `executor::run_program` ne reçoit plus un source pré-expansé ; il itère sur des
+  **segments bruts** (`RawSegmenter`, découpe aux frontières top-level en respectant
+  `%macro…%mend` et le masquage `%str/%nrstr`), appelle `macro_engine.expand_open_code(raw)`,
+  puis lexe/parse/exécute le texte expansé via un `StatementStream` transitoire (les bras du
+  match `Block` sont réutilisés tels quels). `lib.rs` cesse de pré-expanser.
+- **CALL SYMPUT** : `EvalCtx` (construit par étape, sans `&mut Session`) gagne
+  `symput_writes: Vec<(String,String)>` ; `DsStmt::CallRoutine` y pousse ; APRÈS l'exécution de
+  l'étape, `exec::execute` draine vers `macro_engine.set_symbol_global` (visible au segment
+  suivant — fidèle à SAS : invisible dans la même étape). `SYMGET` lit un instantané
+  `EvalCtx.macro_symbols_snapshot` pris en début d'étape.
+- **Écho log** : afficher les n° de ligne ORIGINAUX (pas le texte généré ; MPRINT hors périmètre).
+- **Vars auto / déterminisme** : `&SYSDATE9`/`&SYSTIME`/`&SYSVER` figées sous `--deterministic`
+  (sinon snapshots instables). `today_sas()` doit devenir deterministic-aware si SYSDATE9 en dérive.
+- **Invariant de bascule (M11.7)** : `expand_open_code` est l'IDENTITÉ pour tout segment sans
+  déclencheur macro résolu → les 789 tests + snapshots restent octet-identiques sans `--features`.
+- Découpage en 7 unités commit+push : voir PROGRESS.md (M11.1 … M11.7).
 
 ### Conseils d'orchestration
 

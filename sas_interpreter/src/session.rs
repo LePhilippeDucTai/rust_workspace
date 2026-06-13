@@ -7,12 +7,22 @@ use std::path::PathBuf;
 /// parsed and ignored with a WARNING.
 pub struct SasOptions {
     pub ls: usize,
+    /// FIRSTOBS= : 1-based number of the first observation to read from each
+    /// input data set. Default 1.
+    pub firstobs: usize,
+    /// OBS= : the number of the LAST observation to process (1-based, an upper
+    /// bound on the observation count read). `None` = no limit (OBS=MAX).
+    pub obs: Option<usize>,
 }
 
 impl Default for SasOptions {
     fn default() -> Self {
         // SAS 9.4 listing default linesize.
-        SasOptions { ls: 96 }
+        SasOptions {
+            ls: 96,
+            firstobs: 1,
+            obs: None,
+        }
     }
 }
 
@@ -28,6 +38,16 @@ pub struct Session {
     /// input of procs without DATA=.
     pub last_dataset: Option<String>,
     pub deterministic: bool,
+    /// User-defined format catalog (populated by PROC FORMAT).
+    pub format_catalog: crate::formats::FormatCatalog,
+    /// Processeur macro de la session (M11) : table des symboles `%let`/`&var`.
+    /// Sous le build par défaut c'est une identité pure (cf. `MacroEngine`).
+    pub macro_engine: crate::preprocess::MacroEngine,
+    /// Opt-in : autorise le fast-path vectorisé des étapes DATA simples
+    /// (`datastep::fastpath`). OFF par défaut — le chemin ligne-à-ligne reste
+    /// la référence ; le fast-path ne s'active que pour les étapes que
+    /// `fastpath::eligible` prouve équivalentes.
+    pub vectorize: bool,
 }
 
 impl Session {
@@ -45,6 +65,9 @@ impl Session {
             base_dir,
             last_dataset: None,
             deterministic,
+            format_catalog: crate::formats::FormatCatalog::default(),
+            macro_engine: crate::preprocess::MacroEngine::new(deterministic),
+            vectorize: false,
         })
     }
 }
