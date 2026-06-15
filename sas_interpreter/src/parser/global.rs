@@ -89,8 +89,8 @@ fn parse_libname(ts: &mut StatementStream) -> Result<GlobalStmt> {
     }
     ts.next(); // consume libref
 
-    // Peek at what follows: `clear` keyword, an identifier (engine), or a
-    // string literal (path).
+    // Peek at what follows: `clear` keyword, a string literal (path), or
+    // an engine identifier followed by a string literal.
     let next_tok = ts.peek().clone();
 
     // `libname ref clear ;`
@@ -100,43 +100,64 @@ fn parse_libname(ts: &mut StatementStream) -> Result<GlobalStmt> {
         return Ok(GlobalStmt::LibnameClear { libref });
     }
 
-    // Detect optional engine keyword: an identifier that is NOT a string.
-    // e.g. `LIBNAME mylib CSV '/data';`  — engine = "CSV", path follows.
-    // If the next token is an identifier (not a quoted string), treat it as
-    // the engine name and then read the mandatory path.
-    let engine: Option<String> = match &next_tok.kind {
-        TokenKind::Ident(s) => {
-            let engine_str = s.to_ascii_uppercase();
-            ts.next(); // consume engine keyword
-            Some(engine_str)
+    // `libname ref 'path' ;`  — no engine
+    if let TokenKind::Str { value, suffix } = &next_tok.kind {
+        if *suffix != StrSuffix::None {
+            return Err(SasError::parse(
+                "LIBNAME path must be a plain string literal (no date/time suffix)",
+                next_tok.span,
+            ));
         }
-        _ => None,
-    };
+        let path = value.clone();
+        ts.next(); // consume the string literal
+        ts.expect_semi()?;
+        return Ok(GlobalStmt::Libname { libref, engine: None, path });
+    }
 
-    // Now read the mandatory path (string literal).
-    let path_tok = ts.peek().clone();
-    match &path_tok.kind {
-        TokenKind::Str { value, suffix } => {
-            if *suffix != StrSuffix::None {
+    // `libname ref <engine> 'path' ;`  — engine identifier before the path.
+    // Known engines: CSV, XLSX, EXCEL, PARQUET, BASE, V9 (plus any identifier
+    // is accepted and uppercased; the executor emits an error for unknowns).
+    if let TokenKind::Ident(eng) = &next_tok.kind {
+        let engine = eng.to_ascii_uppercase();
+        ts.next(); // consume the engine identifier
+
+        // Now expect the path string literal.
+        let path_tok = ts.peek().clone();
+        match &path_tok.kind {
+            TokenKind::Str { value, suffix } => {
+                if *suffix != StrSuffix::None {
+                    return Err(SasError::parse(
+                        "LIBNAME path must be a plain string literal (no date/time suffix)",
+                        path_tok.span,
+                    ));
+                }
+                let path = value.clone();
+                ts.next(); // consume the string literal
+                ts.expect_semi()?;
+                return Ok(GlobalStmt::Libname { libref, engine: Some(engine), path });
+            }
+            _ => {
                 return Err(SasError::parse(
-                    "LIBNAME path must be a plain string literal (no date/time suffix)",
+                    format!(
+                        "Expected a quoted path after engine {} for libref {}; \
+                         got an unexpected token.",
+                        engine,
+                        libref.to_uppercase()
+                    ),
                     path_tok.span,
                 ));
             }
-            let path = value.clone();
-            ts.next(); // consume the string literal
-            ts.expect_semi()?;
-            Ok(GlobalStmt::Libname { libref, engine, path })
         }
-        _ => Err(SasError::parse(
-            format!(
-                "Expected a quoted path or CLEAR after libref {}; \
-                 got an unexpected token.",
-                libref.to_uppercase()
-            ),
-            path_tok.span,
-        )),
     }
+
+    Err(SasError::parse(
+        format!(
+            "Expected a quoted path or CLEAR after libref {}; \
+             got an unexpected token.",
+            libref.to_uppercase()
+        ),
+        next_tok.span,
+    ))
 }
 
 // ── TITLE ────────────────────────────────────────────────────────────────────
@@ -300,24 +321,11 @@ mod tests {
 
     #[test]
     fn libname_with_csv_engine() {
-        let stmt = parse("libname mylib CSV '/data/csv';").unwrap();
+        let stmt = parse("libname csvlib csv '/data/csv';").unwrap();
         assert_eq!(
             stmt,
             GlobalStmt::Libname {
-                libref: "mylib".into(),
-                engine: Some("CSV".into()),
-                path: "/data/csv".into(),
-            }
-        );
-    }
-
-    #[test]
-    fn libname_csv_engine_lowercase() {
-        let stmt = parse("libname mylib csv '/data/csv';").unwrap();
-        assert_eq!(
-            stmt,
-            GlobalStmt::Libname {
-                libref: "mylib".into(),
+                libref: "csvlib".into(),
                 engine: Some("CSV".into()),
                 path: "/data/csv".into(),
             }
@@ -326,14 +334,39 @@ mod tests {
 
     #[test]
     fn libname_with_xlsx_engine() {
-        // XLSX engine parses correctly (execution will error, not parsing).
-        let stmt = parse("libname mylib XLSX '/data/xlsx';").unwrap();
+        let stmt = parse("libname xl xlsx '/data/xl';").unwrap();
         assert_eq!(
             stmt,
             GlobalStmt::Libname {
-                libref: "mylib".into(),
+                libref: "xl".into(),
                 engine: Some("XLSX".into()),
-                path: "/data/xlsx".into(),
+                path: "/data/xl".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn libname_with_parquet_engine() {
+        let stmt = parse("libname pq parquet '/data/pq';").unwrap();
+        assert_eq!(
+            stmt,
+            GlobalStmt::Libname {
+                libref: "pq".into(),
+                engine: Some("PARQUET".into()),
+                path: "/data/pq".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn libname_engine_is_uppercased() {
+        let stmt = parse("libname x Csv '/tmp';").unwrap();
+        assert_eq!(
+            stmt,
+            GlobalStmt::Libname {
+                libref: "x".into(),
+                engine: Some("CSV".into()),
+                path: "/tmp".into(),
             }
         );
     }

@@ -97,11 +97,10 @@
 //!   existe) : n_ > n_rows + 10_000 → erreur d'exécution. SAS bouclerait
 //!   sans fin ; divergence assumée.
 
-use super::eval::{coerce_num, eval, EvalCtx};
+use super::eval::{coerce_num, eval, sas_values_equal, EvalCtx};
 use super::pdv::Pdv;
 use super::{
-    ByVar, InputAction, InputData, InputDataset, OutputSpec, PutDestResolved, StepProgram,
-    TextInput,
+    ByVar, InputAction, InputData, InputDataset, OutputSpec, ShortMode, StepProgram, TextInput,
 };
 use crate::ast::DsStmt;
 use crate::dataset::{SasDataset, VarMeta};
@@ -111,6 +110,7 @@ use crate::session::Session;
 use crate::value::{format_best, Value, VarType};
 use polars::prelude::{Column, DataFrame, NamedFrom, Series};
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
 pub struct StepStats {
     /// (display, lignes lues) par input.
@@ -119,11 +119,20 @@ pub struct StepStats {
     pub written: Vec<(String, usize, usize)>,
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone)]
 enum Flow {
     Normal,
     NextIter,
     EndStep,
+    /// GOTO (M16.6) : saut inconditionnel vers l'étiquette nommée (index résolu
+    /// par le pilote de niveau supérieur). Traverse les boucles DO englobantes.
+    /// Émis depuis une sous-routine LINK, il l'abandonne et remonte jusqu'au
+    /// pilote de premier niveau qui repositionne le compteur de programme.
+    Goto(String),
+    /// RETURN (M16.6) : retour de la sous-routine LINK courante (consommé par
+    /// `exec_link_subroutine`). Sans LINK actif (premier niveau), équivaut à la
+    /// fin d'itération (output implicite).
+    Return,
 }
 
 enum ColBuilder {
@@ -131,9 +140,92 @@ enum ColBuilder {
     Char(Vec<String>),
 }
 
+/// Enregistrement maintenu par un hold `@`/`@@` (M14).
+struct HeldLine {
+    line: String,
+    cursor: usize,
+    /// `@@` : survit aux itérations ; `@` : relâché à la prochaine itération.
+    double: bool,
+}
+
+/// Destination résolue d'un PUT (M14.2). `Path` porte le chemin du fichier
+/// externe ; `Log`/`Print` routent vers le journal / le listing.
+#[derive(Clone, PartialEq)]
+enum PutDestKind {
+    Path(String),
+    Log,
+    Print,
+}
+
+/// État de sortie texte du PUT (M14.2). Mirroir de sortie du held-line de
+/// l'INPUT : une destination courante, une ligne de sortie en construction
+/// (`line`), un curseur de colonne 0-based, et le drapeau de hold `@`/`@@`.
+struct PutState {
+    /// Destination courante (par défaut le LOG, conformément à SAS).
+    dest: PutDestKind,
+    /// Ligne de sortie en construction (avant relâchement/flush).
+    line: String,
+    /// Position d'écriture courante (colonne 0-based) dans `line`.
+    cursor: usize,
+    /// Une ligne est-elle en cours de construction (au moins un PUT l'a
+    /// commencée) ? Sert à distinguer une ligne vide explicite d'un état
+    /// vierge au flush de fin d'étape.
+    started: bool,
+    /// Hold simple `@` actif : la ligne n'est PAS relâchée en fin de PUT ;
+    /// relâchée au début de l'itération suivante.
+    hold: bool,
+    /// Hold double `@@` actif : la ligne survit aux itérations.
+    hold_double: bool,
+    /// Lignes de sortie complètes, dans l'ordre de production, taguées par
+    /// leur destination. Rejouées vers le LOG / le listing / les fichiers
+    /// APRÈS la boucle implicite (exec.rs n'a pas `&mut session` en boucle).
+    out: Vec<(PutDestKind, String)>,
+}
+
+impl PutState {
+    fn new() -> Self {
+        PutState {
+            dest: PutDestKind::Log,
+            line: String::new(),
+            cursor: 0,
+            started: false,
+            hold: false,
+            hold_double: false,
+            out: Vec::new(),
+        }
+    }
+}
+
+/// Résultat de la lecture d'UNE variable d'INPUT (M14).
+enum ReadOutcome {
+    /// Lecture normale (valeur posée au PDV, missing inclus).
+    Ok,
+    /// Ligne trop courte, comportement MISSOVER/TRUNCOVER/défaut : on arrête
+    /// la lecture des items restants (laissés à missing).
+    ShortMissover,
+    /// Ligne trop courte avec STOPOVER : erreur.
+    Stopover,
+}
+
 struct Runner {
     pdv: Pdv,
     input: Option<InputData>,
+    /// Source d'entrée TEXTE (M14 : INFILE/INPUT/DATALINES).
+    text: Option<TextInput>,
+    /// Prochaine ligne brute (index dans `text.lines`) à charger.
+    text_line: usize,
+    /// Nombre d'enregistrements (lignes) lus de la source texte.
+    text_read: usize,
+    /// Enregistrement maintenu par `@`/`@@` : la ligne courante, le curseur
+    /// (colonne 0-based) et un drapeau `double` (`@@` survit aux itérations ;
+    /// `@` simple est relâché au début de l'itération suivante). `Some` quand
+    /// un hold est actif.
+    held: Option<HeldLine>,
+    /// Catalogue de formats/informats (clone de session) pour appliquer les
+    /// informats de l'INPUT (M14).
+    format_catalog: crate::formats::FormatCatalog,
+    /// État de sortie texte des PUT (M14.2 : FILE/PUT).
+    put: PutState,
     /// Mode CONCATÉNATION (sans BY) : index du dataset en cours de lecture.
     cur_ds: usize,
     /// Curseur PAR dataset : sans BY, prochaine ligne brute à charger (y
@@ -162,89 +254,47 @@ struct Runner {
     merge_plan: Vec<MergeObs>,
     /// Curseur dans `merge_plan` (prochaine obs à servir).
     merge_cursor: usize,
-    /// Entrée texte (INFILE/INPUT/DATALINES, M14.1). `None` hors mode texte.
-    text: Option<TextInput>,
-    /// Actions INPUT compilées, une liste par statement INPUT (ordre
-    /// d'apparition). Consommées via `input_action_cursor`.
-    input_actions: Vec<Vec<InputAction>>,
-    /// Index du PROCHAIN statement INPUT à exécuter (un par exécution
-    /// d'INPUT dans une itération ; remis à 0 en début d'itération).
-    input_action_cursor: usize,
-    /// Ligne d'entrée courante (index dans `text.lines`).
-    text_line: usize,
-    /// Pointeur de colonne courant (1-based) dans la ligne d'entrée.
-    text_col: usize,
-    /// Lignes lues au sens SAS (records read), pour la NOTE de fin d'étape.
-    records_read: usize,
-    /// Sortie texte (FILE/PUT, M14.2). `None` si l'étape n'a aucun PUT.
-    put: Option<PutState>,
+    /// Labels des variables (nom UPPERCASE → libellé), copié depuis
+    /// `StepProgram.labels`. Sert CALL LABEL(var, result) (M15.6).
+    labels: HashMap<String, String>,
+    /// CALL EXECUTE (M15.6) : texte SAS mis en file pour exécution APRÈS
+    /// l'étape DATA courante. Drainé par `execute` vers
+    /// `session.call_execute_queue` (l'exécuteur le rejoue ensuite). Chaque
+    /// appel concatène son argument résolu dans l'ordre d'exécution.
+    call_execute_queue: Vec<String>,
+    /// MODIFY+POINT= (M16.5) : état partagé pour l'accès direct piloté par le
+    /// corps. `None` hors de ce cas (boucle séquentielle MODIFY ou UPDATE).
+    modify_state: Option<ModifyState>,
+    /// Statements de PREMIER NIVEAU de l'étape (M16.6) — partagés avec les
+    /// boucles d'exécution. Sert à exécuter INLINE le corps d'une sous-routine
+    /// LINK (du statement étiqueté jusqu'au prochain RETURN) sans abandonner la
+    /// structure de boucle DO englobante. Vide tant qu'aucun LINK n'est possible.
+    program: std::rc::Rc<Vec<DsStmt>>,
+    /// Étiquettes de contrôle (M16.6) : nom UPPERCASE → index dans `program`.
+    /// Cibles des LINK exécutés inline et des GOTO résolus par le pilote.
+    flow_labels: std::rc::Rc<HashMap<String, usize>>,
 }
 
-/// État de sortie texte d'une étape DATA (FILE/PUT, M14.2).
-struct PutState {
-    /// Répertoire de base de la session (pour résoudre les chemins FILE
-    /// relatifs).
-    base_dir: std::path::PathBuf,
-    /// Destination courante (par défaut LOG).
-    cur_dest: PutDestResolved,
-    /// Délimiteur courant du list output (issu du dernier FILE).
-    delimiter: Option<String>,
-    dsd: bool,
-    /// Tampon de la ligne de sortie en cours (line-hold).
-    buf: String,
-    /// Pointeur de colonne de sortie courant (1-based) dans `buf`.
-    col: usize,
-    /// La ligne courante est-elle retenue (`@`) à l'intérieur de l'itération ?
-    held: bool,
-    /// ... ou retenue à travers les itérations (`@@`) ?
-    held_across: bool,
-    /// La ligne en cours a-t-elle reçu au moins un PUT (pour décider du flush
-    /// d'une ligne vide en fin de hold) ?
-    line_started: bool,
-    /// Destination à laquelle appartient la ligne retenue en cours.
-    held_dest: PutDestResolved,
-    /// Tampons de sortie par destination, vidés vers la session après la
-    /// boucle (ordre des lignes = ordre des PUT exécutés).
-    log_lines: Vec<String>,
-    print_lines: Vec<String>,
-    /// Fichiers physiques : chemin → lignes, dans l'ordre de première
-    /// écriture.
-    files: Vec<(std::path::PathBuf, Vec<String>)>,
-}
-
-impl PutState {
-    fn new(base_dir: std::path::PathBuf) -> Self {
-        PutState {
-            base_dir,
-            cur_dest: PutDestResolved::Log,
-            delimiter: None,
-            dsd: false,
-            buf: String::new(),
-            col: 1,
-            held: false,
-            held_across: false,
-            line_started: false,
-            held_dest: PutDestResolved::Log,
-            log_lines: Vec::new(),
-            print_lines: Vec::new(),
-            files: Vec::new(),
-        }
-    }
-
-    /// Pousse une ligne complète vers le tampon de sa destination.
-    fn emit(&mut self, dest: &PutDestResolved, line: String) {
-        match dest {
-            PutDestResolved::Log => self.log_lines.push(line),
-            PutDestResolved::Print => self.print_lines.push(line),
-            PutDestResolved::Path(p) => {
-                if let Some((_, lines)) = self.files.iter_mut().find(|(fp, _)| fp == p) {
-                    lines.push(line);
-                } else {
-                    self.files.push((p.clone(), vec![line]));
-                }
-            }
-        }
-    }
+/// État partagé d'un MODIFY+POINT= (M16.5). Le bras `DsStmt::Modify` de
+/// `exec_stmt` y charge l'obs à l'index POINT= courant (et capture la
+/// précédente). `cols` est le tampon de réécriture (parallèle à `var_slots`).
+struct ModifyState {
+    /// Slot PDV de la variable d'index POINT=.
+    point_slot: usize,
+    /// Tampon de réécriture : colonnes décodées, modifiées au fil des captures.
+    cols: Vec<Vec<Value>>,
+    /// Slots PDV de chaque colonne (parallèle à `cols`).
+    var_slots: Vec<usize>,
+    /// Ligne actuellement chargée (à capturer au prochain marqueur / en fin).
+    cur_row: Option<usize>,
+    /// "WORK.A" pour les messages d'erreur POINT=.
+    display: String,
+    /// Nombre total d'observations (bornes de l'index POINT=).
+    n_rows: usize,
+    /// Erreur POINT= différée (index invalide), remontée par la boucle externe.
+    error: Option<String>,
+    /// Lignes touchées (chargées au moins une fois) — compteur de lecture.
+    touched: Vec<bool>,
 }
 
 /// Une observation de sortie d'un MERGE, pré-calculée par `build_merge_plan`.
@@ -277,27 +327,31 @@ pub fn execute(prog: StepProgram, session: &mut Session) -> Result<StepStats> {
         return super::fastpath::run(prog, session);
     }
 
+    // UPDATE/MODIFY (M16.5) ont leur propre boucle d'exécution (sémantique
+    // distincte du SET/MERGE) : on les détourne avant la boucle implicite
+    // générique.
+    if prog.update.is_some() {
+        return execute_update(prog, session);
+    }
+    if prog.modify.is_some() {
+        return execute_modify(prog, session);
+    }
+
     let StepProgram {
         pdv,
         stmts,
         input,
+        update: _,
+        modify: _,
         text_input,
-        input_actions,
-        has_put,
         outputs,
         has_explicit_output,
         uninitialized,
         initial_values,
         arrays,
         labels,
+        flow_labels,
     } = prog;
-
-    // Sortie texte (FILE/PUT, M14.2) : état seulement si l'étape a un PUT.
-    let put = if has_put {
-        Some(PutState::new(session.base_dir.clone()))
-    } else {
-        None
-    };
 
     for name in &uninitialized {
         session.log.note(&format!("Variable {name} is uninitialized."));
@@ -316,11 +370,14 @@ pub fn execute(prog: StepProgram, session: &mut Session) -> Result<StepStats> {
         })
         .collect();
 
+    // Une étape avec une source texte (INFILE/INPUT) boucle comme un SET ;
+    // sans aucune source (ni SET ni texte) elle ne tourne qu'une fois.
     let single_iteration = input.is_none() && text_input.is_none();
     let n_rows: usize = input
         .as_ref()
-        .map_or(0, |i| i.datasets.iter().map(|d| d.n_rows).sum())
-        + text_input.as_ref().map_or(0, |t| t.lines.len());
+        .map_or(0, |i| i.datasets.iter().map(|d| d.n_rows).sum());
+    // Garde-fou anti-boucle infinie pour la source texte.
+    let n_text_lines = text_input.as_ref().map_or(0, |t| t.lines.len());
     let n_datasets = input.as_ref().map_or(0, |i| i.datasets.len());
     // FIRST./LAST. valent 1 tant qu'aucune observation n'a été servie.
     let by_flags = input
@@ -335,6 +392,19 @@ pub fn execute(prog: StepProgram, session: &mut Session) -> Result<StepStats> {
             .map(|(name, _)| (name.clone(), false))
             .collect()
     });
+    // END= (M16.4) : variable automatique 0/1, initialisée à 0.
+    let end_flag = input
+        .as_ref()
+        .and_then(|i| i.end_var.as_ref().map(|n| (n.clone(), 0.0)));
+    // POINT= (M16.4) : si présent, la boucle implicite est REMPLACÉE par un
+    // contrôle manuel (pas d'avance de curseur automatique, pas d'output
+    // implicite, pas de fin d'étape à l'épuisement). On mémorise le slot.
+    let point_slot = input.as_ref().and_then(|i| i.point_slot);
+    // NOBS= (M16.4) : slot + total d'observations (somme des datasets).
+    let nobs = input.as_ref().and_then(|i| {
+        i.nobs_slot
+            .map(|slot| (slot, i.datasets.iter().map(|d| d.n_rows).sum::<usize>()))
+    });
     let n_outputs = outputs.len();
     // SYMGET (M11.5) : instantané de la table macro pris AU DÉBUT de
     // l'étape. Sous la feature `macros` il porte les `%let`/symput
@@ -344,6 +414,12 @@ pub fn execute(prog: StepProgram, session: &mut Session) -> Result<StepStats> {
     let mut r = Runner {
         pdv,
         input,
+        text: text_input,
+        text_line: 0,
+        text_read: 0,
+        held: None,
+        format_catalog: session.format_catalog.clone(),
+        put: PutState::new(),
         cur_ds: 0,
         cursors: vec![0; n_datasets],
         filtered: vec![Vec::new(); n_datasets],
@@ -353,8 +429,8 @@ pub fn execute(prog: StepProgram, session: &mut Session) -> Result<StepStats> {
             arrays,
             by_flags,
             in_flags,
+            end_flag,
             macro_symbols,
-            deterministic: session.deterministic,
             ..EvalCtx::default()
         },
         outputs,
@@ -362,13 +438,11 @@ pub fn execute(prog: StepProgram, session: &mut Session) -> Result<StepStats> {
         out_rows: vec![0; n_outputs],
         merge_plan: Vec::new(),
         merge_cursor: 0,
-        text: text_input,
-        input_actions,
-        input_action_cursor: 0,
-        text_line: 0,
-        text_col: 1,
-        records_read: 0,
-        put,
+        labels,
+        call_execute_queue: Vec::new(),
+        modify_state: None,
+        program: std::rc::Rc::new(Vec::new()),
+        flow_labels: std::rc::Rc::new(HashMap::new()),
     };
 
     // Interclassement / match-merge : pré-application des WHERE= par dataset
@@ -396,63 +470,55 @@ pub fn execute(prog: StepProgram, session: &mut Session) -> Result<StepStats> {
         r.pdv.set(slot, v);
     }
 
+    // NOBS= (M16.4) : affectée AVANT la boucle (disponible dès la 1re
+    // itération, p.ex. `do i = 1 to n;`). Slot retenu ⇒ persiste.
+    if let Some((slot, total)) = nobs {
+        r.pdv.set(slot, Value::Num(total as f64));
+    }
+
+    // POINT= (M16.4) : l'output implicite est SUPPRIMÉ (SAS exige un OUTPUT
+    // explicite), et la boucle ne se termine pas sur épuisement d'entrée
+    // (c'est l'utilisateur qui pilote l'itération via DO/STOP).
+    let suppress_implicit_output = has_explicit_output || point_slot.is_some();
+
+    // M16.6 : programme + étiquettes partagés avec le Runner (LINK exécuté
+    // inline, GOTO résolu par `run_step_body`).
+    r.program = std::rc::Rc::new(stmts);
+    r.flow_labels = std::rc::Rc::new(flow_labels);
+
     loop {
         r.pdv.n_ += 1;
         r.pdv.error_ = false;
         r.pdv.reset_non_retained();
-        r.input_action_cursor = 0;
-
-        let mut flow = Flow::Normal;
-        for stmt in &stmts {
-            flow = r.exec_stmt(stmt)?;
-            if flow != Flow::Normal {
-                break;
+        // Hold de ligne (M14) : un `@` simple est relâché au DÉBUT de
+        // l'itération suivante (le prochain INPUT lira un nouvel
+        // enregistrement) ; un `@@` survit.
+        if let Some(h) = &r.held {
+            if !h.double {
+                r.held = None;
             }
         }
-        // Fin d'itération (FILE/PUT, M14.2) : une ligne retenue par `@`
-        // (mais pas `@@`) est émise automatiquement à la fin de l'itération.
-        r.flush_put_iteration_end();
+        // Hold de ligne PUT (M14.2) : un `@` simple relâche la ligne au DÉBUT
+        // de l'itération suivante (flush + clear) ; un `@@` la conserve.
+        if r.put.hold && !r.put.hold_double {
+            r.put_release_line();
+        }
+
+        let flow = r.run_step_body()?;
         if flow == Flow::EndStep {
             break;
         }
-        if flow != Flow::NextIter && !has_explicit_output {
+        if flow != Flow::NextIter && !suppress_implicit_output {
             r.push_outputs();
         }
         if single_iteration {
             break;
         }
         // Garde-fou anti-boucle infinie (cf. en-tête).
-        if r.pdv.n_ as usize > n_rows + 10_000 {
+        if r.pdv.n_ as usize > n_rows + n_text_lines + 10_000 {
             return Err(SasError::runtime(
                 "DATA step appears to loop infinitely (no input rows consumed); stopping.",
             ));
-        }
-    }
-
-    // Sortie texte (FILE/PUT, M14.2) : une ligne encore retenue (`@@` ou un
-    // `@` non libéré sur une étape sans itération) est émise à la fin de
-    // l'étape, puis on écrit les tampons vers la session (LOG/listing) et les
-    // fichiers physiques. Les lignes PUT-vers-LOG s'intercalent APRÈS l'écho
-    // du source et AVANT les NOTEs de fin d'étape (fidèle à SAS).
-    r.flush_put_final();
-    if let Some(put) = r.put.take() {
-        for line in put.log_lines {
-            session.log.put_line(&line);
-        }
-        for line in put.print_lines {
-            session.listing.write_line(&line);
-        }
-        for (path, lines) in put.files {
-            let mut content = lines.join("\n");
-            if !content.is_empty() {
-                content.push('\n');
-            }
-            if let Err(e) = std::fs::write(&path, content) {
-                session.log.error(&format!(
-                    "Unable to write the FILE physical file {}: {e}",
-                    path.display()
-                ));
-            }
         }
     }
 
@@ -464,6 +530,21 @@ pub fn execute(prog: StepProgram, session: &mut Session) -> Result<StepStats> {
     for (name, value) in std::mem::take(&mut r.ctx.symput_writes) {
         session.macro_engine.set_symbol_global(&name, value);
     }
+
+    // CALL EXECUTE (M15.6) : drain de la file de code généré pendant l'étape
+    // vers la session. L'exécuteur le rejoue APRÈS le RUN de l'étape (fidèle à
+    // SAS : les pas mis en file par CALL EXECUTE s'exécutent une fois l'étape
+    // courante terminée). On préserve l'ordre d'accumulation.
+    session
+        .call_execute_queue
+        .extend(std::mem::take(&mut r.call_execute_queue));
+
+    // PUT (M14.2) : flush de la ligne maintenue en fin d'étape, puis rejeu
+    // des lignes produites vers leurs destinations. Le rejeu a lieu AVANT les
+    // NOTEs de fin d'étape (la sortie PUT « pendant » l'étape précède la NOTE
+    // « N records were read »/« data set has N obs » dans le log SAS).
+    r.put_flush_at_step_end();
+    r.put_replay(session)?;
 
     // NOTEs d'erreurs/conversions collectées par l'évaluateur.
     if r.ctx.note_num_to_char {
@@ -504,13 +585,18 @@ pub fn execute(prog: StepProgram, session: &mut Session) -> Result<StepStats> {
             stats.read.push((ds.display.clone(), *n));
         }
     }
-    // Mode texte (INFILE/INPUT/DATALINES) : NOTE des records lus (M14.1).
+    // Source texte (M14) : NOTE "N records were read from the infile ..."
+    // UNIQUEMENT pour un fichier externe. Pour les données instream
+    // DATALINES/CARDS, SAS n'émet aucune NOTE de ce type (elle est réservée
+    // aux fichiers physiques).
     if let Some(text) = &r.text {
-        session.log.note(&format!(
-            "{} records were read from the infile {}.",
-            r.records_read, text.display
-        ));
-        stats.read.push((text.display.clone(), r.records_read));
+        if text.is_file {
+            session.log.note(&format!(
+                "{} records were read from {}.",
+                r.text_read, text.display
+            ));
+            stats.read.push((text.display.clone(), r.text_read));
+        }
     }
 
     // Écriture des sorties (ordre du statement DATA ; _LAST_ = la dernière).
@@ -528,7 +614,7 @@ pub fn execute(prog: StepProgram, session: &mut Session) -> Result<StepStats> {
             columns.push(series.into());
             // Le libellé suit la variable (par son nom de PDV, pas le
             // nom renommé en sortie).
-            let label = labels.get(&v.name.to_uppercase()).cloned();
+            let label = r.labels.get(&v.name.to_uppercase()).cloned();
             vars.push(VarMeta {
                 name: out_name.clone(),
                 ty: v.ty,
@@ -555,24 +641,556 @@ pub fn execute(prog: StepProgram, session: &mut Session) -> Result<StepStats> {
     Ok(stats)
 }
 
+/// Construit un Runner « squelette » pour les boucles UPDATE/MODIFY (M16.5),
+/// avec le PDV, les arrays, les builders de sortie et l'instantané macro déjà
+/// posés. Les champs spécifiques au SET/MERGE/texte sont vides.
+fn build_um_runner(
+    pdv: Pdv,
+    outputs: Vec<OutputSpec>,
+    arrays: HashMap<String, super::ArrayDef>,
+    labels: HashMap<String, String>,
+    by: &[ByVar],
+    macro_symbols: HashMap<String, String>,
+    format_catalog: crate::formats::FormatCatalog,
+) -> Runner {
+    let builders: Vec<Vec<ColBuilder>> = outputs
+        .iter()
+        .map(|o| {
+            o.kept_slots
+                .iter()
+                .map(|s| match pdv.vars()[*s].ty {
+                    VarType::Num => ColBuilder::Num(Vec::new()),
+                    VarType::Char => ColBuilder::Char(Vec::new()),
+                })
+                .collect()
+        })
+        .collect();
+    let n_outputs = outputs.len();
+    let by_flags = by.iter().map(|b| (b.name.clone(), true, true)).collect();
+    Runner {
+        pdv,
+        input: None,
+        text: None,
+        text_line: 0,
+        text_read: 0,
+        held: None,
+        format_catalog,
+        put: PutState::new(),
+        cur_ds: 0,
+        cursors: Vec::new(),
+        filtered: Vec::new(),
+        prev_keys: None,
+        rows_read: vec![0; 1],
+        ctx: EvalCtx {
+            arrays,
+            by_flags,
+            macro_symbols,
+            ..EvalCtx::default()
+        },
+        outputs,
+        builders,
+        out_rows: vec![0; n_outputs],
+        merge_plan: Vec::new(),
+        merge_cursor: 0,
+        labels,
+        call_execute_queue: Vec::new(),
+        modify_state: None,
+        program: std::rc::Rc::new(Vec::new()),
+        flow_labels: std::rc::Rc::new(HashMap::new()),
+    }
+}
+
+/// Charge la ligne `row` du dataset matérialisé `ds` dans le PDV (tous ses
+/// slots). Downcast déjà fait à la compilation (colonnes décodées).
+fn load_row(pdv: &mut Pdv, ds: &InputDataset, row: usize) {
+    for (col, slot) in ds.columns.iter().zip(&ds.var_slots) {
+        pdv.set(*slot, col[row].clone());
+    }
+}
+
+/// Clé d'appariement canonique d'une liste de `Value` (UPDATE/MODIFY KEY=).
+/// Encode la sémantique d'égalité SAS : `. == .`, char insensible aux blancs
+/// finaux. Sert de clé de `HashMap`.
+fn key_string(values: &[Value]) -> String {
+    let mut s = String::new();
+    for v in values {
+        match v {
+            Value::Num(n) => {
+                s.push('N');
+                s.push_str(&format!("{:?}", n));
+            }
+            Value::Missing(k) => {
+                s.push('M');
+                s.push_str(&k.display());
+            }
+            Value::Char(c) => {
+                s.push('C');
+                s.push_str(c.trim_end());
+            }
+        }
+        s.push('\u{1}');
+    }
+    s
+}
+
+/// Émet les NOTEs d'erreurs/conversions accumulées par l'évaluateur + draine
+/// CALL SYMPUT / CALL EXECUTE / PUT (partagé entre les boucles UPDATE/MODIFY).
+fn drain_runner_side_effects(r: &mut Runner, session: &mut Session) -> Result<()> {
+    for (name, value) in std::mem::take(&mut r.ctx.symput_writes) {
+        session.macro_engine.set_symbol_global(&name, value);
+    }
+    session
+        .call_execute_queue
+        .extend(std::mem::take(&mut r.call_execute_queue));
+    r.put_flush_at_step_end();
+    r.put_replay(session)?;
+    if r.ctx.note_num_to_char {
+        session
+            .log
+            .note("Numeric values have been converted to character values.");
+    }
+    if r.ctx.note_char_to_num {
+        session
+            .log
+            .note("Character values have been converted to numeric values.");
+    }
+    if r.ctx.division_by_zero > 0 {
+        session.log.note("Division by zero detected.");
+    }
+    if r.ctx.invalid_data > 0 {
+        session.log.note("Invalid numeric data.");
+    }
+    if r.ctx.missing_generated > 0 {
+        session.log.note(
+            "Missing values were generated as a result of performing an operation on missing values.",
+        );
+    }
+    Ok(())
+}
+
+/// Écrit les sorties DATA additionnelles (ordre du statement DATA) à partir des
+/// builders du Runner. Partagé par les boucles UPDATE/MODIFY.
+fn write_runner_outputs(r: &mut Runner, session: &mut Session, stats: &mut StepStats) -> Result<()> {
+    let outputs = std::mem::take(&mut r.outputs);
+    let builders = std::mem::take(&mut r.builders);
+    for ((spec, bset), n_out) in outputs.iter().zip(builders).zip(&r.out_rows) {
+        let mut columns: Vec<Column> = Vec::with_capacity(spec.kept_slots.len());
+        let mut vars: Vec<VarMeta> = Vec::with_capacity(spec.kept_slots.len());
+        for ((slot, b), out_name) in spec.kept_slots.iter().zip(bset).zip(&spec.out_names) {
+            let v = &r.pdv.vars()[*slot];
+            let series = match b {
+                ColBuilder::Num(vals) => Series::new(out_name.as_str().into(), vals),
+                ColBuilder::Char(vals) => Series::new(out_name.as_str().into(), vals),
+            };
+            columns.push(series.into());
+            let label = r.labels.get(&v.name.to_uppercase()).cloned();
+            vars.push(VarMeta {
+                name: out_name.clone(),
+                ty: v.ty,
+                length: v.length,
+                format: v.format.clone(),
+                label,
+            });
+        }
+        let df = DataFrame::new(columns)?;
+        let ds = SasDataset { df, vars };
+        session.libs.get(&spec.libref)?.write(&spec.table, &ds)?;
+        session.last_dataset = Some(spec.display.clone());
+        session.log.note(&format!(
+            "The data set {} has {} observations and {} variables.",
+            spec.display,
+            n_out,
+            spec.kept_slots.len()
+        ));
+        stats
+            .written
+            .push((spec.display.clone(), *n_out, spec.kept_slots.len()));
+    }
+    Ok(())
+}
+
+/// Exécute une étape DATA pilotée par un UPDATE (M16.5).
+///
+/// Le maître est lu séquentiellement (pilote l'itération). Pour chaque obs
+/// maître (qui passe le WHERE= du maître), on cherche la PREMIÈRE obs de la
+/// transaction de même clé ; si trouvée, on superpose ses variables NON
+/// MANQUANTES (hors clés) au PDV. Le corps de l'étape s'exécute puis l'obs est
+/// sortie (output implicite, sauf OUTPUT explicite). Les obs de transaction
+/// sans maître correspondant sont IGNORÉES en v1 (divergence documentée vs SAS,
+/// qui les insère). Plusieurs transactions pour une même clé : seule la
+/// PREMIÈRE est appliquée.
+fn execute_update(prog: StepProgram, session: &mut Session) -> Result<StepStats> {
+    let StepProgram {
+        pdv,
+        stmts,
+        update,
+        outputs,
+        has_explicit_output,
+        uninitialized,
+        initial_values,
+        arrays,
+        labels,
+        flow_labels,
+        ..
+    } = prog;
+    let upd = update.expect("execute_update requires UpdateData");
+
+    for name in &uninitialized {
+        session.log.note(&format!("Variable {name} is uninitialized."));
+    }
+
+    let trans = &upd.transaction;
+    let trans_key_pos: Vec<usize> = upd
+        .key_slots
+        .iter()
+        .map(|&slot| trans.var_slots.iter().position(|&s| s == slot).unwrap())
+        .collect();
+    let mut trans_index: HashMap<String, usize> = HashMap::new();
+    for row in 0..trans.n_rows {
+        let key_vals: Vec<Value> = trans_key_pos
+            .iter()
+            .map(|&pos| trans.columns[pos][row].clone())
+            .collect();
+        trans_index.entry(key_string(&key_vals)).or_insert(row);
+    }
+    let overlay_pos: Vec<(usize, usize)> = upd
+        .overlay_slots
+        .iter()
+        .map(|&slot| (slot, trans.var_slots.iter().position(|&s| s == slot).unwrap()))
+        .collect();
+
+    let macro_symbols = session.macro_engine.symbols_snapshot();
+    let format_catalog = session.format_catalog.clone();
+    let mut r = build_um_runner(
+        pdv,
+        outputs,
+        arrays,
+        labels,
+        &upd.by,
+        macro_symbols,
+        format_catalog,
+    );
+
+    for (slot, v) in initial_values {
+        r.pdv.set(slot, v);
+    }
+
+    // M16.6 : programme + étiquettes partagés (LINK/GOTO dans un UPDATE).
+    r.program = std::rc::Rc::new(stmts);
+    r.flow_labels = std::rc::Rc::new(flow_labels);
+
+    let master = &upd.master;
+    let mut master_read = 0usize;
+    let suppress_implicit_output = has_explicit_output;
+
+    // Slots issus UNIQUEMENT de la transaction (absents du maître). Comme ils
+    // sont `from_input`, `reset_non_retained` ne les blanchit pas ; il faut les
+    // remettre à MISSING au début de CHAQUE obs maître pour qu'une obs sans
+    // transaction correspondante ne « traîne » pas la valeur d'une précédente.
+    let trans_only_slots: Vec<usize> = upd
+        .overlay_slots
+        .iter()
+        .copied()
+        .filter(|s| !master.var_slots.contains(s))
+        .collect();
+
+    // Séquence des obs maître RETENUES (après WHERE=). FIRST./LAST. sont
+    // calculés sur les transitions de clé BY DANS cette séquence.
+    let mut kept_rows: Vec<usize> = Vec::with_capacity(master.n_rows);
+    for m_row in 0..master.n_rows {
+        if let Some(w) = &upd.master_where {
+            // Charger seulement les variables maître pour évaluer le WHERE=.
+            load_row(&mut r.pdv, master, m_row);
+            let v = eval(w, &r.pdv, &mut r.ctx);
+            if let Some(msg) = r.ctx.fatal.take() {
+                let msg = msg.strip_prefix("ERROR: ").unwrap_or(&msg).to_string();
+                return Err(SasError::runtime(msg));
+            }
+            if !v.truthy() {
+                continue;
+            }
+        }
+        kept_rows.push(m_row);
+    }
+    // Clés BY de chaque obs retenue (vide si pas de BY).
+    let by_keys: Vec<Vec<Value>> = kept_rows
+        .iter()
+        .map(|&row| keys_at(master, row))
+        .collect();
+
+    for (seq, &m_row) in kept_rows.iter().enumerate() {
+        r.pdv.n_ += 1;
+        r.pdv.error_ = false;
+        r.pdv.reset_non_retained();
+        for &slot in &trans_only_slots {
+            let init = match r.pdv.vars()[slot].ty {
+                VarType::Num => Value::missing(),
+                VarType::Char => Value::Char(String::new()),
+            };
+            r.pdv.set(slot, init);
+        }
+        load_row(&mut r.pdv, master, m_row);
+        // FIRST./LAST. par variable BY (préfixe de clés vs voisins retenus).
+        if !upd.by.is_empty() {
+            let cur = &by_keys[seq];
+            for (i, flags) in r.ctx.by_flags.iter_mut().enumerate() {
+                let first = match seq.checked_sub(1) {
+                    None => true,
+                    Some(p) => prefix_changed(cur, &by_keys[p], i),
+                };
+                let last = match by_keys.get(seq + 1) {
+                    None => true,
+                    Some(next) => prefix_changed(cur, next, i),
+                };
+                flags.1 = first;
+                flags.2 = last;
+            }
+        }
+        master_read += 1;
+        let key_vals: Vec<Value> = upd
+            .key_slots
+            .iter()
+            .map(|&slot| r.pdv.get(slot).clone())
+            .collect();
+        if let Some(&t_row) = trans_index.get(&key_string(&key_vals)) {
+            for &(slot, pos) in &overlay_pos {
+                let tv = &trans.columns[pos][t_row];
+                if !tv.is_missing() {
+                    r.pdv.set(slot, tv.clone());
+                }
+            }
+        }
+        let flow = r.run_step_body()?;
+        if flow == Flow::EndStep {
+            break;
+        }
+        if flow != Flow::NextIter && !suppress_implicit_output {
+            r.push_outputs();
+        }
+    }
+
+    drain_runner_side_effects(&mut r, session)?;
+
+    let mut stats = StepStats {
+        read: Vec::new(),
+        written: Vec::new(),
+    };
+    session.log.note(&format!(
+        "There were {} observations read from the data set {}.",
+        master_read, master.display
+    ));
+    stats.read.push((master.display.clone(), master_read));
+    session.log.note(&format!(
+        "There were {} observations read from the data set {}.",
+        trans.n_rows, trans.display
+    ));
+    stats.read.push((trans.display.clone(), trans.n_rows));
+
+    write_runner_outputs(&mut r, session, &mut stats)?;
+    Ok(stats)
+}
+
+/// Exécute une étape DATA pilotée par un MODIFY (M16.5) : modification EN
+/// PLACE. Le dataset est lu (séquentiellement, ou via POINT= en accès direct),
+/// le corps modifie ses variables, et le dataset est RÉÉCRIT à l'identique
+/// (mêmes colonnes/ordre) avec les valeurs modifiées. Pas d'output implicite ;
+/// OUTPUT interdit (vérifié à la compilation).
+fn execute_modify(prog: StepProgram, session: &mut Session) -> Result<StepStats> {
+    let StepProgram {
+        pdv,
+        stmts,
+        modify,
+        outputs,
+        uninitialized,
+        initial_values,
+        arrays,
+        labels,
+        flow_labels,
+        ..
+    } = prog;
+    let m = modify.expect("execute_modify requires ModifyData");
+
+    for name in &uninitialized {
+        session.log.note(&format!("Variable {name} is uninitialized."));
+    }
+
+    let macro_symbols = session.macro_engine.symbols_snapshot();
+    let format_catalog = session.format_catalog.clone();
+    let mut r = build_um_runner(pdv, outputs, arrays, labels, &[], macro_symbols, format_catalog);
+
+    for (slot, v) in initial_values {
+        r.pdv.set(slot, v);
+    }
+    // M16.6 : programme + étiquettes partagés (LINK/GOTO dans un MODIFY).
+    r.program = std::rc::Rc::new(stmts);
+    r.flow_labels = std::rc::Rc::new(flow_labels);
+    let n_rows = m.data.n_rows;
+    if let Some(slot) = m.nobs_slot {
+        r.pdv.set(slot, Value::Num(n_rows as f64));
+    }
+
+    let mut buffer: Vec<Vec<Value>> = m.data.columns.clone();
+    let mut rows_processed = 0usize;
+
+    if let Some(point_slot) = m.point_slot {
+        // ACCÈS DIRECT par POINT= : boucle implicite supprimée. Le corps
+        // (typiquement `do i = 1 to nobs; p = i; modify ds; ...; end;`) pilote
+        // l'itération ; chaque marqueur MODIFY charge l'obs à l'index POINT=
+        // courant et capture la ligne PRÉCÉDEMMENT chargée (les assignations
+        // entre deux marqueurs modifient l'obs courante). La dernière ligne est
+        // capturée en fin d'étape. L'état partagé vit sur le Runner pour que le
+        // bras `DsStmt::Modify` standard l'utilise.
+        r.modify_state = Some(ModifyState {
+            point_slot,
+            cols: m.data.columns.clone(),
+            var_slots: m.data.var_slots.clone(),
+            cur_row: None,
+            display: m.display.clone(),
+            n_rows,
+            error: None,
+            touched: vec![false; n_rows],
+        });
+        r.pdv.n_ += 1;
+        r.pdv.error_ = false;
+        let _flow = r.run_step_body()?;
+        if let Some(msg) = r.modify_state.as_mut().and_then(|st| st.error.take()) {
+            return Err(SasError::runtime(msg));
+        }
+        if let Some(mut state) = r.modify_state.take() {
+            capture_modify_state(&mut state, &r.pdv);
+            buffer[..m.data.var_slots.len()]
+                .clone_from_slice(&state.cols[..m.data.var_slots.len()]);
+            rows_processed = state.touched.iter().filter(|t| **t).count();
+        }
+    } else {
+        // `row` indexe à la fois le chargement et la capture du tampon : la
+        // boucle range est intentionnelle.
+        #[allow(clippy::needless_range_loop)]
+        for row in 0..n_rows {
+            r.pdv.n_ += 1;
+            r.pdv.error_ = false;
+            r.pdv.reset_non_retained();
+            load_row(&mut r.pdv, &m.data, row);
+            rows_processed += 1;
+            let flow = r.run_step_body()?;
+            for (pos, &slot) in m.data.var_slots.iter().enumerate() {
+                buffer[pos][row] = r.pdv.get(slot).clone();
+            }
+            if flow == Flow::EndStep {
+                break;
+            }
+        }
+    }
+
+    drain_runner_side_effects(&mut r, session)?;
+
+    let mut columns: Vec<Column> = Vec::with_capacity(m.out_vars.len());
+    for (pos, meta) in m.out_vars.iter().enumerate() {
+        let series = match meta.ty {
+            VarType::Num => {
+                let vals: Vec<Option<f64>> = buffer[pos].iter().map(value_to_num).collect();
+                Series::new(meta.name.as_str().into(), vals)
+            }
+            VarType::Char => {
+                let vals: Vec<String> = buffer[pos]
+                    .iter()
+                    .map(|v| match v {
+                        Value::Char(s) => s.clone(),
+                        _ => String::new(),
+                    })
+                    .collect();
+                Series::new(meta.name.as_str().into(), vals)
+            }
+        };
+        columns.push(series.into());
+    }
+    let df = DataFrame::new(columns)?;
+    let ds = SasDataset {
+        df,
+        vars: m.out_vars.clone(),
+    };
+    session.libs.get(&m.libref)?.write(&m.table, &ds)?;
+    session.last_dataset = Some(m.display.clone());
+
+    let mut stats = StepStats {
+        read: Vec::new(),
+        written: Vec::new(),
+    };
+    session.log.note(&format!(
+        "There were {} observations read from the data set {}.",
+        rows_processed, m.display
+    ));
+    stats.read.push((m.display.clone(), rows_processed));
+    session.log.note(&format!(
+        "The data set {} has {} observations and {} variables.",
+        m.display,
+        n_rows,
+        m.out_vars.len()
+    ));
+    stats
+        .written
+        .push((m.display.clone(), n_rows, m.out_vars.len()));
+
+    // Les sorties DATA (le dataset nommé par `data X;`) coïncident avec la
+    // table MODIFY réécrite en place : on les IGNORE (pas d'output implicite, et
+    // l'écriture vide des builders écraserait la réécriture). OUTPUT explicite
+    // est déjà interdit à la compilation ; un OUT= vers un autre dataset n'est
+    // pas supporté en v1.
+    let _ = &r.outputs;
+    Ok(stats)
+}
+
+/// Capture les valeurs courantes du PDV dans le tampon `cols` à la ligne MODIFY
+/// chargée (`cur_row`), puis remet le marqueur à `None`. No-op si aucune ligne
+/// n'est chargée.
+fn capture_modify_state(state: &mut ModifyState, pdv: &Pdv) {
+    if let Some(row) = state.cur_row.take() {
+        for (pos, &slot) in state.var_slots.iter().enumerate() {
+            state.cols[pos][row] = pdv.get(slot).clone();
+        }
+    }
+}
+
 impl Runner {
     fn exec_stmt(&mut self, stmt: &DsStmt) -> Result<Flow> {
         match stmt {
-            DsStmt::Set(_) => {
+            DsStmt::Set { .. } => {
                 let Some(input) = &self.input else {
                     // Impossible après compile() ; garde-fou.
                     return Err(SasError::runtime("SET statement without input data."));
                 };
-                if input.by.is_empty() {
+                if input.point_slot.is_some() {
+                    self.exec_set_point()
+                } else if input.by.is_empty() {
                     self.exec_set_concat()
                 } else {
                     self.exec_set_interleave()
                 }
             }
             DsStmt::Merge(_) => self.exec_merge(),
+            // UPDATE (M16.5) : marqueur. La ligne maître est chargée par la
+            // boucle externe (execute_update) AVANT le corps ; ici no-op.
+            DsStmt::Update { .. } => Ok(Flow::Normal),
+            // MODIFY (M16.5) : en lecture séquentielle, marqueur no-op (la
+            // boucle externe charge/capture). En MODIFY+POINT= (modify_state
+            // présent), le marqueur capture la ligne précédente puis charge
+            // l'obs à l'index POINT= courant.
+            DsStmt::Modify { .. } => {
+                if self.modify_state.is_some() {
+                    self.exec_modify_point()
+                } else {
+                    Ok(Flow::Normal)
+                }
+            }
             DsStmt::Assign { var, expr } => {
                 let value = self.eval_checked(expr)?;
-                let Some(slot) = self.pdv.slot(var) else {
+                // `arr = e;` sous un `DO OVER arr` : la cible est l'élément
+                // courant (slot dans `ctx.do_over`), pas une variable du PDV.
+                let slot = if let Some(s) = self.ctx.do_over.get(&var.to_uppercase()) {
+                    *s
+                } else if let Some(s) = self.pdv.slot(var) {
+                    s
+                } else {
                     return Err(SasError::runtime(format!(
                         "Variable {var} is not addressable."
                     )));
@@ -627,6 +1245,13 @@ impl Runner {
                 until.as_ref(),
                 body,
             ),
+            DsStmt::DoList { index, items, body } => self.exec_do_list(index, items, body),
+            DsStmt::DoOver { array, body } => self.exec_do_over(array, body),
+            DsStmt::Select {
+                selector,
+                whens,
+                otherwise,
+            } => self.exec_select(selector.as_ref(), whens, otherwise.as_deref()),
             DsStmt::Delete => Ok(Flow::NextIter),
             DsStmt::Output(targets) => {
                 if targets.is_empty() {
@@ -673,39 +1298,51 @@ impl Runner {
                 self.pdv.set(slot, Value::Num(acc + incr));
                 Ok(Flow::Normal)
             }
-            DsStmt::AssignIndexed { array, index, expr } => {
-                // Indice évalué avec les MÊMES règles que les rvalues
+            DsStmt::AssignIndexed {
+                array,
+                indices,
+                expr,
+            } => {
+                // Indices évalués avec les MÊMES règles que les rvalues
                 // (coercition num + arrondi ; missing/hors bornes → l'étape
                 // s'arrête), puis coercition vers le type de l'élément.
-                let idx_val = self.eval_checked(index)?;
-                let slot = self.resolve_subscript(array, idx_val)?;
+                let mut idx_vals = Vec::with_capacity(indices.len());
+                for index in indices {
+                    idx_vals.push(self.eval_checked(index)?);
+                }
+                let slot = self.resolve_subscript(array, &idx_vals)?;
                 let value = self.eval_checked(expr)?;
                 let coerced = self.coerce_assign(value, self.pdv.vars()[slot].ty);
                 self.pdv.set(slot, coerced);
                 Ok(Flow::Normal)
             }
             DsStmt::CallRoutine { name, args } => self.exec_call_routine(name, args),
-            // INPUT (M14.1) : lit la ligne d'entrée courante. EOF → EndStep
-            // immédiat (comme SET, fin au milieu de l'itération).
-            DsStmt::Input { .. } => self.exec_input(),
-            // INFILE/DATALINES : déclaratifs (source résolue à la
-            // compilation) ; rien à exécuter.
-            DsStmt::Infile { .. } | DsStmt::Datalines { .. } => Ok(Flow::Normal),
-            // FILE (M14.2) : change la destination courante des PUT suivants.
-            DsStmt::File {
-                dest,
-                delimiter,
-                dsd,
-            } => {
-                self.exec_file(dest, delimiter, *dsd);
-                Ok(Flow::Normal)
-            }
-            // PUT (M14.2) : écrit dans la destination courante.
-            DsStmt::Put { items } => {
-                self.exec_put(items)?;
-                Ok(Flow::Normal)
-            }
-            // Directives de compilation : rien à exécuter.
+            // Étiquette (M16.6) : l'étiquette elle-même est un marqueur
+            // (résolue par index dans le pilote de niveau supérieur) ; on
+            // exécute simplement le statement étiqueté.
+            DsStmt::Labeled { stmt, .. } => self.exec_stmt(stmt),
+            // GOTO/LINK/RETURN (M16.6) : remontent comme Flow non-Normal
+            // jusqu'au pilote de niveau supérieur (`run_step_body`), qui pilote
+            // le compteur de programme et la pile de retour. Traversent les
+            // boucles DO englobantes (mêmes règles de propagation que EndStep).
+            DsStmt::Goto(label) => Ok(Flow::Goto(label.to_uppercase())),
+            // LINK : exécute la sous-routine INLINE (du label au prochain
+            // RETURN) puis reprend après le LINK (Flow::Normal). Exécuté ICI —
+            // et non remonté — pour qu'un LINK à l'intérieur d'une boucle DO
+            // n'abandonne PAS la boucle (la pile d'appels Rust = pile de
+            // retour). Un Flow non-Normal de la sous-routine (GOTO non local,
+            // DELETE, STOP, fin d'entrée) est propagé tel quel.
+            DsStmt::Link(label) => self.exec_link_subroutine(&label.to_uppercase()),
+            DsStmt::Return => Ok(Flow::Return),
+            // INPUT (M14) : lit le PROCHAIN enregistrement de la source texte
+            // dans le PDV. Comme SET, l'épuisement de la source termine
+            // l'étape IMMÉDIATEMENT (au milieu de l'itération).
+            DsStmt::Input(items) => self.exec_input(items),
+            // FILE (M14.2) : change la destination courante des PUT.
+            DsStmt::File { dest } => self.exec_file(dest),
+            // PUT (M14.2) : rend les items dans la ligne de sortie courante.
+            DsStmt::Put(items) => self.exec_put(items),
+            // Directives de compilation / déclaratives : rien à exécuter.
             DsStmt::Keep(_)
             | DsStmt::Drop(_)
             | DsStmt::Retain(_)
@@ -714,531 +1351,896 @@ impl Runner {
             | DsStmt::Format(_)
             | DsStmt::Label(_)
             | DsStmt::Attrib(_)
+            | DsStmt::Infile { .. }
+            | DsStmt::Datalines(_)
             | DsStmt::Array { .. } => Ok(Flow::Normal),
         }
     }
 
-    /// Exécute le prochain statement INPUT de l'itération (M14.1) : charge la
-    /// ligne d'entrée suivante, applique les actions de lecture, peuple le
-    /// PDV. EOF → `Flow::EndStep` (fin immédiate, comme SET). Respecte le
-    /// pointeur de colonne (`@n`, `+n`, `/`) et les options
-    /// MISSOVER/TRUNCOVER/STOPOVER.
-    fn exec_input(&mut self) -> Result<Flow> {
-        // Récupère le bloc d'actions de CE statement INPUT.
-        let cursor = self.input_action_cursor;
-        self.input_action_cursor += 1;
-        let Some(actions) = self.input_actions.get(cursor).cloned() else {
-            // Plus d'actions compilées : INPUT vide (garde-fou).
-            return Ok(Flow::Normal);
-        };
-        let Some(text) = &self.text else {
-            return Err(SasError::runtime("INPUT statement without an input source."));
-        };
-        // Fin de données : EndStep immédiat.
-        if self.text_line >= text.lines.len() {
-            return Ok(Flow::EndStep);
-        }
-        // Nouvelle ligne logique : repart en colonne 1.
-        self.text_col = 1;
-        self.records_read += 1;
-
-        // Découpe en champs (list/DSD) une seule fois si nécessaire — mais
-        // comme column/formatted input lisent par position, on travaille sur
-        // la ligne brute et un itérateur de champs pour le list input.
-        let line = text.lines[self.text_line].clone();
-        let dsd = text.dsd;
-        let delimiters = text.delimiters.clone();
-        let missover = text.missover;
-        let truncover = text.truncover;
-        let stopover = text.stopover;
-        let display = text.display.clone();
-
-        // Champs pour le list input (séparés à la demande, en suivant le
-        // pointeur de colonne). On maintient un curseur de champ pour le list
-        // input et un pointeur de colonne pour column/formatted.
-        let mut field_iter = FieldReader::new(&line, &delimiters, dsd);
-        // Synchronise le curseur du FieldReader avec un éventuel pointeur de
-        // colonne déjà avancé : pour le list input pur, text_col reste 1.
-
-        let mut premature_eol = false;
-        for action in &actions {
-            match action {
-                InputAction::PointerCol(n) => {
-                    self.text_col = *n;
-                    field_iter.seek_col(*n);
+    /// INPUT (M14) : lit un enregistrement de la source texte et applique la
+    /// spécification INPUT au PDV. Gère les modes liste/colonne/formaté, les
+    /// pointeurs `@n`/`+n`/`/`, et les holds `@`/`@@`.
+    ///
+    /// Sémantique de fin de source (comme SET) : si aucun enregistrement
+    /// n'est disponible quand on doit en lire un nouveau → EndStep.
+    /// Résout les items AST d'un statement INPUT en `InputAction` (slots PDV
+    /// + informats parsés). Plusieurs INPUT par étape sont ainsi gérés (chacun
+    /// avec ses propres items).
+    fn resolve_input_items(
+        &self,
+        ast_items: &[crate::ast::InputItem],
+    ) -> Result<Vec<InputAction>> {
+        use crate::ast::InputItem;
+        let mut out = Vec::with_capacity(ast_items.len());
+        for item in ast_items {
+            let action = match item {
+                InputItem::Var {
+                    name,
+                    is_char,
+                    cols,
+                    informat,
+                    list_modifier,
+                } => {
+                    let slot = self.pdv.slot(name).ok_or_else(|| {
+                        SasError::runtime(format!(
+                            "Variable {name} is not on the INPUT statement."
+                        ))
+                    })?;
+                    let spec = match informat {
+                        Some(tok) => Some(crate::formats::FormatSpec::parse(tok).ok_or_else(
+                            || SasError::runtime(format!("The informat {tok} is not valid.")),
+                        )?),
+                        None => None,
+                    };
+                    let pdv_is_char = self.pdv.vars()[slot].ty == VarType::Char;
+                    InputAction::Var {
+                        slot,
+                        is_char: pdv_is_char || *is_char,
+                        cols: *cols,
+                        informat: spec,
+                        list_modifier: *list_modifier,
+                    }
                 }
-                InputAction::PointerSkip(n) => {
-                    self.text_col += *n;
-                    field_iter.seek_col(self.text_col);
+                InputItem::ColumnPointer(n) => InputAction::ColumnPointer(*n),
+                InputItem::SkipColumns(n) => InputAction::SkipColumns(*n),
+                InputItem::NextLine => InputAction::NextLine,
+                InputItem::HoldLine => InputAction::HoldLine,
+                InputItem::HoldLineDouble => InputAction::HoldLineDouble,
+            };
+            out.push(action);
+        }
+        Ok(out)
+    }
+
+    fn exec_input(&mut self, ast_items: &[crate::ast::InputItem]) -> Result<Flow> {
+        // Récupérer la ligne de travail : soit un hold actif (avec encore des
+        // données après le curseur), soit la prochaine ligne de la source. Un
+        // hold `@@` dont le reste de ligne n'est que des blancs est épuisé →
+        // on lit un nouvel enregistrement (sémantique SAS du « double hold »).
+        let held = self.held.take().filter(|h| {
+            let rest: String = h.line.chars().skip(h.cursor).collect();
+            !rest.trim().is_empty()
+        });
+        let (mut line, mut cursor) = match held {
+            Some(h) => (h.line, h.cursor),
+            None => match self.next_record()? {
+                Some(s) => (s, 0usize),
+                None => return Ok(Flow::EndStep),
+            },
+        };
+
+        if self.text.is_none() {
+            return Err(SasError::runtime("INPUT statement without an INFILE source."));
+        }
+        // Items résolus en `InputAction` (slots PDV + informats parsés). On les
+        // résout depuis l'AST de CE statement INPUT pour gérer plusieurs INPUT
+        // par étape (chacun partage la même source mais a ses propres items).
+        let items = self.resolve_input_items(ast_items)?;
+        let short = self.text.as_ref().unwrap().options.short;
+        let dsd = self.text.as_ref().unwrap().options.dsd;
+        let delim = self.text.as_ref().unwrap().options.delimiter.clone();
+
+        let mut hold_after = false;
+        let mut hold_double = false;
+
+        for action in &items {
+            match action {
+                InputAction::ColumnPointer(n) => {
+                    cursor = n.saturating_sub(1);
+                }
+                InputAction::SkipColumns(n) => {
+                    cursor += n;
                 }
                 InputAction::NextLine => {
-                    // `/` : passe à la ligne suivante.
-                    self.text_line += 1;
-                    self.text_col = 1;
-                    if self.text_line >= self.text.as_ref().unwrap().lines.len() {
-                        // Plus de ligne : fin d'étape.
-                        return Ok(Flow::EndStep);
+                    // Passe à la ligne d'entrée suivante (curseur réinitialisé).
+                    match self.next_record()? {
+                        Some(s) => {
+                            line = s;
+                            cursor = 0;
+                        }
+                        None => return Ok(Flow::EndStep),
                     }
-                    self.records_read += 1;
-                    // Rebâtit le lecteur sur la nouvelle ligne.
-                    let new_line = self.text.as_ref().unwrap().lines[self.text_line].clone();
-                    field_iter = FieldReader::new_owned(new_line, &delimiters, dsd);
                 }
-                InputAction::ReadVar {
+                InputAction::HoldLine => hold_after = true,
+                InputAction::HoldLineDouble => {
+                    hold_after = true;
+                    hold_double = true;
+                }
+                InputAction::Var {
                     slot,
                     is_char,
-                    col_range,
+                    cols,
                     informat,
+                    list_modifier,
                 } => {
-                    // Récupère le texte brut du champ selon le style.
-                    let raw: Option<String> = if let Some((a, b)) = col_range {
-                        // Column input : sous-chaîne par position (1-based).
-                        Some(substr_cols(&field_iter.line(), *a, *b))
-                    } else if informat.is_some() {
-                        // Formatted input : largeur de l'informat depuis la
-                        // position courante du pointeur de colonne.
-                        let w = informat
-                            .as_ref()
-                            .and_then(|s| s.w)
-                            .map(|w| w as usize);
-                        match w {
-                            Some(w) => {
-                                let s = substr_from(&field_iter.line(), self.text_col, w);
-                                self.text_col += w;
-                                field_iter.seek_col(self.text_col);
-                                Some(s)
-                            }
-                            // Informat sans largeur : se comporte en list
-                            // input (champ délimité).
-                            None => field_iter.next_field(),
+                    let outcome = self.read_one_var(
+                        &line, &mut cursor, *slot, *is_char, *cols, informat, *list_modifier,
+                        &delim, dsd, short,
+                    )?;
+                    match outcome {
+                        ReadOutcome::Ok => {}
+                        ReadOutcome::ShortMissover => {
+                            // MISSOVER/TRUNCOVER/défaut liste : variables
+                            // restantes laissées telles quelles (déjà missing
+                            // par le reset). On arrête la lecture des items.
+                            break;
                         }
-                    } else {
-                        // List input : champ délimité suivant.
-                        field_iter.next_field()
-                    };
-
-                    let raw = match raw {
-                        Some(s) => s,
-                        None => {
-                            // Fin de ligne prématurée.
-                            premature_eol = true;
-                            if stopover {
-                                self.pdv.error_ = true;
-                                return Err(SasError::runtime(format!(
-                                    "INPUT statement exceeded record length on the file {display} (STOPOVER)."
-                                )));
-                            }
-                            // MISSOVER / TRUNCOVER / défaut : variable
-                            // manquante. (Le défaut SAS « flow to next line »
-                            // n'est pas couvert pour le list input : on
-                            // assigne missing — divergence documentée.)
-                            self.assign_input_missing(*slot, *is_char);
-                            continue;
+                        ReadOutcome::Stopover => {
+                            return Err(SasError::runtime(
+                                "INPUT statement exceeded record length (STOPOVER).",
+                            ));
                         }
-                    };
-
-                    self.assign_input_value(*slot, *is_char, &raw, informat.as_ref());
+                    }
                 }
             }
         }
-        let _ = (truncover, missover, premature_eol);
-        // Avance à la ligne suivante pour le prochain INPUT/itération.
-        self.text_line += 1;
+
+        // Hold : conserver la ligne pour le prochain INPUT.
+        if hold_after {
+            self.held = Some(HeldLine {
+                line,
+                cursor,
+                double: hold_double,
+            });
+        }
         Ok(Flow::Normal)
     }
 
-    /// Assigne une valeur missing à une variable lue par INPUT.
-    fn assign_input_missing(&mut self, slot: usize, is_char: bool) {
-        let v = if is_char {
+    /// Lit le prochain enregistrement brut de la source texte, en respectant
+    /// FIRSTOBS=/OBS=. Incrémente `text_read`. Renvoie `None` à l'épuisement.
+    fn next_record(&mut self) -> Result<Option<String>> {
+        let text = match &self.text {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+        let firstobs = text.options.firstobs;
+        let obs = text.options.obs;
+        loop {
+            // FIRSTOBS= : sauter les lignes avant firstobs (1-based).
+            if self.text_line + 1 < firstobs {
+                self.text_line += 1;
+                continue;
+            }
+            // OBS= : borne supérieure (1-based, inclusive).
+            if let Some(o) = obs {
+                if self.text_line + 1 > o {
+                    return Ok(None);
+                }
+            }
+            let Some(line) = text.lines.get(self.text_line) else {
+                return Ok(None);
+            };
+            let line = line.clone();
+            self.text_line += 1;
+            self.text_read += 1;
+            return Ok(Some(line));
+        }
+    }
+
+    /// Lit UNE variable d'INPUT à partir de `line`, en avançant `cursor`.
+    /// Couvre les trois modes (colonne / formaté / liste) et applique la
+    /// coercition vers le slot PDV. Renvoie le devenir de la lecture (OK /
+    /// ligne trop courte selon MISSOVER/TRUNCOVER/STOPOVER).
+    #[allow(clippy::too_many_arguments)]
+    fn read_one_var(
+        &mut self,
+        line: &str,
+        cursor: &mut usize,
+        slot: usize,
+        is_char: bool,
+        cols: Option<(usize, usize)>,
+        informat: &Option<crate::formats::FormatSpec>,
+        list_modifier: bool,
+        delim: &Option<String>,
+        dsd: bool,
+        short: ShortMode,
+    ) -> Result<ReadOutcome> {
+        let chars: Vec<char> = line.chars().collect();
+
+        // ── Mode COLONNE : champ fixe `a-b` (1-based inclusif). ──────────────
+        if let Some((a, b)) = cols {
+            let start = a - 1;
+            let end = b; // exclusif sur la borne 1-based supérieure
+            if start >= chars.len() {
+                // Champ entièrement au-delà de la ligne.
+                return Ok(self.handle_short(short, slot, is_char));
+            }
+            let stop = end.min(chars.len());
+            let field: String = chars[start..stop].iter().collect();
+            *cursor = end;
+            self.apply_field(slot, &field, is_char, informat);
+            return Ok(ReadOutcome::Ok);
+        }
+
+        // ── Modes LISTE et FORMATÉ-COLONNE ───────────────────────────────────
+        // Un informat SANS `:`, en mode espace par défaut (ni DSD ni
+        // délimiteur explicite), lit une largeur FIXE à partir du curseur
+        // (mode formaté colonne). Avec `:`, DSD, ou un délimiteur, il lit un
+        // jeton délimité puis applique l'informat (mode liste). En mode liste
+        // pur (sans informat), on lit un jeton délimité.
+        let delimited_mode = dsd || delim.is_some() || list_modifier;
+        let formatted_fixed = informat.is_some() && !delimited_mode;
+        if formatted_fixed {
+            let w = informat.as_ref().and_then(|s| s.w).map(|w| w as usize);
+            // Sans largeur explicite : se comporter comme un jeton délimité.
+            if let Some(w) = w {
+                if *cursor >= chars.len() {
+                    return Ok(self.handle_short(short, slot, is_char));
+                }
+                let stop = (*cursor + w).min(chars.len());
+                // TRUNCOVER/MISSOVER : un champ partiel est lu tel quel.
+                let field: String = chars[*cursor..stop].iter().collect();
+                *cursor = *cursor + w;
+                self.apply_field(slot, &field, is_char, informat);
+                return Ok(ReadOutcome::Ok);
+            }
+        }
+
+        // ── Mode LISTE : jeton délimité ──────────────────────────────────────
+        match self.scan_token(&chars, cursor, delim, dsd) {
+            Some(field) => {
+                self.apply_field(slot, &field, is_char, informat);
+                Ok(ReadOutcome::Ok)
+            }
+            None => Ok(self.handle_short(short, slot, is_char)),
+        }
+    }
+
+    /// Comportement « ligne trop courte » selon MISSOVER/TRUNCOVER/STOPOVER.
+    /// En mode défaut/MISSOVER/TRUNCOVER, la variable reste à sa valeur de
+    /// reset (missing num / chaîne vide) et on signale d'arrêter les items
+    /// restants. STOPOVER → erreur.
+    fn handle_short(&mut self, short: ShortMode, slot: usize, is_char: bool) -> ReadOutcome {
+        if short == ShortMode::Stopover {
+            return ReadOutcome::Stopover;
+        }
+        // La variable manquante reste à missing/blanc (le reset l'a déjà
+        // posée ; on force par sûreté).
+        let init = if is_char {
             Value::Char(String::new())
         } else {
             Value::missing()
         };
-        self.pdv.set(slot, v);
+        self.pdv.set(slot, init);
+        ReadOutcome::ShortMissover
     }
 
-    /// Convertit le texte d'un champ en `Value` puis l'assigne au PDV.
-    /// Char : la chaîne trimée (la troncature à la longueur est faite par
-    /// `Pdv::set`). Num : via l'informat si présent, sinon parse standard ;
-    /// donnée numérique illisible → `.` + NOTE "Invalid data" + `_ERROR_`.
-    fn assign_input_value(
+    /// Découpe le prochain jeton délimité à partir de `cursor`. En mode
+    /// DSD : la virgule est le délimiteur par défaut, deux délimiteurs
+    /// consécutifs encadrent une valeur manquante (chaîne vide), et les
+    /// guillemets protègent les délimiteurs. Renvoie `None` si la fin de
+    /// ligne est atteinte avant tout jeton (hors DSD-vide).
+    fn scan_token(
+        &self,
+        chars: &[char],
+        cursor: &mut usize,
+        delim: &Option<String>,
+        dsd: bool,
+    ) -> Option<String> {
+        // Jeu de délimiteurs.
+        let delims: Vec<char> = match delim {
+            Some(s) => s.chars().collect(),
+            None if dsd => vec![','],
+            None => vec![' ', '\t'],
+        };
+        let is_delim = |c: char| delims.contains(&c);
+
+        if dsd {
+            // En DSD, on lit exactement UN champ : il peut être vide (deux
+            // délimiteurs consécutifs) ou entre guillemets.
+            if *cursor > chars.len() {
+                return None;
+            }
+            if *cursor == chars.len() {
+                // Curseur en bout de ligne : plus de champ.
+                return None;
+            }
+            let mut field = String::new();
+            // Champ entre guillemets.
+            if chars[*cursor] == '"' {
+                *cursor += 1;
+                while *cursor < chars.len() {
+                    let c = chars[*cursor];
+                    if c == '"' {
+                        // Guillemet doublé = guillemet littéral.
+                        if *cursor + 1 < chars.len() && chars[*cursor + 1] == '"' {
+                            field.push('"');
+                            *cursor += 2;
+                            continue;
+                        }
+                        *cursor += 1;
+                        break;
+                    }
+                    field.push(c);
+                    *cursor += 1;
+                }
+                // Consommer le délimiteur de fin de champ s'il y en a un.
+                if *cursor < chars.len() && is_delim(chars[*cursor]) {
+                    *cursor += 1;
+                }
+                return Some(field);
+            }
+            // Champ nu : jusqu'au prochain délimiteur.
+            while *cursor < chars.len() && !is_delim(chars[*cursor]) {
+                field.push(chars[*cursor]);
+                *cursor += 1;
+            }
+            // Consommer le délimiteur (sépare du champ suivant).
+            if *cursor < chars.len() && is_delim(chars[*cursor]) {
+                *cursor += 1;
+            }
+            return Some(field);
+        }
+
+        // Mode liste ordinaire : sauter les délimiteurs de tête, puis lire
+        // jusqu'au prochain délimiteur.
+        while *cursor < chars.len() && is_delim(chars[*cursor]) {
+            *cursor += 1;
+        }
+        if *cursor >= chars.len() {
+            return None;
+        }
+        let mut field = String::new();
+        while *cursor < chars.len() && !is_delim(chars[*cursor]) {
+            field.push(chars[*cursor]);
+            *cursor += 1;
+        }
+        Some(field)
+    }
+
+    /// Applique un champ texte à un slot PDV : informat si présent, sinon
+    /// décodage natif (char → tel quel ; num → parse/missing). La troncature
+    /// char est gérée par `pdv.set`.
+    fn apply_field(
         &mut self,
         slot: usize,
+        field: &str,
         is_char: bool,
-        raw: &str,
-        informat: Option<&crate::formats::FormatSpec>,
+        informat: &Option<crate::formats::FormatSpec>,
     ) {
-        if is_char {
-            // Caractère : si un informat $ est posé, il peut transformer
-            // (ex. $UPCASE) ; sinon on prend la chaîne brute (trim des blancs
-            // de bord façon list input — la troncature PDV gère la longueur).
-            let s = match informat {
-                Some(spec) => match apply_informat(raw, spec) {
-                    Value::Char(s) => s,
-                    Value::Num(n) => crate::value::format_best(n, 12).trim().to_string(),
-                    Value::Missing(_) => String::new(),
-                },
-                None => raw.trim().to_string(),
-            };
-            self.pdv.set(slot, Value::Char(s));
-            return;
-        }
-        // Numérique.
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            self.pdv.set(slot, Value::missing());
-            return;
-        }
-        let value = match informat {
-            Some(spec) => apply_informat(trimmed, spec),
-            None => {
-                // Standard numeric informat (w. implicite) : parse direct.
-                // Accepte le `.` SAS comme missing.
-                if trimmed == "." {
-                    Value::missing()
-                } else {
-                    match trimmed.parse::<f64>() {
-                        Ok(f) => Value::Num(f),
-                        Err(_) => Value::Missing(crate::value::MissingKind::Dot),
+        let value = if let Some(spec) = informat {
+            // Informat : on délègue au catalogue (gère le piège des décimales
+            // implicites). Le champ est passé tel quel.
+            self.format_informat(field, spec)
+        } else if is_char {
+            // Mode liste/colonne caractère : la valeur est le champ (les
+            // blancs de bord sont rognés en mode liste ; en colonne, SAS rogne
+            // aussi les blancs de tête/fin).
+            Value::Char(field.trim().to_string())
+        } else {
+            // Numérique : trim + parse ; vide/"." → missing.
+            let t = field.trim();
+            if t.is_empty() || t == "." {
+                Value::missing()
+            } else {
+                match t.parse::<f64>() {
+                    Ok(f) => Value::Num(f),
+                    Err(_) => {
+                        // Donnée numérique invalide : missing + NOTE + _ERROR_.
+                        self.ctx.invalid_data += 1;
+                        self.pdv.error_ = true;
+                        Value::missing()
                     }
                 }
             }
         };
-        match value {
-            Value::Num(f) => self.pdv.set(slot, Value::Num(f)),
-            Value::Missing(_) => {
-                // Une donnée non vide qui ne se lit pas en numérique est une
-                // « invalid data » : missing + NOTE + _ERROR_.
-                self.ctx.invalid_data += 1;
-                self.pdv.error_ = true;
-                self.pdv.set(slot, Value::missing());
-            }
-            // Un informat caractère sur une variable numérique : missing.
-            Value::Char(_) => {
-                self.ctx.invalid_data += 1;
-                self.pdv.error_ = true;
-                self.pdv.set(slot, Value::missing());
-            }
-        }
+        let target = self.pdv.vars()[slot].ty;
+        let coerced = self.coerce_assign(value, target);
+        self.pdv.set(slot, coerced);
     }
 
-    /// Exécute un statement FILE (M14.2) : fixe la destination courante des
-    /// PUT suivants + ses options de délimiteur. Résout depuis l'AST (le
-    /// chemin relatif vs `base_dir`).
-    fn exec_file(&mut self, dest: &crate::ast::PutDest, delimiter: &Option<String>, dsd: bool) {
-        let Some(put) = &mut self.put else { return };
-        let resolved = match dest {
-            crate::ast::PutDest::Log => PutDestResolved::Log,
-            crate::ast::PutDest::Print => PutDestResolved::Print,
-            crate::ast::PutDest::Path(path) => {
-                let p = std::path::PathBuf::from(path);
-                let abs = if p.is_absolute() {
-                    p
-                } else {
-                    put.base_dir.join(&p)
-                };
-                PutDestResolved::Path(abs)
-            }
+    /// Applique un informat à un champ via le catalogue (clone de session).
+    fn format_informat(&self, field: &str, spec: &crate::formats::FormatSpec) -> Value {
+        self.format_catalog.informat(field, spec)
+    }
+
+    // ── FILE / PUT (M14.2) ───────────────────────────────────────────────
+
+    /// FILE (M14.2) : change la destination courante des PUT. Si une ligne
+    /// non maintenue est en construction et que la destination CHANGE, elle
+    /// est d'abord relâchée vers l'ancienne destination (la ligne « en cours »
+    /// appartient à la destination active au moment de son écriture).
+    fn exec_file(&mut self, dest: &crate::ast::PutDest) -> Result<Flow> {
+        let new_dest = match dest {
+            crate::ast::PutDest::Path(p) => PutDestKind::Path(p.clone()),
+            crate::ast::PutDest::Log => PutDestKind::Log,
+            crate::ast::PutDest::Print => PutDestKind::Print,
         };
-        put.cur_dest = resolved;
-        put.delimiter = delimiter.clone();
-        put.dsd = dsd;
+        if new_dest != self.put.dest {
+            // Relâcher la ligne pendante (non maintenue) vers l'ancienne
+            // destination avant de basculer.
+            if self.put.started && !self.put.hold && !self.put.hold_double {
+                self.put_release_line();
+            }
+            self.put.dest = new_dest;
+        }
+        Ok(Flow::Normal)
     }
 
-    /// Exécute un statement PUT (M14.2) : formate les items dans le tampon de
-    /// ligne, gère les pointeurs `@n`/`+n`, le saut `/`, le maintien `@`/`@@`
-    /// et `_all_`/named output. La ligne n'est émise qu'au flush (fin de PUT
-    /// sans hold, `/`, ou fin d'itération). Exécuté depuis l'AST (robuste aux
-    /// boucles DO).
-    fn exec_put(&mut self, items: &[crate::ast::PutItem]) -> Result<()> {
+    /// PUT (M14.2) : rend chaque item dans la ligne de sortie courante puis,
+    /// sauf hold `@`/`@@` final, relâche la ligne vers la destination.
+    fn exec_put(&mut self, items: &[crate::ast::PutItem]) -> Result<Flow> {
         use crate::ast::PutItem;
-        if self.put.is_none() {
-            return Ok(());
-        }
-
-        let mut hold = false;
-        let mut hold_across = false;
+        // Un nouveau PUT efface le hold simple précédent (la ligne maintenue
+        // par `@` est reprise telle quelle ; un nouveau PUT sans `@` final la
+        // relâchera). Le hold est recalculé pour CE statement.
+        self.put.hold = false;
+        self.put.hold_double = false;
+        self.put.started = true;
 
         for item in items {
             match item {
-                PutItem::Literal(s) => {
-                    self.put_write_literal(s);
+                PutItem::ColumnPointer(n) => {
+                    self.put.cursor = n.saturating_sub(1);
                 }
-                PutItem::Var { name, format } => {
-                    let (slot, is_char, spec) = self.resolve_put_runtime(name, format)?;
-                    let text = self.format_put_value(slot, is_char, spec.as_ref());
-                    self.put_write_value(&text, spec.is_some());
-                }
-                PutItem::NamedVar(name) => {
-                    let (slot, is_char, _spec) = self.resolve_put_runtime(name, &None)?;
-                    let display = self.pdv.vars()[slot].name.clone();
-                    let text = self.format_put_value(slot, is_char, None);
-                    self.put_write_named(&display, &text);
-                }
-                PutItem::PointerCol(n) => {
-                    if let Some(p) = &mut self.put {
-                        p.col = (*n).max(1);
-                    }
-                }
-                PutItem::PointerSkip(n) => {
-                    if let Some(p) = &mut self.put {
-                        p.col += *n;
-                    }
+                PutItem::SkipColumns(n) => {
+                    self.put.cursor += n;
                 }
                 PutItem::NextLine => {
-                    self.put_flush_line();
+                    // Saut de ligne DANS le même PUT : relâche la ligne
+                    // courante et en commence une nouvelle (même destination).
+                    self.put_release_line();
+                    self.put.started = true;
+                }
+                PutItem::HoldLine => self.put.hold = true,
+                PutItem::HoldLineDouble => {
+                    self.put.hold = true;
+                    self.put.hold_double = true;
+                }
+                PutItem::Literal(s) => {
+                    self.put_write_at(s);
+                    // Un blanc sépare l'item suivant en mode liste.
+                    self.put.cursor += 1;
+                }
+                PutItem::Var { name, format } => {
+                    let text = self.render_put_var(name, format.as_deref())?;
+                    self.put_write_at(&text);
+                    self.put.cursor += 1;
+                }
+                PutItem::NamedVar(name) => {
+                    let val = self.render_put_var(name, None)?;
+                    let text = format!("{}={}", name, val);
+                    self.put_write_at(&text);
+                    self.put.cursor += 1;
                 }
                 PutItem::All => {
-                    self.put_write_all();
-                }
-                PutItem::HoldLine => {
-                    hold = true;
-                }
-                PutItem::HoldLineAcross => {
-                    hold_across = true;
+                    // `var=value` pour chaque variable du PDV, séparés d'un
+                    // blanc, dans l'ordre du PDV.
+                    let n = self.pdv.vars().len();
+                    for slot in 0..n {
+                        // Les éléments d'array _TEMPORARY_ ne sont pas listés.
+                        if self.pdv.vars()[slot].temporary {
+                            continue;
+                        }
+                        let name = self.pdv.vars()[slot].name.clone();
+                        let val = self.render_put_slot(slot, None);
+                        let text = format!("{}={}", name, val);
+                        self.put_write_at(&text);
+                        self.put.cursor += 1;
+                    }
                 }
             }
         }
 
-        // Fin du PUT : si aucune rétention, on émet la ligne. Sinon on la
-        // retient (mémorise la destination courante pour le flush ultérieur).
-        if let Some(p) = &mut self.put {
-            if hold || hold_across {
-                p.held = hold;
-                p.held_across = hold_across;
-                p.held_dest = p.cur_dest.clone();
+        // Fin du PUT : sauf hold, relâcher la ligne.
+        if !self.put.hold && !self.put.hold_double {
+            self.put_release_line();
+        }
+        Ok(Flow::Normal)
+    }
+
+    /// Écrit `text` dans la ligne de sortie courante à partir de la colonne
+    /// `cursor` (0-based), en complétant de blancs si le curseur est au-delà
+    /// de la longueur courante, et avance le curseur après le texte écrit.
+    fn put_write_at(&mut self, text: &str) {
+        let mut chars: Vec<char> = self.put.line.chars().collect();
+        let start = self.put.cursor;
+        // Compléter de blancs jusqu'à `start`.
+        while chars.len() < start {
+            chars.push(' ');
+        }
+        // Écrire (écrasement) à partir de `start`.
+        for (i, c) in text.chars().enumerate() {
+            let pos = start + i;
+            if pos < chars.len() {
+                chars[pos] = c;
             } else {
-                p.held = false;
-                p.held_across = false;
+                chars.push(c);
             }
         }
-        if !hold && !hold_across {
-            self.put_flush_line();
+        self.put.cursor = start + text.chars().count();
+        self.put.line = chars.into_iter().collect();
+    }
+
+    /// Relâche (flush + clear) la ligne de sortie courante vers la
+    /// destination active, et réinitialise l'état de ligne.
+    fn put_release_line(&mut self) {
+        let line = std::mem::take(&mut self.put.line);
+        // SAS rogne les blancs de fin de la ligne PUT relâchée.
+        let line = line.trim_end().to_string();
+        let dest = self.put.dest.clone();
+        self.put.out.push((dest, line));
+        self.put.cursor = 0;
+        self.put.started = false;
+        self.put.hold = false;
+        self.put.hold_double = false;
+    }
+
+    /// Flush de fin d'étape : une ligne encore maintenue (`@`/`@@`) ou en
+    /// construction est relâchée.
+    fn put_flush_at_step_end(&mut self) {
+        if self.put.started || !self.put.line.is_empty() {
+            self.put_release_line();
+        }
+    }
+
+    /// Rejoue les lignes PUT produites vers leurs destinations (LOG, listing,
+    /// fichiers externes). Les fichiers sont regroupés par chemin et écrits
+    /// (création/troncature) en une fois.
+    fn put_replay(&mut self, session: &mut Session) -> Result<()> {
+        use std::collections::HashMap;
+        // Tampon par fichier (ordre des lignes préservé).
+        let mut files: HashMap<String, Vec<String>> = HashMap::new();
+        let mut file_order: Vec<String> = Vec::new();
+        for (dest, line) in std::mem::take(&mut self.put.out) {
+            match dest {
+                PutDestKind::Log => session.log.put_line(&line),
+                PutDestKind::Print => session.listing.write_line(&line),
+                PutDestKind::Path(path) => {
+                    files
+                        .entry(path.clone())
+                        .or_insert_with(|| {
+                            file_order.push(path.clone());
+                            Vec::new()
+                        })
+                        .push(line);
+                }
+            }
+        }
+        for path in file_order {
+            let lines = files.remove(&path).unwrap_or_default();
+            let mut content = lines.join("\n");
+            // Terminer le fichier par un saut de ligne (convention texte).
+            if !content.is_empty() {
+                content.push('\n');
+            }
+            // Chemin relatif résolu sous `base_dir` (cohérent avec LIBNAME et
+            // INFILE) ; le message d'erreur garde le chemin source.
+            let resolved = session.resolve_path(&path);
+            std::fs::write(&resolved, content).map_err(|e| {
+                SasError::runtime(format!("Unable to write the FILE '{path}': {e}"))
+            })?;
         }
         Ok(())
     }
 
-    /// Résout une variable de PUT à l'exécution : slot PDV (déjà créé à la
-    /// compilation), type effectif, et FormatSpec éventuel. Un format absent
-    /// pour une variable absente du PDV ne devrait pas arriver (compile_put
-    /// l'a créée), mais on dégrade en missing numérique par robustesse.
-    fn resolve_put_runtime(
-        &self,
-        name: &str,
-        format: &Option<String>,
-    ) -> Result<(usize, bool, Option<crate::formats::FormatSpec>)> {
-        let spec = match format {
-            Some(tok) => crate::formats::FormatSpec::parse(tok),
-            None => None,
-        };
-        let slot = self
-            .pdv
-            .slot(name)
-            .ok_or_else(|| SasError::runtime(format!("PUT references unknown variable {name}.")))?;
-        let is_char = self.pdv.vars()[slot].ty == VarType::Char;
-        Ok((slot, is_char, spec))
+    /// Rend une variable PUT (par nom) en texte, avec son format explicite
+    /// (`format`), ou son format d'affichage, ou le défaut BESTw./$w.
+    fn render_put_var(&self, name: &str, format: Option<&str>) -> Result<String> {
+        let slot = self.pdv.slot(name).ok_or_else(|| {
+            SasError::runtime(format!("Variable {name} is not on the PUT statement."))
+        })?;
+        Ok(self.render_put_slot(slot, format))
     }
 
-    /// `_all_` : écrit `NOM=valeur` pour toutes les variables vivantes du PDV
-    /// (forme named output), séparées comme du list output.
-    fn put_write_all(&mut self) {
-        let n = self.pdv.vars().len();
-        for slot in 0..n {
-            let var = &self.pdv.vars()[slot];
-            let is_char = var.ty == VarType::Char;
-            let display = var.name.clone();
-            let text = self.format_put_value(slot, is_char, None);
-            self.put_write_named(&display, &text);
-        }
-    }
-
-    /// Valeur d'une variable formatée pour PUT. Avec format → FormatCatalog ;
-    /// sinon list output : char tel quel (trim des blancs finaux), num en
-    /// BESTw. (12) trimé. `. = .` géré par `Value` (jamais de `==`).
-    fn format_put_value(
-        &self,
-        slot: usize,
-        is_char: bool,
-        format: Option<&crate::formats::FormatSpec>,
-    ) -> String {
-        let v = self.pdv.get(slot);
-        if let Some(spec) = format {
-            let catalog = crate::formats::FormatCatalog::default();
-            return catalog.format(v, spec);
-        }
-        // List output (pas de format).
-        match v {
-            Value::Char(s) => s.trim_end().to_string(),
-            Value::Num(n) => format_best(*n, 12).trim().to_string(),
-            Value::Missing(k) => {
-                let _ = is_char;
-                // Char missing = blanc ; num missing = caractère de missing.
-                if is_char {
-                    String::new()
-                } else {
-                    k.display()
-                }
+    /// Rend la valeur du slot PDV `slot` en texte pour un PUT. Ordre de
+    /// résolution du format : format explicite de l'item > format d'affichage
+    /// de la variable > défaut (BEST12. justifié à droite pour un numérique,
+    /// valeur brute pour un caractère). Le résultat est rogné de ses blancs
+    /// de bord (mode liste SAS : les valeurs formatées sont posées « left
+    /// aligned » dans la ligne).
+    fn render_put_slot(&self, slot: usize, format: Option<&str>) -> String {
+        let value = self.pdv.get(slot).clone();
+        // Format explicite, sinon format d'affichage de la variable.
+        let fmt_tok = format
+            .map(str::to_string)
+            .or_else(|| self.pdv.vars()[slot].format.clone());
+        if let Some(tok) = fmt_tok {
+            if let Some(spec) = crate::formats::FormatSpec::parse(&tok) {
+                return self.format_catalog.format(&value, &spec).trim().to_string();
             }
         }
-    }
-
-    /// Écrit une valeur de list/formatted output dans le tampon courant.
-    /// `formatted` = true (format explicite) → écrit à la colonne courante
-    /// sans séparateur. Sinon (list output) → un séparateur (délimiteur FILE
-    /// ou blanc) précède la valeur si la ligne n'est pas vide.
-    fn put_write_value(&mut self, text: &str, formatted: bool) {
-        if formatted {
-            self.put_write_literal(text);
-            return;
-        }
-        self.put_write_list_item(text);
-    }
-
-    /// Named output `NOM=valeur` (séparé comme du list output).
-    fn put_write_named(&mut self, name: &str, value: &str) {
-        let item = format!("{name}={value}");
-        self.put_write_list_item(&item);
-    }
-
-    /// Écrit un item de list output : insère le séparateur courant si la
-    /// ligne contient déjà quelque chose, puis le texte (avec quoting DSD si
-    /// le texte contient le délimiteur).
-    fn put_write_list_item(&mut self, text: &str) {
-        let (sep, dsd) = match &self.put {
-            Some(p) => {
-                // Séparateur effectif : DLM= explicite ; sinon `,` sous DSD ;
-                // sinon un blanc (list output standard).
-                let sep = match &p.delimiter {
-                    Some(d) => d.clone(),
-                    None if p.dsd => ",".to_string(),
-                    None => " ".to_string(),
-                };
-                (sep, p.dsd)
-            }
-            None => return,
-        };
-        // Séparateur entre items si la ligne a déjà du contenu à gauche.
-        let need_sep = self
-            .put
-            .as_ref()
-            .map(|p| p.line_started && p.col > 1)
-            .unwrap_or(false);
-        if need_sep {
-            self.put_append(&sep);
-        }
-        let delim_char = sep.chars().next();
-        if dsd && delim_char.is_some_and(|d| text.contains(d)) {
-            self.put_append(&format!("\"{text}\""));
-        } else {
-            self.put_append(text);
+        // Défaut : pas de format.
+        match value {
+            Value::Missing(kind) => kind.display(),
+            Value::Num(f) => format_best(f, 12).trim().to_string(),
+            Value::Char(s) => s,
         }
     }
 
-    /// Écrit un littéral / valeur formatée à la colonne courante (pas de
-    /// séparateur automatique). Pad de la ligne jusqu'à la colonne courante.
-    fn put_write_literal(&mut self, text: &str) {
-        self.put_append(text);
-    }
-
-    /// Ajoute `text` au tampon de ligne à la colonne courante : pad par des
-    /// blancs jusqu'à `col`, puis insère `text` et avance `col`. Compté en
-    /// caractères.
-    fn put_append(&mut self, text: &str) {
-        let Some(p) = &mut self.put else { return };
-        let target = p.col.saturating_sub(1);
-        let cur_len = p.buf.chars().count();
-        if target > cur_len {
-            for _ in 0..(target - cur_len) {
-                p.buf.push(' ');
-            }
-        } else if target < cur_len {
-            // Réécriture en arrière (`@n` plus petit) : tronque puis écrit.
-            let kept: String = p.buf.chars().take(target).collect();
-            p.buf = kept;
-        }
-        p.buf.push_str(text);
-        p.col = p.buf.chars().count() + 1;
-        p.line_started = true;
-    }
-
-    /// Émet la ligne courante vers sa destination puis repart à zéro (utilisé
-    /// par `/` et la fin d'un PUT non retenu).
-    fn put_flush_line(&mut self) {
-        let Some(p) = &mut self.put else { return };
-        let line = std::mem::take(&mut p.buf);
-        let dest = p.cur_dest.clone();
-        p.col = 1;
-        p.line_started = false;
-        p.held = false;
-        p.held_across = false;
-        p.emit(&dest, line);
-    }
-
-    /// Fin d'itération (M14.2) : une ligne retenue par `@` (pas `@@`) est
-    /// émise. Une ligne `@@` est conservée pour l'itération suivante.
-    fn flush_put_iteration_end(&mut self) {
-        let Some(p) = &mut self.put else { return };
-        if p.held_across {
-            return;
-        }
-        if p.held || p.line_started {
-            let line = std::mem::take(&mut p.buf);
-            let dest = p.held_dest.clone();
-            p.col = 1;
-            p.line_started = false;
-            p.held = false;
-            p.emit(&dest, line);
-        }
-    }
-
-    /// Fin d'étape (M14.2) : émet une éventuelle ligne encore retenue (`@@`
-    /// non libéré, ou hold sur une étape sans itération).
-    fn flush_put_final(&mut self) {
-        let Some(p) = &mut self.put else { return };
-        if p.held || p.held_across || p.line_started || !p.buf.is_empty() {
-            let line = std::mem::take(&mut p.buf);
-            let dest = if p.held_across || p.held {
-                p.held_dest.clone()
-            } else {
-                p.cur_dest.clone()
-            };
-            p.col = 1;
-            p.line_started = false;
-            p.held = false;
-            p.held_across = false;
-            p.emit(&dest, line);
-        }
-    }
-
-    /// Exécute une CALL routine (M11.5). v1 : seule `SYMPUT` est supportée.
+    /// Exécute une CALL routine. Routines supportées (M11.5 + M15.6) :
+    /// STREAMINIT, SYMPUT, SYMPUTX, MISSING, EXECUTE, SORTN, SORTC, CATS,
+    /// SCAN, LABEL, VNAME. Toute autre → erreur « not yet implemented ».
     ///
-    /// `call symput(name, value);` évalue les deux arguments, convertit le
-    /// nom et la valeur en chaîne (un numérique est formaté en BEST12.
-    /// cadré à gauche, conformément à SAS), et POUSSE la paire dans
-    /// `ctx.symput_writes`. La table macro n'est PAS touchée pendant
-    /// l'étape : le symbole n'est visible qu'APRÈS le RUN (règle SAS) ; le
-    /// drain effectif est fait par `execute` après la boucle implicite.
-    /// Toute autre routine → erreur runtime « not yet implemented ».
+    /// Les routines qui ÉCRIVENT dans un argument (MISSING, SORTN/SORTC, CATS,
+    /// SCAN, LABEL, VNAME) résolvent cet argument en lvalue (variable ou
+    /// élément d'array) via `resolve_lvalue_slot`. SYMPUT/SYMPUTX diffèrent
+    /// l'écriture macro à la fin de l'étape (règle de visibilité SAS) ;
+    /// EXECUTE met du code en file pour exécution post-étape.
     fn exec_call_routine(&mut self, name: &str, args: &[crate::ast::Expr]) -> Result<Flow> {
-        if !name.eq_ignore_ascii_case("symput") {
-            return Err(SasError::runtime(format!(
-                "CALL routine {} is not yet implemented.",
-                name.to_uppercase()
-            )));
+        // CALL STREAMINIT(seed) — initialise the RNG stream. Accepts an
+        // optional single argument (integer seed); no argument → no-op.
+        if name.eq_ignore_ascii_case("streaminit") {
+            if let Some(seed_expr) = args.first() {
+                let seed_val = self.eval_checked(seed_expr)?;
+                if let Value::Num(f) = seed_val {
+                    self.ctx.rng_state = super::functions::streaminit_seed(f as i64);
+                    self.ctx.rng_spare = None; // invalidate cached Box-Muller spare
+                }
+                // missing seed value → no-op (as per spec)
+            }
+            return Ok(Flow::Normal);
         }
+
+        let upper = name.to_uppercase();
+        match upper.as_str() {
+            "SYMPUT" => self.call_symput(args, false),
+            "SYMPUTX" => self.call_symput(args, true),
+            "MISSING" => self.call_missing(args),
+            "EXECUTE" => self.call_execute(args),
+            "SORTN" => self.call_sort(args, false),
+            "SORTC" => self.call_sort(args, true),
+            "CATS" => self.call_cats(args),
+            "SCAN" => self.call_scan(args),
+            "LABEL" => self.call_label(args),
+            "VNAME" => self.call_vname(args),
+            _ => Err(SasError::runtime(format!(
+                "CALL routine {upper} is not yet implemented."
+            ))),
+        }
+    }
+
+    /// Résout un argument qui DOIT être une variable scalaire ou un élément
+    /// d'array indexé (`var` ou `arr{i}`) en son slot PDV. Utilisé par les
+    /// CALL routines qui écrivent dans leurs arguments (MISSING, CATS, SCAN,
+    /// LABEL, VNAME). Une expression qui n'est pas une lvalue → erreur.
+    fn resolve_lvalue_slot(&mut self, arg: &crate::ast::Expr) -> Result<usize> {
+        use crate::ast::Expr;
+        match arg {
+            Expr::Var(name) => self.pdv.slot(name).ok_or_else(|| {
+                SasError::runtime(format!("Variable {name} is not addressable."))
+            }),
+            Expr::Index { name, indices } => {
+                let mut idx_vals = Vec::with_capacity(indices.len());
+                for index in indices {
+                    idx_vals.push(self.eval_checked(index)?);
+                }
+                self.resolve_subscript(name, &idx_vals)
+            }
+            // `arr(i)` / `arr(i,j)` se parse en Call ; si le nom est un array,
+            // c'est une référence d'élément.
+            Expr::Call { name, args } if !args.is_empty()
+                && self.ctx.arrays.contains_key(&name.to_uppercase()) =>
+            {
+                let mut idx_vals = Vec::with_capacity(args.len());
+                for a in args {
+                    idx_vals.push(self.eval_checked(a)?);
+                }
+                self.resolve_subscript(name, &idx_vals)
+            }
+            _ => Err(SasError::runtime(
+                "CALL routine argument must be a variable reference.",
+            )),
+        }
+    }
+
+    /// CALL SYMPUT(name, value) / CALL SYMPUTX(name, value) — écrit un
+    /// symbole macro. SYMPUTX rogne EN PLUS les blancs de tête ET de fin de
+    /// la valeur (et un nombre est formaté sans blancs) ; SYMPUT garde la
+    /// valeur char telle quelle. Les deux trim­ent le nom.
+    fn call_symput(&mut self, args: &[crate::ast::Expr], x: bool) -> Result<Flow> {
         if args.len() != 2 {
-            return Err(SasError::runtime(
-                "CALL SYMPUT requires exactly two arguments (name, value).",
-            ));
+            return Err(SasError::runtime(if x {
+                "CALL SYMPUTX requires exactly two arguments (name, value)."
+            } else {
+                "CALL SYMPUT requires exactly two arguments (name, value)."
+            }));
         }
         let name_val = self.eval_checked(&args[0])?;
         let value_val = self.eval_checked(&args[1])?;
-        // Le nom macro est trimé (SAS rogne les blancs de bord du nom).
         let sym_name = symput_string(name_val);
         let sym_value = symput_string(value_val);
+        // SYMPUTX rogne les deux bords de la valeur ; SYMPUT la garde telle
+        // quelle (mais BEST12. d'un nombre est déjà cadré à gauche).
+        let sym_value = if x {
+            sym_value.trim().to_string()
+        } else {
+            sym_value
+        };
         self.ctx
             .symput_writes
             .push((sym_name.trim().to_string(), sym_value));
+        Ok(Flow::Normal)
+    }
+
+    /// CALL MISSING(var, var, ...) — met chaque variable argument à missing
+    /// (`.` pour numérique, `""` pour caractère). Chaque argument doit être
+    /// une lvalue (variable scalaire ou élément d'array).
+    fn call_missing(&mut self, args: &[crate::ast::Expr]) -> Result<Flow> {
+        for arg in args {
+            let slot = self.resolve_lvalue_slot(arg)?;
+            let init = match self.pdv.vars()[slot].ty {
+                VarType::Num => Value::missing(),
+                VarType::Char => Value::Char(String::new()),
+            };
+            self.pdv.set(slot, init);
+        }
+        Ok(Flow::Normal)
+    }
+
+    /// CALL EXECUTE(arg) — met le texte résolu de `arg` en file pour
+    /// exécution APRÈS l'étape DATA courante. `arg` est évalué comme une
+    /// expression caractère ; sa valeur est concaténée (avec un espace de
+    /// séparation) au code mis en file. La file est rejouée par l'exécuteur
+    /// une fois l'étape terminée.
+    ///
+    /// Limites documentées : la résolution macro (`%nrstr`, exécution macro à
+    /// l'évaluation vs à l'exécution) n'est PAS distinguée — le texte est
+    /// rejoué tel quel comme un programme SAS ordinaire (qui passe par le
+    /// processeur macro à son tour). Les références `&`/`%` du texte mis en
+    /// file sont donc résolues au MOMENT du rejeu, pas de l'appel.
+    fn call_execute(&mut self, args: &[crate::ast::Expr]) -> Result<Flow> {
+        if args.len() != 1 {
+            return Err(SasError::runtime(
+                "CALL EXECUTE requires exactly one argument.",
+            ));
+        }
+        let v = self.eval_checked(&args[0])?;
+        let code = match v {
+            Value::Char(s) => s,
+            Value::Num(f) => format_best(f, 12).trim().to_string(),
+            Value::Missing(_) => String::new(),
+        };
+        self.call_execute_queue.push(code);
+        Ok(Flow::Normal)
+    }
+
+    /// CALL SORTN(arr, ...) / CALL SORTC(arr, ...) — trie EN PLACE, par ordre
+    /// croissant (`sas_cmp`), les valeurs des variables/éléments passés en
+    /// arguments. La forme habituelle est un nom d'array (`call sortn(of a[*])`
+    /// — ici on accepte chaque élément ou un array entier), mais SAS accepte
+    /// aussi une liste de variables. On collecte donc tous les slots cibles
+    /// (un argument array entier dépliant ses slots), on récupère les valeurs,
+    /// on les trie, puis on les ré-assigne dans l'ordre des slots.
+    fn call_sort(&mut self, args: &[crate::ast::Expr], char_sort: bool) -> Result<Flow> {
+        use crate::ast::Expr;
+        // Collecte des slots cibles, dans l'ordre des arguments. Un argument
+        // qui nomme un array entier (`call sortn(arr)`) déplie tous ses slots.
+        let mut slots: Vec<usize> = Vec::new();
+        for arg in args {
+            match arg {
+                Expr::Var(name) if self.ctx.arrays.contains_key(&name.to_uppercase()) => {
+                    let elems = self.ctx.arrays[&name.to_uppercase()].slots.clone();
+                    slots.extend(elems);
+                }
+                _ => slots.push(self.resolve_lvalue_slot(arg)?),
+            }
+        }
+        if slots.is_empty() {
+            return Ok(Flow::Normal);
+        }
+        // Cohérence de type : SORTN attend du numérique, SORTC du caractère.
+        // On ne bloque pas (SAS est permissif) mais on lit les valeurs telles
+        // quelles ; `sas_cmp` ordonne num et char dans leur domaine.
+        let _ = char_sort;
+        let mut values: Vec<Value> = slots.iter().map(|&s| self.pdv.get(s).clone()).collect();
+        values.sort_by(|a, b| a.sas_cmp(b));
+        for (&slot, v) in slots.iter().zip(values) {
+            let coerced = self.coerce_assign(v, self.pdv.vars()[slot].ty);
+            self.pdv.set(slot, coerced);
+        }
+        Ok(Flow::Normal)
+    }
+
+    /// CALL CATS(result, item, ...) — concatène `item...` (chacun rogné des
+    /// blancs de bord, comme la fonction CATS) dans la variable caractère
+    /// `result`. Le résultat est tronqué à la longueur de `result` (sémantique
+    /// PDV normale via `set`). Le premier argument est l'lvalue de sortie.
+    fn call_cats(&mut self, args: &[crate::ast::Expr]) -> Result<Flow> {
+        if args.is_empty() {
+            return Err(SasError::runtime(
+                "CALL CATS requires at least one argument (the result variable).",
+            ));
+        }
+        let result_slot = self.resolve_lvalue_slot(&args[0])?;
+        let mut out = String::new();
+        for arg in &args[1..] {
+            let v = self.eval_checked(arg)?;
+            let s = match v {
+                Value::Char(s) => s,
+                Value::Num(f) => format_best(f, 12).trim().to_string(),
+                Value::Missing(k) => k.display(),
+            };
+            out.push_str(s.trim());
+        }
+        let coerced = self.coerce_assign(Value::Char(out), self.pdv.vars()[result_slot].ty);
+        self.pdv.set(result_slot, coerced);
+        Ok(Flow::Normal)
+    }
+
+    /// CALL SCAN(string, n, result[, delims]) — extrait le n-ième mot de
+    /// `string` (n<0 = depuis la fin) dans la variable caractère `result`.
+    /// Réutilise la sémantique de la fonction SCAN. Le 3e argument est
+    /// l'lvalue de sortie.
+    fn call_scan(&mut self, args: &[crate::ast::Expr]) -> Result<Flow> {
+        if args.len() < 3 {
+            return Err(SasError::runtime(
+                "CALL SCAN requires at least three arguments (string, n, result).",
+            ));
+        }
+        // Le mot est calculé par la fonction SCAN (string, n[, delims]).
+        let mut fn_args = vec![self.eval_checked(&args[0])?, self.eval_checked(&args[1])?];
+        if let Some(delim_arg) = args.get(3) {
+            fn_args.push(self.eval_checked(delim_arg)?);
+        }
+        let result_slot = self.resolve_lvalue_slot(&args[2])?;
+        let word = super::functions::call("SCAN", &fn_args, &mut self.ctx)
+            .unwrap_or(Value::Char(String::new()));
+        if let Some(msg) = self.ctx.fatal.take() {
+            let msg = msg.strip_prefix("ERROR: ").unwrap_or(&msg).to_string();
+            return Err(SasError::runtime(msg));
+        }
+        let coerced = self.coerce_assign(word, self.pdv.vars()[result_slot].ty);
+        self.pdv.set(result_slot, coerced);
+        Ok(Flow::Normal)
+    }
+
+    /// CALL LABEL(var, result) — pose dans la variable caractère `result` le
+    /// libellé de `var`. Si `var` n'a pas de libellé, SAS renvoie le NOM de la
+    /// variable (comportement reproduit ici).
+    fn call_label(&mut self, args: &[crate::ast::Expr]) -> Result<Flow> {
+        if args.len() != 2 {
+            return Err(SasError::runtime(
+                "CALL LABEL requires exactly two arguments (variable, result).",
+            ));
+        }
+        let var_slot = self.resolve_lvalue_slot(&args[0])?;
+        let result_slot = self.resolve_lvalue_slot(&args[1])?;
+        let var_name = self.pdv.vars()[var_slot].name.clone();
+        let label = self
+            .labels
+            .get(&var_name.to_uppercase())
+            .cloned()
+            .unwrap_or(var_name);
+        let coerced = self.coerce_assign(Value::Char(label), self.pdv.vars()[result_slot].ty);
+        self.pdv.set(result_slot, coerced);
+        Ok(Flow::Normal)
+    }
+
+    /// CALL VNAME(var, result) — pose dans la variable caractère `result` le
+    /// NOM de `var` (tel que stocké au PDV, casse de première référence).
+    fn call_vname(&mut self, args: &[crate::ast::Expr]) -> Result<Flow> {
+        if args.len() != 2 {
+            return Err(SasError::runtime(
+                "CALL VNAME requires exactly two arguments (variable, result).",
+            ));
+        }
+        let var_slot = self.resolve_lvalue_slot(&args[0])?;
+        let result_slot = self.resolve_lvalue_slot(&args[1])?;
+        let var_name = self.pdv.vars()[var_slot].name.clone();
+        let coerced =
+            self.coerce_assign(Value::Char(var_name), self.pdv.vars()[result_slot].ty);
+        self.pdv.set(result_slot, coerced);
         Ok(Flow::Normal)
     }
 
@@ -1271,6 +2273,7 @@ impl Runner {
             self.cursors[self.cur_ds] += 1;
             let Some(w) = &ds.where_ else {
                 self.rows_read[self.cur_ds] += 1;
+                self.set_end_flag();
                 return Ok(Flow::Normal);
             };
             // Évaluation inline (emprunts disjoints : `input` tient
@@ -1286,9 +2289,195 @@ impl Runner {
             }
             if v.truthy() {
                 self.rows_read[self.cur_ds] += 1;
+                self.set_end_flag();
                 return Ok(Flow::Normal);
             }
         }
+    }
+
+    /// Met à jour la variable END= (M16.4) après une lecture réussie en mode
+    /// concaténation : 1 si AUCUNE observation ne reste à lire (en tenant
+    /// compte du WHERE= de chaque dataset), 0 sinon. Sans END= déclaré,
+    /// no-op. La détection se fait par un balayage en avant NON destructif
+    /// (les curseurs ne sont pas modifiés).
+    fn set_end_flag(&mut self) {
+        if self.ctx.end_flag.is_none() {
+            return;
+        }
+        let has_more = self.concat_has_more();
+        if let Some((_, v)) = &mut self.ctx.end_flag {
+            *v = if has_more { 0.0 } else { 1.0 };
+        }
+    }
+
+    /// Balaye en avant (sans muter les curseurs) pour savoir s'il reste au
+    /// moins une observation lisible APRÈS la position courante, en respectant
+    /// le WHERE= de chaque dataset. Sert END= en mode concaténation.
+    fn concat_has_more(&mut self) -> bool {
+        let Some(input) = self.input.take() else {
+            return false;
+        };
+        // Le balayage évalue éventuellement des WHERE= sur des lignes JAMAIS
+        // réellement lues : il ne doit donc émettre AUCUNE NOTE/erreur. On
+        // mémorise l'état des compteurs de l'évaluateur et on le restaure à la
+        // fin (le vrai chargement, lui, comptabilise normalement).
+        let saved_ctx = (
+            self.ctx.missing_generated,
+            self.ctx.division_by_zero,
+            self.ctx.note_num_to_char,
+            self.ctx.note_char_to_num,
+            self.ctx.invalid_data,
+            self.ctx.error_flag,
+            self.ctx.fatal.take(),
+        );
+        let mut found = false;
+        'outer: for d in self.cur_ds..input.datasets.len() {
+            let ds = &input.datasets[d];
+            let start = if d == self.cur_ds { self.cursors[d] } else { 0 };
+            for row in start..ds.n_rows {
+                match &ds.where_ {
+                    None => {
+                        found = true;
+                        break 'outer;
+                    }
+                    Some(w) => {
+                        // Évalue le WHERE= sur une COPIE des valeurs de la ligne
+                        // chargées dans le PDV, puis restaure (le balayage ne
+                        // doit pas laisser de trace). On sauvegarde/restaure les
+                        // slots touchés.
+                        let saved: Vec<(usize, Value)> = ds
+                            .var_slots
+                            .iter()
+                            .map(|&s| (s, self.pdv.get(s).clone()))
+                            .collect();
+                        for (col, slot) in ds.columns.iter().zip(&ds.var_slots) {
+                            self.pdv.set(*slot, col[row].clone());
+                        }
+                        let v = eval(w, &self.pdv, &mut self.ctx);
+                        // Restaure les slots (le balayage ne laisse aucune
+                        // trace sur le PDV).
+                        for (slot, val) in saved {
+                            self.pdv.set(slot, val);
+                        }
+                        if v.truthy() {
+                            found = true;
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+        // Restaure intégralement les compteurs de l'évaluateur.
+        (
+            self.ctx.missing_generated,
+            self.ctx.division_by_zero,
+            self.ctx.note_num_to_char,
+            self.ctx.note_char_to_num,
+            self.ctx.invalid_data,
+            self.ctx.error_flag,
+            self.ctx.fatal,
+        ) = saved_ctx;
+        self.input = Some(input);
+        found
+    }
+
+    /// SET ... POINT= (M16.4) : ACCÈS DIRECT. Lit la valeur de la variable
+    /// d'index (slot `point_slot`), l'arrondit à l'entier (sémantique SAS),
+    /// et charge l'observation correspondante (1-based). Avec plusieurs
+    /// datasets en concaténation, l'index est GLOBAL (1..total, parcourant les
+    /// datasets dans l'ordre du SET). Index missing / non entier valide /
+    /// hors bornes [1, total] → ERROR "Error in variable p." (l'étape
+    /// s'arrête). N'avance AUCUN curseur (l'utilisateur pilote l'itération) et
+    /// ne compte pas dans les NOTEs "There were N observations read" au sens
+    /// d'un balayage séquentiel — mais on incrémente `rows_read` du dataset
+    /// servi pour rester cohérent avec le décompte SAS d'obs lues.
+    fn exec_set_point(&mut self) -> Result<Flow> {
+        let Some(input) = self.input.take() else {
+            return Err(SasError::runtime("SET statement without input data."));
+        };
+        let point_slot = input.point_slot.expect("exec_set_point requires POINT=");
+        let total: usize = input.datasets.iter().map(|d| d.n_rows).sum();
+        let point_name = self.pdv.vars()[point_slot].name.clone();
+
+        // Lecture + coercition de l'index. Une valeur missing ou non
+        // convertible → erreur SAS sur la variable d'index.
+        let idx_val = self.pdv.get(point_slot).clone();
+        let idx = match coerce_num(&idx_val, &mut self.ctx) {
+            Some(f) => f.round() as i64,
+            None => {
+                self.input = Some(input);
+                self.pdv.error_ = true;
+                return Err(SasError::runtime(format!(
+                    "Error in variable {point_name}."
+                )));
+            }
+        };
+        if idx < 1 || (idx as usize) > total {
+            self.input = Some(input);
+            self.pdv.error_ = true;
+            return Err(SasError::runtime(format!("Error in variable {point_name}.")));
+        }
+
+        // Localiser l'observation globale `idx` (1-based) dans la concaténation.
+        let mut remaining = idx as usize - 1; // 0-based offset global
+        let mut target: Option<(usize, usize)> = None;
+        for (d, ds) in input.datasets.iter().enumerate() {
+            if remaining < ds.n_rows {
+                target = Some((d, remaining));
+                break;
+            }
+            remaining -= ds.n_rows;
+        }
+        let (d, row) = target.expect("index validated against total");
+        let ds = &input.datasets[d];
+        for (col, slot) in ds.columns.iter().zip(&ds.var_slots) {
+            self.pdv.set(*slot, col[row].clone());
+        }
+        self.rows_read[d] += 1;
+        // END= avec POINT= : 1 si l'index pointe la DERNIÈRE observation.
+        if let Some((_, v)) = &mut self.ctx.end_flag {
+            *v = if (idx as usize) == total { 1.0 } else { 0.0 };
+        }
+        self.input = Some(input);
+        Ok(Flow::Normal)
+    }
+
+    /// MODIFY+POINT= (M16.5) : au marqueur MODIFY, on CAPTURE la ligne
+    /// précédemment chargée (les assignations qui l'ont suivie sont ses
+    /// modifications), puis on CHARGE l'obs à l'index POINT= courant (1-based,
+    /// arrondi). Index missing / hors bornes → erreur différée (relevée par la
+    /// boucle externe). L'état partagé est `self.modify_state`.
+    fn exec_modify_point(&mut self) -> Result<Flow> {
+        // Capture de la ligne précédente.
+        let mut state = self.modify_state.take().expect("modify_state present");
+        capture_modify_state(&mut state, &self.pdv);
+        // Index POINT= courant.
+        let idx_val = self.pdv.get(state.point_slot).clone();
+        let idx = match coerce_num(&idx_val, &mut self.ctx) {
+            Some(f) => f.round() as i64,
+            None => {
+                state.error = Some(format!("Invalid POINT= value for the data set {}.", state.display));
+                self.modify_state = Some(state);
+                self.pdv.error_ = true;
+                return Ok(Flow::EndStep);
+            }
+        };
+        if idx < 1 || (idx as usize) > state.n_rows {
+            state.error = Some(format!("Invalid POINT= value for the data set {}.", state.display));
+            self.modify_state = Some(state);
+            self.pdv.error_ = true;
+            return Ok(Flow::EndStep);
+        }
+        let row = idx as usize - 1;
+        // Charger la ligne `row` depuis le tampon (qui peut déjà porter des
+        // modifications d'un tour précédent — fidèle à la réécriture en place).
+        for (pos, &slot) in state.var_slots.iter().enumerate() {
+            self.pdv.set(slot, state.cols[pos][row].clone());
+        }
+        state.touched[row] = true;
+        state.cur_row = Some(row);
+        self.modify_state = Some(state);
+        Ok(Flow::Normal)
     }
 
     /// SET avec BY = INTERCLASSEMENT : parmi les datasets non épuisés,
@@ -1342,6 +2531,10 @@ impl Runner {
             };
         }
         self.prev_keys = Some(cur_keys);
+        // END= (M16.4) : 1 si plus aucune observation à interclasser.
+        if let Some((_, v)) = &mut self.ctx.end_flag {
+            *v = if next_keys.is_none() { 1.0 } else { 0.0 };
+        }
         Ok(Flow::Normal)
     }
 
@@ -1614,24 +2807,33 @@ impl Runner {
         Ok(())
     }
 
-    /// Résout l'indice d'une assignation indexée en slot PDV : coercition
-    /// numérique (mêmes règles que `eval::coerce_num`), arrondi au plus
-    /// proche ; missing ou hors 1..=dim → erreur qui stoppe l'étape.
-    fn resolve_subscript(&mut self, array: &str, idx_val: Value) -> Result<usize> {
-        let idx = coerce_num(&idx_val, &mut self.ctx).map(f64::round);
-        if self.ctx.error_flag {
-            self.pdv.error_ = true;
-            self.ctx.error_flag = false;
+    /// Résout un sous-script d'array (un ou plusieurs indices) en slot PDV :
+    /// coercition numérique (mêmes règles que `eval::coerce_num`), arrondi au
+    /// plus proche ; missing, hors bornes ou nombre d'indices invalide →
+    /// erreur qui stoppe l'étape. Un index unique sur un array multi-dim est
+    /// interprété linéairement (row-major).
+    fn resolve_subscript(&mut self, array: &str, idx_vals: &[Value]) -> Result<usize> {
+        let mut idxs: Vec<i64> = Vec::with_capacity(idx_vals.len());
+        for idx_val in idx_vals {
+            let idx = coerce_num(idx_val, &mut self.ctx).map(f64::round);
+            if self.ctx.error_flag {
+                self.pdv.error_ = true;
+                self.ctx.error_flag = false;
+            }
+            match idx {
+                Some(i) => idxs.push(i as i64),
+                None => return Err(SasError::runtime("Array subscript out of range.")),
+            }
         }
-        let Some(slots) = self.ctx.arrays.get(&array.to_uppercase()) else {
+        let Some(def) = self.ctx.arrays.get(&array.to_uppercase()) else {
             // Impossible après compile() ; garde-fou.
             return Err(SasError::runtime(format!(
                 "Undeclared array referenced: {array}."
             )));
         };
-        match idx {
-            Some(i) if i >= 1.0 && i <= slots.len() as f64 => Ok(slots[i as usize - 1]),
-            _ => Err(SasError::runtime("Array subscript out of range.")),
+        match def.linear_index(&idxs) {
+            Some(lin) => Ok(def.slots[lin]),
+            None => Err(SasError::runtime("Array subscript out of range.")),
         }
     }
 
@@ -1721,6 +2923,225 @@ impl Runner {
         Ok(Flow::Normal)
     }
 
+    /// DO sur une liste de valeurs (M16.3). L'index prend successivement
+    /// chaque valeur de la liste développée (valeurs explicites évaluées une
+    /// par une ; sous-listes `from to e [by k]` énumérées comme un DO
+    /// classique). Le corps s'exécute une fois par valeur ; un Flow non
+    /// Normal du corps sort de la boucle et remonte.
+    fn exec_do_list(
+        &mut self,
+        index: &str,
+        items: &[crate::ast::DoListItem],
+        body: &[DsStmt],
+    ) -> Result<Flow> {
+        use crate::ast::DoListItem;
+        let Some(idx_slot) = self.pdv.slot(index) else {
+            return Err(SasError::runtime(format!(
+                "Variable {index} is not addressable."
+            )));
+        };
+        let idx_ty = self.pdv.vars()[idx_slot].ty;
+        let mut iters: u64 = 0;
+        for item in items {
+            match item {
+                DoListItem::Value(e) => {
+                    let v = self.eval_checked(e)?;
+                    let coerced = self.coerce_assign(v, idx_ty);
+                    self.pdv.set(idx_slot, coerced);
+                    if let Some(f) = self.run_do_list_body(body)? {
+                        return Ok(f);
+                    }
+                    self.bump_do_list_guard(&mut iters)?;
+                }
+                DoListItem::Range { from, to, by } => {
+                    let from_v = self.loop_control(from)?;
+                    let to_v = self.loop_control(to)?;
+                    let by_v = match by {
+                        Some(b) => self.loop_control(b)?,
+                        None => 1.0,
+                    };
+                    if by_v == 0.0 {
+                        return Err(SasError::runtime(
+                            "Invalid DO loop control information.",
+                        ));
+                    }
+                    let mut cur = from_v;
+                    loop {
+                        if (by_v > 0.0 && cur > to_v) || (by_v < 0.0 && cur < to_v) {
+                            break;
+                        }
+                        self.pdv.set(idx_slot, Value::Num(cur));
+                        if let Some(f) = self.run_do_list_body(body)? {
+                            return Ok(f);
+                        }
+                        self.bump_do_list_guard(&mut iters)?;
+                        cur += by_v;
+                    }
+                }
+            }
+        }
+        Ok(Flow::Normal)
+    }
+
+    /// Exécute le corps d'un DO (liste/over) ; renvoie `Some(flow)` si un Flow
+    /// non Normal doit remonter, `None` sinon.
+    fn run_do_list_body(&mut self, body: &[DsStmt]) -> Result<Option<Flow>> {
+        for s in body {
+            let f = self.exec_stmt(s)?;
+            if f != Flow::Normal {
+                return Ok(Some(f));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Pilote de niveau supérieur d'UNE itération de l'étape (M16.6). Exécute
+    /// les statements de premier niveau via un COMPTEUR DE PROGRAMME, ce qui
+    /// permet GOTO (saut), LINK (appel de sous-routine, pile d'adresses de
+    /// retour) et RETURN (dépile). Sans aucune de ces directives, c'est un
+    /// parcours séquentiel équivalent à `for stmt in stmts`.
+    ///
+    /// Renvoie le `Flow` TERMINAL de l'itération vu par la boucle implicite :
+    /// `Normal` (corps épuisé → output implicite), `NextIter` (DELETE / IF
+    /// subsetting faux → pas d'output) ou `EndStep` (STOP / fin d'entrée).
+    /// Les `Flow::Goto/Link/Return` sont entièrement consommés ici (jamais
+    /// remontés au-delà).
+    ///
+    /// Sémantique RETURN : avec un LINK actif, dépile l'adresse de retour ;
+    /// sans LINK actif (pile vide), RETURN termine l'itération NORMALEMENT
+    /// (output implicite), comme en SAS. Un LINK sans RETURN atteignant la fin
+    /// du corps fait simplement tomber le PC en bout de liste (retour implicite
+    /// en fin d'étape).
+    fn run_step_body(&mut self) -> Result<Flow> {
+        let program = self.program.clone();
+        let flow_labels = self.flow_labels.clone();
+        let mut pc: usize = 0;
+        // Garde-fou anti-boucle (GOTO pouvant boucler indéfiniment).
+        let mut steps: u64 = 0;
+        while pc < program.len() {
+            steps += 1;
+            if steps > 100_000_000 {
+                return Err(SasError::runtime(
+                    "DATA step control flow (GOTO/LINK) appears to loop infinitely; stopping.",
+                ));
+            }
+            match self.exec_stmt(&program[pc])? {
+                Flow::Normal => pc += 1,
+                Flow::NextIter => return Ok(Flow::NextIter),
+                Flow::EndStep => return Ok(Flow::EndStep),
+                Flow::Goto(label) => {
+                    // Cible validée à la compilation : présente dans flow_labels.
+                    let Some(&target) = flow_labels.get(&label) else {
+                        return Err(SasError::runtime(format!(
+                            "The statement label {label} is not defined in the DATA step."
+                        )));
+                    };
+                    pc = target;
+                }
+                // RETURN au niveau supérieur (hors sous-routine LINK) : fin
+                // d'itération normale (output implicite), comme en SAS.
+                Flow::Return => return Ok(Flow::Normal),
+            }
+        }
+        // Corps épuisé : fin d'itération normale.
+        Ok(Flow::Normal)
+    }
+
+    /// Exécute INLINE le corps d'une sous-routine LINK (M16.6) : du statement
+    /// étiqueté `label` (premier niveau) jusqu'au prochain `RETURN` (ou la fin
+    /// de l'étape). Renvoie le `Flow` à propager au-delà du LINK :
+    /// - `Flow::Normal` après un RETURN (ou la fin de l'étape) → on reprend
+    ///   normalement après le LINK ;
+    /// - `Flow::NextIter`/`EndStep` (DELETE/STOP/fin d'entrée dans la
+    ///   sous-routine) → remontés tels quels (terminent l'itération/l'étape) ;
+    /// - `Flow::Goto` (GOTO dans la sous-routine) → remonté pour saut non local.
+    ///
+    /// Un LINK imbriqué (`link` dans la sous-routine) récursionne ici : la pile
+    /// d'appels Rust EST la pile d'adresses de retour.
+    fn exec_link_subroutine(&mut self, label: &str) -> Result<Flow> {
+        let program = self.program.clone();
+        let flow_labels = self.flow_labels.clone();
+        let Some(&start) = flow_labels.get(label) else {
+            return Err(SasError::runtime(format!(
+                "The statement label {label} is not defined in the DATA step."
+            )));
+        };
+        let mut pc = start;
+        let mut steps: u64 = 0;
+        while pc < program.len() {
+            steps += 1;
+            if steps > 100_000_000 {
+                return Err(SasError::runtime(
+                    "DATA step control flow (LINK) appears to loop infinitely; stopping.",
+                ));
+            }
+            match self.exec_stmt(&program[pc])? {
+                Flow::Normal => pc += 1,
+                // RETURN : fin de la sous-routine → reprise après le LINK.
+                Flow::Return => return Ok(Flow::Normal),
+                // GOTO dans une sous-routine : saut non local (remonté au
+                // pilote de niveau supérieur, qui repositionne le PC global —
+                // la sous-routine est abandonnée, comme en SAS).
+                Flow::Goto(label) => return Ok(Flow::Goto(label)),
+                // DELETE / STOP / fin d'entrée : terminent l'itération/l'étape.
+                Flow::NextIter => return Ok(Flow::NextIter),
+                Flow::EndStep => return Ok(Flow::EndStep),
+            }
+        }
+        // Fin de l'étape atteinte sans RETURN : retour implicite.
+        Ok(Flow::Normal)
+    }
+
+    /// Garde-fou anti-boucle infinie partagé par DO liste / DO OVER.
+    fn bump_do_list_guard(&self, iters: &mut u64) -> Result<()> {
+        *iters += 1;
+        if *iters > 10_000_000 {
+            return Err(SasError::runtime(
+                "DO loop exceeded 10000000 iterations; stopping (possible infinite loop).",
+            ));
+        }
+        Ok(())
+    }
+
+    /// DO OVER (M16.3) : itère implicitement sur les éléments d'un array dans
+    /// l'ordre row-major (= ordre des `slots`, déjà row-major par
+    /// construction). À chaque tour, le slot de l'élément courant est exposé
+    /// via `ctx.do_over` (référence nue au nom de l'array = élément courant).
+    /// Un Flow non Normal du corps sort de la boucle, en restaurant l'état
+    /// `do_over` précédent.
+    fn exec_do_over(&mut self, array: &str, body: &[DsStmt]) -> Result<Flow> {
+        let upper = array.to_uppercase();
+        let Some(def) = self.ctx.arrays.get(&upper) else {
+            return Err(SasError::runtime(format!(
+                "Undeclared array referenced: {array}."
+            )));
+        };
+        let slots = def.slots.clone();
+        // Sauvegarde de l'entrée éventuellement masquée (DO OVER imbriqués sur
+        // le même nom — improbable, mais correct).
+        let prev = self.ctx.do_over.remove(&upper);
+        let mut iters: u64 = 0;
+        let mut out = Flow::Normal;
+        for slot in slots {
+            self.ctx.do_over.insert(upper.clone(), slot);
+            if let Some(f) = self.run_do_list_body(body)? {
+                out = f;
+                break;
+            }
+            self.bump_do_list_guard(&mut iters)?;
+        }
+        // Restaure l'état précédent.
+        match prev {
+            Some(p) => {
+                self.ctx.do_over.insert(upper, p);
+            }
+            None => {
+                self.ctx.do_over.remove(&upper);
+            }
+        }
+        Ok(out)
+    }
+
     /// Valeur courante de l'index pour le test TO. Un index rendu missing
     /// par le corps se classe SOUS tous les nombres (ordre SAS) :
     /// -inf fait sortir avec by<0 et continuer avec by>0.
@@ -1784,6 +3205,59 @@ impl Runner {
     }
 
     /// Évalue, propage les fatals, reporte `_ERROR_` au PDV.
+    /// SELECT/WHEN/OTHERWISE (M16.1). Cherche la PREMIÈRE clause WHEN qui
+    /// correspond, exécute son corps et retourne (pas de fall-through). Sinon
+    /// OTHERWISE s'il existe, sinon erreur runtime fidèle à SAS.
+    ///
+    /// Forme sélecteur (`selector = Some`) : le sélecteur est évalué UNE seule
+    /// fois ; chaque valeur de WHEN est comparée avec la sémantique `=` de SAS
+    /// (`sas_values_equal`). Forme booléenne (`selector = None`) : chaque WHEN
+    /// porte une unique condition évaluée en contexte booléen.
+    fn exec_select(
+        &mut self,
+        selector: Option<&crate::ast::Expr>,
+        whens: &[crate::ast::WhenClause],
+        otherwise: Option<&DsStmt>,
+    ) -> Result<Flow> {
+        // Sélecteur évalué une seule fois (sémantique SAS).
+        let sel_val = match selector {
+            Some(expr) => Some(self.eval_checked(expr)?),
+            None => None,
+        };
+        for when in whens {
+            let matched = match &sel_val {
+                // Forme sélecteur : vrai si le sélecteur égale l'une des
+                // valeurs listées (court-circuit dès le premier match).
+                Some(sv) => {
+                    let mut hit = false;
+                    for v in &when.values {
+                        let val = self.eval_checked(v)?;
+                        if sas_values_equal(sv.clone(), val, &mut self.ctx) {
+                            hit = true;
+                            break;
+                        }
+                    }
+                    hit
+                }
+                // Forme booléenne : la condition (unique) est vraie ?
+                None => {
+                    // Le parser garantit exactement une expression ici.
+                    let cond = &when.values[0];
+                    self.eval_checked(cond)?.truthy()
+                }
+            };
+            if matched {
+                return self.exec_stmt(&when.body);
+            }
+        }
+        match otherwise {
+            Some(body) => self.exec_stmt(body),
+            None => Err(SasError::runtime(
+                "The WHEN list does not match any clause and there is no OTHERWISE clause.",
+            )),
+        }
+    }
+
     fn eval_checked(&mut self, expr: &crate::ast::Expr) -> Result<Value> {
         let v = eval(expr, &self.pdv, &mut self.ctx);
         if let Some(msg) = self.ctx.fatal.take() {
@@ -1928,169 +3402,6 @@ fn choose_next(
         }
     }
     best
-}
-
-/// Applique un informat à un texte brut (M14.1) via un catalogue builtin
-/// par défaut (les informats utilisateur de PROC FORMAT ne sont pas couverts
-/// dans l'INPUT — divergence documentée). Réutilise
-/// `FormatCatalog::informat` : le piège des décimales implicites (`w.d`
-/// applique `d` décimales SI la donnée n'a pas de point décimal) y est déjà
-/// géré (cf. `formats::builtin::informat_builtin`).
-fn apply_informat(s: &str, spec: &crate::formats::FormatSpec) -> Value {
-    let catalog = crate::formats::FormatCatalog::default();
-    catalog.informat(s, spec)
-}
-
-/// Sous-chaîne par colonnes 1-based inclusives `[a, b]` (column input).
-/// Comptée en CARACTÈRES (pas octets). Au-delà de la fin → ce qui reste.
-fn substr_cols(line: &str, a: usize, b: usize) -> String {
-    let chars: Vec<char> = line.chars().collect();
-    let start = a.saturating_sub(1);
-    let end = b.min(chars.len());
-    if start >= chars.len() || start >= end {
-        return String::new();
-    }
-    chars[start..end].iter().collect()
-}
-
-/// Sous-chaîne de largeur `w` à partir de la colonne 1-based `col`
-/// (formatted input). Comptée en caractères.
-fn substr_from(line: &str, col: usize, w: usize) -> String {
-    let chars: Vec<char> = line.chars().collect();
-    let start = col.saturating_sub(1);
-    if start >= chars.len() {
-        return String::new();
-    }
-    let end = (start + w).min(chars.len());
-    chars[start..end].iter().collect()
-}
-
-/// Lecteur de champs pour le list input (M14.1). Découpe une ligne en
-/// champs selon les délimiteurs (blancs par défaut, ou DLM=/DSD). Gère :
-/// - délimiteurs multiples consécutifs : en mode blanc, plusieurs blancs =
-///   UN séparateur ; en DSD, deux délimiteurs consécutifs = valeur manquante ;
-/// - DSD : valeurs entre guillemets (`"..."`), guillemets retirés, délimiteur
-///   dans les quotes ignoré.
-struct FieldReader {
-    chars: Vec<char>,
-    pos: usize,
-    /// Délimiteurs effectifs. Vide = découpage par blancs.
-    delims: Vec<char>,
-    dsd: bool,
-}
-
-impl FieldReader {
-    fn new(line: &str, delims: &[char], dsd: bool) -> Self {
-        FieldReader {
-            chars: line.chars().collect(),
-            pos: 0,
-            delims: delims.to_vec(),
-            dsd,
-        }
-    }
-
-    fn new_owned(line: String, delims: &[char], dsd: bool) -> Self {
-        FieldReader {
-            chars: line.chars().collect(),
-            pos: 0,
-            delims: delims.to_vec(),
-            dsd,
-        }
-    }
-
-    /// Ligne brute (pour column/formatted input).
-    fn line(&self) -> String {
-        self.chars.iter().collect()
-    }
-
-    /// Repositionne le curseur de champ sur la colonne 1-based `col`.
-    fn seek_col(&mut self, col: usize) {
-        self.pos = col.saturating_sub(1).min(self.chars.len());
-    }
-
-    fn is_delim(&self, c: char) -> bool {
-        if self.delims.is_empty() {
-            c == ' ' || c == '\t'
-        } else {
-            self.delims.contains(&c)
-        }
-    }
-
-    /// Prochain champ. `None` = fin de ligne atteinte sans champ à lire
-    /// (fin prématurée). Sémantique :
-    /// - mode blanc : saute les blancs de tête, lit jusqu'au prochain blanc ;
-    /// - mode DSD : un champ peut être vide (deux délimiteurs consécutifs =
-    ///   missing) ; les quotes encadrent une valeur littérale.
-    fn next_field(&mut self) -> Option<String> {
-        if self.dsd {
-            self.next_field_dsd()
-        } else {
-            self.next_field_plain()
-        }
-    }
-
-    fn next_field_plain(&mut self) -> Option<String> {
-        // Saute les délimiteurs de tête (blancs consécutifs = un séparateur).
-        while self.pos < self.chars.len() && self.is_delim(self.chars[self.pos]) {
-            self.pos += 1;
-        }
-        if self.pos >= self.chars.len() {
-            return None;
-        }
-        let start = self.pos;
-        while self.pos < self.chars.len() && !self.is_delim(self.chars[self.pos]) {
-            self.pos += 1;
-        }
-        Some(self.chars[start..self.pos].iter().collect())
-    }
-
-    fn next_field_dsd(&mut self) -> Option<String> {
-        if self.pos > self.chars.len() {
-            return None;
-        }
-        // En DSD, après la fin de la ligne, plus aucun champ.
-        if self.pos == self.chars.len() {
-            // Position pile en fin : il n'y a plus de champ à servir.
-            return None;
-        }
-        // Valeur entre guillemets.
-        if self.chars[self.pos] == '"' {
-            self.pos += 1;
-            let mut out = String::new();
-            while self.pos < self.chars.len() {
-                let c = self.chars[self.pos];
-                if c == '"' {
-                    // Guillemet doublé = guillemet littéral.
-                    if self.pos + 1 < self.chars.len() && self.chars[self.pos + 1] == '"' {
-                        out.push('"');
-                        self.pos += 2;
-                        continue;
-                    }
-                    self.pos += 1; // guillemet fermant
-                    break;
-                }
-                out.push(c);
-                self.pos += 1;
-            }
-            // Consomme le délimiteur suivant éventuel.
-            if self.pos < self.chars.len() && self.is_delim(self.chars[self.pos]) {
-                self.pos += 1;
-            }
-            return Some(out);
-        }
-        // Champ non quoté : lit jusqu'au prochain délimiteur.
-        let start = self.pos;
-        while self.pos < self.chars.len() && !self.is_delim(self.chars[self.pos]) {
-            self.pos += 1;
-        }
-        let field: String = self.chars[start..self.pos].iter().collect();
-        // Consomme le délimiteur (un seul ; deux consécutifs = champ vide
-        // suivant).
-        if self.pos < self.chars.len() && self.is_delim(self.chars[self.pos]) {
-            self.pos += 1;
-        }
-        Some(field)
-    }
 }
 
 #[cfg(test)]
@@ -2685,6 +3996,276 @@ mod tests {
             Some("abcdefgh")
         );
         assert_eq!(ds.vars[0].length, 8);
+    }
+
+    // ── M16.2 : arrays multi-dimensionnels, valeurs initiales, DIM/HBOUND/
+    //    LBOUND, _TEMPORARY_/_NUMERIC_/_CHARACTER_/_ALL_ ─────────────────
+
+    #[test]
+    fn array_2d_creation_and_access_row_major() {
+        let mut s = session();
+        // 2×3 array sur 6 variables ; remplissage row-major v(i,j) = i*10+j.
+        run(
+            "data out; array m{2,3} v1-v6; do i = 1 to 2; do j = 1 to 3; \
+             m{i,j} = i*10 + j; end; end; run;",
+            &mut s,
+        )
+        .unwrap();
+        // Ordre row-major : v1=m(1,1), v2=m(1,2), v3=m(1,3), v4=m(2,1)...
+        assert_eq!(num_at(&s, "out", "v1", 0), Some(11.0));
+        assert_eq!(num_at(&s, "out", "v2", 0), Some(12.0));
+        assert_eq!(num_at(&s, "out", "v3", 0), Some(13.0));
+        assert_eq!(num_at(&s, "out", "v4", 0), Some(21.0));
+        assert_eq!(num_at(&s, "out", "v5", 0), Some(22.0));
+        assert_eq!(num_at(&s, "out", "v6", 0), Some(23.0));
+    }
+
+    #[test]
+    fn array_3d_creation_and_access() {
+        let mut s = session();
+        // 2×3×2 = 12 slots, éléments auto-nommés t1..t12.
+        run(
+            "data out; array t{2,3,2}; \
+             t{1,1,1} = 1; t{1,1,2} = 2; t{2,3,2} = 99; \
+             a = t{1,1,1}; b = t{1,1,2}; c = t{2,3,2}; run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(num_at(&s, "out", "a", 0), Some(1.0));
+        assert_eq!(num_at(&s, "out", "b", 0), Some(2.0));
+        assert_eq!(num_at(&s, "out", "c", 0), Some(99.0));
+        // t1 = (1,1,1) ; t12 = (2,3,2).
+        assert_eq!(num_at(&s, "out", "t1", 0), Some(1.0));
+        assert_eq!(num_at(&s, "out", "t12", 0), Some(99.0));
+    }
+
+    #[test]
+    fn array_linear_index_on_multidim() {
+        let mut s = session();
+        // Accès linéaire `m{n}` sur un array 2-D (interprétation row-major).
+        run(
+            "data out; array m{2,3} v1-v6; do n = 1 to 6; m{n} = n*n; end; \
+             a = m{1,1}; f = m{2,3}; run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(num_at(&s, "out", "v1", 0), Some(1.0));
+        assert_eq!(num_at(&s, "out", "v6", 0), Some(36.0));
+        assert_eq!(num_at(&s, "out", "a", 0), Some(1.0));
+        assert_eq!(num_at(&s, "out", "f", 0), Some(36.0));
+    }
+
+    #[test]
+    fn array_initial_values_row_major() {
+        let mut s = session();
+        run(
+            "data out; array a{2,2} (1, 2, 3, 4); \
+             p = a{1,1}; q = a{1,2}; r = a{2,1}; t = a{2,2}; run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(num_at(&s, "out", "p", 0), Some(1.0));
+        assert_eq!(num_at(&s, "out", "q", 0), Some(2.0));
+        assert_eq!(num_at(&s, "out", "r", 0), Some(3.0));
+        assert_eq!(num_at(&s, "out", "t", 0), Some(4.0));
+    }
+
+    #[test]
+    fn array_initial_values_space_separated_1d() {
+        let mut s = session();
+        run(
+            "data out; array a{3} x y z (10 20 30); run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(num_at(&s, "out", "x", 0), Some(10.0));
+        assert_eq!(num_at(&s, "out", "y", 0), Some(20.0));
+        assert_eq!(num_at(&s, "out", "z", 0), Some(30.0));
+    }
+
+    #[test]
+    fn array_dim_hbound_lbound_functions() {
+        let mut s = session();
+        run(
+            "data out; array m{2,3} v1-v6; \
+             nd = dim(m); n1 = dim(m, 1); n2 = dim(m, 2); \
+             hb = hbound(m); hb2 = hbound(m, 2); \
+             lb = lbound(m); lb2 = lbound(m, 2); run;",
+            &mut s,
+        )
+        .unwrap();
+        // dim(m) sans n = 1re dimension = 2 ; dim(m,2) = 3.
+        assert_eq!(num_at(&s, "out", "nd", 0), Some(2.0));
+        assert_eq!(num_at(&s, "out", "n1", 0), Some(2.0));
+        assert_eq!(num_at(&s, "out", "n2", 0), Some(3.0));
+        // hbound = borne supérieure (= dim, lbound=1).
+        assert_eq!(num_at(&s, "out", "hb", 0), Some(2.0));
+        assert_eq!(num_at(&s, "out", "hb2", 0), Some(3.0));
+        // lbound toujours 1.
+        assert_eq!(num_at(&s, "out", "lb", 0), Some(1.0));
+        assert_eq!(num_at(&s, "out", "lb2", 0), Some(1.0));
+    }
+
+    #[test]
+    fn array_dim_on_1d_array() {
+        let mut s = session();
+        run(
+            "data out; array a{5} a1-a5; d = dim(a); h = hbound(a); l = lbound(a); run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(num_at(&s, "out", "d", 0), Some(5.0));
+        assert_eq!(num_at(&s, "out", "h", 0), Some(5.0));
+        assert_eq!(num_at(&s, "out", "l", 0), Some(1.0));
+    }
+
+    #[test]
+    fn array_temporary_elements_not_in_output() {
+        let mut s = session();
+        run(
+            "data out; array t{3} _temporary_ (100 200 300); \
+             total = t{1} + t{2} + t{3}; run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(num_at(&s, "out", "total", 0), Some(600.0));
+        let ds = read_work(&s, "out");
+        // Les éléments temporaires ne sont PAS des colonnes de sortie.
+        let cols: Vec<&str> = ds.df.get_column_names().iter().map(|s| s.as_str()).collect();
+        assert_eq!(cols, vec!["total"], "temporary elements must not be output");
+    }
+
+    #[test]
+    fn array_temporary_retained_across_iterations() {
+        let mut s = session();
+        write_class(&s, "inp");
+        // Les éléments _TEMPORARY_ sont retenus : un compteur accumule
+        // (valeur initiale 0, puis +1 par itération).
+        run(
+            "data out; set inp; array acc{1} _temporary_ (0); \
+             acc{1} = acc{1} + 1; n = acc{1}; run;",
+            &mut s,
+        )
+        .unwrap();
+        // 3 observations → n vaut 1, 2, 3 (retenu, pas remis à missing).
+        assert_eq!(num_at(&s, "out", "n", 0), Some(1.0));
+        assert_eq!(num_at(&s, "out", "n", 1), Some(2.0));
+        assert_eq!(num_at(&s, "out", "n", 2), Some(3.0));
+    }
+
+    #[test]
+    fn array_numeric_special_list() {
+        let mut s = session();
+        // _NUMERIC_ : toutes les variables numériques déjà connues.
+        run(
+            "data out; x = 1; y = 2; z = 3; array nums{*} _numeric_; \
+             d = dim(nums); s = 0; do i = 1 to dim(nums); s = s + nums{i}; end; run;",
+            &mut s,
+        )
+        .unwrap();
+        // x, y, z sont les 3 numériques (i, d, s entrent APRÈS l'ARRAY).
+        assert_eq!(num_at(&s, "out", "d", 0), Some(3.0));
+        assert_eq!(num_at(&s, "out", "s", 0), Some(6.0));
+    }
+
+    #[test]
+    fn array_character_special_list() {
+        let mut s = session();
+        run(
+            "data out; a = 'foo'; b = 'bar'; array chs{*} $ _character_; \
+             d = dim(chs); chs{1} = 'NEW'; run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(num_at(&s, "out", "d", 0), Some(2.0));
+        let ds = read_work(&s, "out");
+        // chs{1} pointe sur la 1re variable char (a).
+        assert_eq!(ds.df.column("a").unwrap().str().unwrap().get(0), Some("NEW"));
+    }
+
+    #[test]
+    fn array_mixing_1d_and_multidim() {
+        let mut s = session();
+        // Une étape avec un array 1-D et un array 2-D coexistants.
+        run(
+            "data out; array a{3} a1-a3; array m{2,2} m1-m4; \
+             do i = 1 to 3; a{i} = i; end; \
+             m{1,1} = 9; m{2,2} = 8; \
+             da = dim(a); dm = dim(m); dm2 = dim(m,2); run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(num_at(&s, "out", "a2", 0), Some(2.0));
+        assert_eq!(num_at(&s, "out", "m1", 0), Some(9.0));
+        assert_eq!(num_at(&s, "out", "m4", 0), Some(8.0));
+        assert_eq!(num_at(&s, "out", "da", 0), Some(3.0));
+        assert_eq!(num_at(&s, "out", "dm", 0), Some(2.0));
+        assert_eq!(num_at(&s, "out", "dm2", 0), Some(2.0));
+    }
+
+    #[test]
+    fn array_2d_out_of_bounds_stops_step() {
+        // Indice de dimension hors bornes : arrêt avec ERROR.
+        let out = crate::run(
+            "data out; array m{2,3} v1-v6; m{3,1} = 1; run;",
+            crate::RunOptions {
+                work_dir: None,
+                base_dir: None,
+                deterministic: true,
+                vectorize: false,
+            },
+        );
+        assert_eq!(out.exit_code, 2, "log was:\n{}", out.log);
+        assert!(
+            out.log.contains("ERROR: Array subscript out of range."),
+            "log was:\n{}",
+            out.log
+        );
+    }
+
+    #[test]
+    fn array_2d_wrong_index_count_stops_step() {
+        // 2 indices attendus, 3 fournis → hors bornes.
+        let out = crate::run(
+            "data out; array m{2,3} v1-v6; t = m{1,2,1}; run;",
+            crate::RunOptions {
+                work_dir: None,
+                base_dir: None,
+                deterministic: true,
+                vectorize: false,
+            },
+        );
+        assert_eq!(out.exit_code, 2, "log was:\n{}", out.log);
+        assert!(
+            out.log.contains("ERROR: Array subscript out of range."),
+            "log was:\n{}",
+            out.log
+        );
+    }
+
+    #[test]
+    fn array_initial_too_many_values_errors() {
+        let mut s = session();
+        match run("data out; array a{2} x y (1 2 3); run;", &mut s) {
+            Err(e) => assert!(
+                e.to_string().contains("Too many initial values"),
+                "wrong error message: {e}"
+            ),
+            Ok(_) => panic!("expected too-many-initial-values error"),
+        }
+    }
+
+    #[test]
+    fn array_dim_count_mismatch_errors() {
+        let mut s = session();
+        // 2×3 = 6 attendus, 4 variables fournies.
+        match run("data out; array m{2,3} a b c d; run;", &mut s) {
+            Err(e) => assert!(
+                e.to_string().contains("does not match"),
+                "wrong error message: {e}"
+            ),
+            Ok(_) => panic!("expected dimension-mismatch error"),
+        }
     }
 
     #[test]
@@ -3519,397 +5100,2365 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------------
-    // M14.1 — INFILE / INPUT / DATALINES
-    // ---------------------------------------------------------------------
+    // ── INFILE / INPUT / DATALINES (M14) ─────────────────────────────────
 
-    fn dfnum(ds: &SasDataset, name: &str) -> Vec<Option<f64>> {
-        ds.df.column(name).unwrap().f64().unwrap().iter().collect()
+    #[test]
+    fn input_list_mode_basic() {
+        let mut s = session();
+        let stats = run(
+            "data out; input name $ age; datalines;\nAlice 14\nBob 16\n;\nrun;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(stats.written, vec![("WORK.OUT".to_string(), 2, 2)]);
+        let ds = read_work(&s, "out");
+        let name = ds.df.column("name").unwrap().str().unwrap();
+        let age = ds.df.column("age").unwrap().f64().unwrap();
+        assert_eq!(name.get(0), Some("Alice"));
+        assert_eq!(age.get(0), Some(14.0));
+        assert_eq!(name.get(1), Some("Bob"));
+        assert_eq!(age.get(1), Some(16.0));
+        // Données instream : SAS n'émet PAS de NOTE "records were read from
+        // the infile DATALINES" (réservée aux fichiers externes) — seule la
+        // NOTE du data set apparaît.
+        let log = s.log.into_string();
+        assert!(
+            !log.contains("records were read from the infile"),
+            "instream DATALINES must not emit an infile-records NOTE; log was: {log}"
+        );
+        assert!(
+            log.contains("The data set WORK.OUT has 2 observations and 2 variables."),
+            "log was: {log}"
+        );
     }
-    fn dfstr(ds: &SasDataset, name: &str) -> Vec<Option<String>> {
-        ds.df
-            .column(name)
-            .unwrap()
-            .str()
-            .unwrap()
-            .iter()
-            .map(|o| o.map(|s| s.to_string()))
+
+    #[test]
+    fn input_column_mode() {
+        let mut s = session();
+        // Colonnes fixes : name = 1-10, age = 11-12.
+        run(
+            "data out; input name $ 1-10 age 11-12; datalines;\nAlice     14\nBob       16\n;\nrun;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        let name = ds.df.column("name").unwrap().str().unwrap();
+        let age = ds.df.column("age").unwrap().f64().unwrap();
+        assert_eq!(name.get(0), Some("Alice"));
+        assert_eq!(age.get(0), Some(14.0));
+        assert_eq!(name.get(1), Some("Bob"));
+        assert_eq!(age.get(1), Some(16.0));
+    }
+
+    #[test]
+    fn input_formatted_informat_decimal() {
+        let mut s = session();
+        // Informat 5.2 : sans point décimal dans le champ, divise par 100.
+        run(
+            "data out; input x 5.2; datalines;\n12345\n6.78\n;\nrun;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        let x = ds.df.column("x").unwrap().f64().unwrap();
+        // "12345" sans point → 123.45 ; "6.78" avec point → 6.78 (d ignoré).
+        assert_eq!(x.get(0), Some(123.45));
+        assert_eq!(x.get(1), Some(6.78));
+    }
+
+    #[test]
+    fn input_char_truncation_at_pdv() {
+        let mut s = session();
+        // $char4. : la longueur du PDV est 4 → troncature à l'assignation.
+        run(
+            "data out; input name $char4.; datalines;\nAlexander\n;\nrun;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        let name = ds.df.column("name").unwrap().str().unwrap();
+        assert_eq!(name.get(0), Some("Alex"));
+    }
+
+    #[test]
+    fn input_dsd_consecutive_delimiters_are_missing() {
+        let mut s = session();
+        run(
+            "data out; infile datalines dsd; input a b c; datalines;\n1,,3\n;\nrun;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        let a = ds.df.column("a").unwrap().f64().unwrap();
+        let b = ds.df.column("b").unwrap().f64().unwrap();
+        let c = ds.df.column("c").unwrap().f64().unwrap();
+        assert_eq!(a.get(0), Some(1.0));
+        assert_eq!(b.get(0), None); // champ vide → missing
+        assert_eq!(c.get(0), Some(3.0));
+    }
+
+    #[test]
+    fn input_dsd_quoted_field_with_comma() {
+        let mut s = session();
+        // `$20.` informat → longueur 20 (le défaut liste serait 8 et
+        // tronquerait "Smith, John").
+        run(
+            "data out; infile datalines dsd; input name $20. x; datalines;\n\"Smith, John\",5\n;\nrun;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        let name = ds.df.column("name").unwrap().str().unwrap();
+        let x = ds.df.column("x").unwrap().f64().unwrap();
+        assert_eq!(name.get(0), Some("Smith, John"));
+        assert_eq!(x.get(0), Some(5.0));
+    }
+
+    #[test]
+    fn input_delimiter_option() {
+        let mut s = session();
+        run(
+            "data out; infile datalines dlm='|'; input a b; datalines;\n10|20\n;\nrun;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        assert_eq!(ds.df.column("a").unwrap().f64().unwrap().get(0), Some(10.0));
+        assert_eq!(ds.df.column("b").unwrap().f64().unwrap().get(0), Some(20.0));
+    }
+
+    #[test]
+    fn input_missover_short_record() {
+        let mut s = session();
+        // MISSOVER : la 2e ligne n'a qu'une valeur → b reste missing.
+        run(
+            "data out; infile datalines missover; input a b; datalines;\n1 2\n3\n;\nrun;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        let b = ds.df.column("b").unwrap().f64().unwrap();
+        assert_eq!(b.get(0), Some(2.0));
+        assert_eq!(b.get(1), None);
+        assert_eq!(ds.n_obs(), 2);
+    }
+
+    #[test]
+    fn input_truncover_partial_field() {
+        let mut s = session();
+        // TRUNCOVER : champ formaté partiel en fin de ligne lu tel quel.
+        run(
+            "data out; infile datalines truncover; input x 5.; datalines;\n12\n;\nrun;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        assert_eq!(ds.df.column("x").unwrap().f64().unwrap().get(0), Some(12.0));
+    }
+
+    #[test]
+    fn input_stopover_errors() {
+        let mut s = session();
+        let err = run(
+            "data out; infile datalines stopover; input a b c; datalines;\n1 2\n;\nrun;",
+            &mut s,
+        );
+        assert!(err.is_err(), "expected STOPOVER error");
+    }
+
+    #[test]
+    fn input_double_hold_multiple_obs_per_line() {
+        let mut s = session();
+        // `@@` : plusieurs observations par ligne.
+        run(
+            "data out; input x @@; datalines;\n1 2 3 4 5\n;\nrun;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        assert_eq!(ds.n_obs(), 5);
+        let x = ds.df.column("x").unwrap().f64().unwrap();
+        assert_eq!(x.get(0), Some(1.0));
+        assert_eq!(x.get(4), Some(5.0));
+    }
+
+    #[test]
+    fn input_single_hold_then_release() {
+        let mut s = session();
+        // `@` : maintient l'enregistrement pour un second INPUT de la même
+        // itération — ici un seul INPUT lit deux variables avec hold, l'autre
+        // est relâché à l'itération suivante.
+        run(
+            "data out; input a @; input b; datalines;\n1 2\n3 4\n;\nrun;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        assert_eq!(ds.n_obs(), 2);
+        let a = ds.df.column("a").unwrap().f64().unwrap();
+        let b = ds.df.column("b").unwrap().f64().unwrap();
+        assert_eq!(a.get(0), Some(1.0));
+        assert_eq!(b.get(0), Some(2.0));
+        assert_eq!(a.get(1), Some(3.0));
+        assert_eq!(b.get(1), Some(4.0));
+    }
+
+    #[test]
+    fn input_column_pointer_at() {
+        let mut s = session();
+        run(
+            "data out; input @3 x 2.; datalines;\nXX42\n;\nrun;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        assert_eq!(ds.df.column("x").unwrap().f64().unwrap().get(0), Some(42.0));
+    }
+
+    #[test]
+    fn input_firstobs_obs_options() {
+        let mut s = session();
+        // FIRSTOBS=2, OBS=3 : lignes 2 et 3 seulement.
+        run(
+            "data out; infile datalines firstobs=2 obs=3; input x; datalines;\n1\n2\n3\n4\n;\nrun;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        assert_eq!(ds.n_obs(), 2);
+        let x = ds.df.column("x").unwrap().f64().unwrap();
+        assert_eq!(x.get(0), Some(2.0));
+        assert_eq!(x.get(1), Some(3.0));
+    }
+
+    #[test]
+    fn input_informat_date9() {
+        let mut s = session();
+        run(
+            "data out; input d date9.; datalines;\n01JAN1960\n02JAN1960\n;\nrun;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        let d = ds.df.column("d").unwrap().f64().unwrap();
+        // epoch SAS 1960-01-01 = 0.
+        assert_eq!(d.get(0), Some(0.0));
+        assert_eq!(d.get(1), Some(1.0));
+    }
+
+    #[test]
+    fn input_list_modifier_colon_informat() {
+        let mut s = session();
+        // `:date9.` lit un jeton délimité puis applique l'informat.
+        run(
+            "data out; infile datalines; input name $ x :date9.; datalines;\nAlice 01JAN1960\n;\nrun;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        assert_eq!(ds.df.column("x").unwrap().f64().unwrap().get(0), Some(0.0));
+        assert_eq!(
+            ds.df.column("name").unwrap().str().unwrap().get(0),
+            Some("Alice")
+        );
+    }
+
+    #[test]
+    fn datalines_without_infile_is_implicit_source() {
+        let mut s = session();
+        // Pas de `infile datalines;` : `input` utilise quand même le bloc.
+        run(
+            "data out; input x y; datalines;\n1 2\n3 4\n;\nrun;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        assert_eq!(ds.n_obs(), 2);
+    }
+
+    // ── FILE / PUT (M14.2) ───────────────────────────────────────────────
+
+    /// Extrait les lignes PUT du log (celles qui ne sont ni vides, ni un
+    /// écho de source numéroté, ni une NOTE/WARNING/ERROR).
+    fn put_log_lines(log: &str) -> Vec<String> {
+        // L'écho de source SAS est de la forme "<num>     <texte>" : un nombre
+        // suivi d'AU MOINS deux espaces (padding à la colonne 6) puis du texte.
+        // Une ligne PUT purement numérique ("42") n'a pas ce padding.
+        fn is_source_echo(l: &str) -> bool {
+            let mut it = l.char_indices();
+            let mut end = 0;
+            for (i, c) in it.by_ref() {
+                if c.is_ascii_digit() {
+                    end = i + 1;
+                } else {
+                    break;
+                }
+            }
+            if end == 0 {
+                return false;
+            }
+            // Au moins deux espaces après le nombre.
+            l[end..].starts_with("  ")
+        }
+        log.lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.is_empty()
+                    && !t.starts_with("NOTE:")
+                    && !t.starts_with("WARNING:")
+                    && !t.starts_with("ERROR:")
+                    && !is_source_echo(l)
+                    // Les continuations de NOTE timing ("real time...").
+                    && !t.starts_with("real time")
+                    && !t.starts_with("cpu time")
+            })
+            .map(|l| l.to_string())
             .collect()
     }
 
     #[test]
-    fn datalines_list_input_basic() {
-        let mut s = session();
-        let stats = run(
-            "data out;\n  input name $ age height;\ndatalines;\nAlfred 14 69\nAlice 13 56.5\n;\nrun;",
-            &mut s,
-        )
-        .unwrap();
-        assert_eq!(stats.written, vec![("WORK.OUT".to_string(), 2, 3)]);
-        let ds = read_work(&s, "out");
-        assert_eq!(ds.n_obs(), 2);
-        assert_eq!(
-            dfstr(&ds, "name"),
-            vec![Some("Alfred".into()), Some("Alice".into())]
-        );
-        assert_eq!(dfnum(&ds, "age"), vec![Some(14.0), Some(13.0)]);
-        assert_eq!(dfnum(&ds, "height"), vec![Some(69.0), Some(56.5)]);
-        let log = s.log.into_string();
-        assert!(log.contains("2 records were read from the infile DATALINES."));
-        assert!(log.contains("The data set WORK.OUT has 2 observations and 3 variables."));
-    }
-
-    #[test]
-    fn datalines_char_truncated_to_default_length_8() {
-        let mut s = session();
-        run(
-            "data out;\n  input name $;\ndatalines;\nVeryLongName\n;\nrun;",
-            &mut s,
-        )
-        .unwrap();
-        let ds = read_work(&s, "out");
-        // Default char length 8 → truncated.
-        assert_eq!(dfstr(&ds, "name"), vec![Some("VeryLong".into())]);
-    }
-
-    #[test]
-    fn column_input_fixed_positions() {
-        let mut s = session();
-        // Columns: name 1-10, age 11-13.
-        run(
-            "data out;\n  input name $ 1-10 age 11-13;\ndatalines;\nAlfred     14\nBarbara    99\n;\nrun;",
-            &mut s,
-        )
-        .unwrap();
-        let ds = read_work(&s, "out");
-        assert_eq!(
-            dfstr(&ds, "name"),
-            vec![Some("Alfred".into()), Some("Barbara".into())]
-        );
-        assert_eq!(dfnum(&ds, "age"), vec![Some(14.0), Some(99.0)]);
-    }
-
-    #[test]
-    fn formatted_input_pointer_and_informat() {
-        let mut s = session();
-        // @1 name $10. then age 5.2 (implicit decimal pitfall: "12345" → 123.45).
-        run(
-            "data out;\n  input @1 name $10. age 5.2;\ndatalines;\nAlfred    12345\n;\nrun;",
-            &mut s,
-        )
-        .unwrap();
-        let ds = read_work(&s, "out");
-        assert_eq!(dfstr(&ds, "name"), vec![Some("Alfred".into())]);
-        // 5.2 informat, no decimal point in data → divide by 100.
-        assert_eq!(dfnum(&ds, "age"), vec![Some(123.45)]);
-    }
-
-    #[test]
-    fn formatted_input_explicit_decimal_ignores_d() {
-        let mut s = session();
-        // Data has an explicit decimal point → d ignored.
-        run(
-            "data out;\n  input x 6.2;\ndatalines;\n123.45\n;\nrun;",
-            &mut s,
-        )
-        .unwrap();
-        let ds = read_work(&s, "out");
-        assert_eq!(dfnum(&ds, "x"), vec![Some(123.45)]);
-    }
-
-    #[test]
-    fn dsd_csv_with_quotes_and_missing() {
-        let mut s = session();
-        // DSD: comma-delimited, quoted field containing a comma, empty field
-        // = missing.
-        run(
-            "data out;\n  length a $ 20;\n  infile datalines dsd;\n  input a $ b c $;\ndatalines;\n\"Smith, John\",,hi\n;\nrun;",
-            &mut s,
-        )
-        .unwrap();
-        let ds = read_work(&s, "out");
-        assert_eq!(dfstr(&ds, "a"), vec![Some("Smith, John".into())]);
-        assert_eq!(dfnum(&ds, "b"), vec![None]); // consecutive delimiters
-        assert_eq!(dfstr(&ds, "c"), vec![Some("hi".into())]);
-    }
-
-    #[test]
-    fn dlm_custom_delimiter() {
-        let mut s = session();
-        run(
-            "data out;\n  infile datalines dlm='|';\n  input a $ b;\ndatalines;\nfoo|42\n;\nrun;",
-            &mut s,
-        )
-        .unwrap();
-        let ds = read_work(&s, "out");
-        assert_eq!(dfstr(&ds, "a"), vec![Some("foo".into())]);
-        assert_eq!(dfnum(&ds, "b"), vec![Some(42.0)]);
-    }
-
-    #[test]
-    fn invalid_numeric_data_sets_error_and_missing() {
-        let mut s = session();
-        run(
-            "data out;\n  input x;\n  e = _error_;\ndatalines;\nabc\n;\nrun;",
-            &mut s,
-        )
-        .unwrap();
-        let ds = read_work(&s, "out");
-        assert_eq!(dfnum(&ds, "x"), vec![None]);
-        assert_eq!(dfnum(&ds, "e"), vec![Some(1.0)]);
-        let log = s.log.into_string();
-        assert!(log.contains("NOTE: Invalid numeric data."), "log: {log}");
-    }
-
-    #[test]
-    fn missover_short_line_gives_missing() {
-        let mut s = session();
-        // Second line is short; MISSOVER → missing for the absent var.
-        run(
-            "data out;\n  infile datalines missover;\n  input a b c;\ndatalines;\n1 2 3\n4 5\n;\nrun;",
-            &mut s,
-        )
-        .unwrap();
-        let ds = read_work(&s, "out");
-        assert_eq!(dfnum(&ds, "a"), vec![Some(1.0), Some(4.0)]);
-        assert_eq!(dfnum(&ds, "b"), vec![Some(2.0), Some(5.0)]);
-        assert_eq!(dfnum(&ds, "c"), vec![Some(3.0), None]);
-    }
-
-    #[test]
-    fn firstobs_obs_window() {
-        let mut s = session();
-        run(
-            "data out;\n  infile datalines firstobs=2 obs=3;\n  input x;\ndatalines;\n10\n20\n30\n40\n;\nrun;",
-            &mut s,
-        )
-        .unwrap();
-        let ds = read_work(&s, "out");
-        // Lines 2..=3 → 20, 30.
-        assert_eq!(dfnum(&ds, "x"), vec![Some(20.0), Some(30.0)]);
-    }
-
-    #[test]
-    fn slash_advances_to_next_line() {
-        let mut s = session();
-        // Each observation spans two input lines.
-        run(
-            "data out;\n  input a / b;\ndatalines;\n1\n2\n3\n4\n;\nrun;",
-            &mut s,
-        )
-        .unwrap();
-        let ds = read_work(&s, "out");
-        assert_eq!(dfnum(&ds, "a"), vec![Some(1.0), Some(3.0)]);
-        assert_eq!(dfnum(&ds, "b"), vec![Some(2.0), Some(4.0)]);
-    }
-
-    #[test]
-    fn empty_datalines_block_no_observations() {
-        let mut s = session();
-        run(
-            "data out;\n  input x;\ndatalines;\n;\nrun;",
-            &mut s,
-        )
-        .unwrap();
-        let ds = read_work(&s, "out");
-        assert_eq!(ds.n_obs(), 0);
-    }
-
-    // ---------------------------------------------------------------------
-    // M14.2 — FILE / PUT
-    // ---------------------------------------------------------------------
-
-    #[test]
-    fn put_default_destination_is_log_list_output() {
+    fn put_list_mode_to_log() {
         let mut s = session();
         write_class(&s, "inp");
+        // `data _null_` : sortie PUT seulement, aucun dataset écrit.
         run("data _null_; set inp; put name age; run;", &mut s).unwrap();
         let log = s.log.into_string();
-        // List output: char as-is, num via BEST, separated by one blank.
-        // Age missing for Alice → '.'.
-        assert!(log.contains("Alfred 14"), "log:\n{log}");
-        assert!(log.contains("Alice ."), "log:\n{log}");
-        assert!(log.contains("Barbara 13"), "log:\n{log}");
+        let lines = put_log_lines(&log);
+        // Age missing (Alice) → "." ; format BEST par défaut.
+        assert_eq!(lines, vec!["Alfred 14", "Alice .", "Barbara 13"]);
     }
 
     #[test]
-    fn put_literal_then_value() {
+    fn put_named_form() {
         let mut s = session();
+        write_class(&s, "inp");
         run(
-            "data _null_;\n  x = 42;\n  put 'Total:' x;\nrun;",
+            "data _null_; set inp; if name='Alfred'; put name= age=; run;",
             &mut s,
         )
         .unwrap();
-        let log = s.log.into_string();
-        assert!(log.contains("Total: 42"), "log:\n{log}");
+        let lines = put_log_lines(&s.log.into_string());
+        assert_eq!(lines, vec!["name=Alfred age=14"]);
     }
 
     #[test]
-    fn put_formatted_column_output() {
+    fn put_literal_and_var() {
         let mut s = session();
+        write_class(&s, "inp");
         run(
-            "data _null_;\n  length name $ 8;\n  name = 'Al';\n  age = 7;\n  put name $10. age 5.2;\nrun;",
+            "data _null_; set inp; if name='Alfred'; put 'Report for' name; run;",
             &mut s,
         )
         .unwrap();
-        let log = s.log.into_string();
-        // $10. left-justified width 10, then 5.2 right-justified width 5.
-        assert!(log.contains("Al         7.00"), "log:\n{log}");
+        let lines = put_log_lines(&s.log.into_string());
+        assert_eq!(lines, vec!["Report for Alfred"]);
     }
 
     #[test]
-    fn put_named_output() {
+    fn put_formatted_numeric() {
+        let mut s = session();
+        run("data _null_; x = 3.14159; put x 8.2; run;", &mut s).unwrap();
+        let lines = put_log_lines(&s.log.into_string());
+        // 8.2 → "    3.14" justifié, puis trim de fin (les blancs de tête
+        // restent mais sont rognés par render_put_slot via .trim()).
+        assert_eq!(lines, vec!["3.14"]);
+    }
+
+    #[test]
+    fn put_formatted_date9() {
+        let mut s = session();
+        // 0 = 01JAN1960 (epoch SAS).
+        run("data _null_; d = 0; put d date9.; run;", &mut s).unwrap();
+        let lines = put_log_lines(&s.log.into_string());
+        assert_eq!(lines, vec!["01JAN1960"]);
+    }
+
+    #[test]
+    fn put_column_pointer_and_skip() {
         let mut s = session();
         run(
-            "data _null_;\n  length nm $ 4;\n  nm = 'abcd';\n  x = 3;\n  put nm= x=;\nrun;",
+            "data _null_; x = 1; y = 2; put @5 x +3 y; run;",
             &mut s,
         )
         .unwrap();
-        let log = s.log.into_string();
-        assert!(log.contains("nm=abcd x=3"), "log:\n{log}");
+        let lines = put_log_lines(&s.log.into_string());
+        // @5 → "1" en colonne 5 (index 4) ; le curseur passe à la colonne 6
+        // (index 5), +3 l'avance à la colonne 9 (index 8) où s'écrit "2".
+        assert_eq!(lines, vec!["    1    2"]);
+    }
+
+    #[test]
+    fn put_slash_newline_within_one_put() {
+        let mut s = session();
+        run(
+            "data _null_; x = 1; y = 2; put x / y; run;",
+            &mut s,
+        )
+        .unwrap();
+        let lines = put_log_lines(&s.log.into_string());
+        assert_eq!(lines, vec!["1", "2"]);
+    }
+
+    #[test]
+    fn put_single_hold_joins_one_line() {
+        let mut s = session();
+        write_class(&s, "inp");
+        // `put name @;` maintient la ligne ; le PUT suivant (même itération)
+        // la continue, puis la relâche.
+        run(
+            "data _null_; set inp; put name @; put age; run;",
+            &mut s,
+        )
+        .unwrap();
+        let lines = put_log_lines(&s.log.into_string());
+        // Une ligne par observation (hold simple relâché en fin d'itération).
+        assert_eq!(lines, vec!["Alfred 14", "Alice .", "Barbara 13"]);
+    }
+
+    #[test]
+    fn put_double_hold_joins_across_iterations() {
+        let mut s = session();
+        write_class(&s, "inp");
+        // `put name @@;` maintient la ligne À TRAVERS les itérations : les
+        // trois noms s'accumulent sur une seule ligne, relâchée en fin d'étape.
+        run("data _null_; set inp; put name @@; run;", &mut s).unwrap();
+        let lines = put_log_lines(&s.log.into_string());
+        assert_eq!(lines, vec!["Alfred Alice Barbara"]);
     }
 
     #[test]
     fn put_all_writes_every_pdv_var() {
         let mut s = session();
+        write_class(&s, "inp");
         run(
-            "data _null_;\n  a = 1;\n  b = 2;\n  put _all_;\nrun;",
+            "data _null_; set inp; if name='Alfred'; put _all_; run;",
             &mut s,
         )
         .unwrap();
-        let log = s.log.into_string();
-        // _ALL_ also emits the automatic _N_ and _ERROR_? We only emit PDV
-        // user vars here. Check a= and b= present.
-        assert!(log.contains("a=1 b=2"), "log:\n{log}");
-    }
-
-    #[test]
-    fn put_slash_starts_new_line() {
-        let mut s = session();
-        run(
-            "data _null_;\n  a = 1; b = 2;\n  put a / b;\nrun;",
-            &mut s,
-        )
-        .unwrap();
-        let log = s.log.into_string();
-        // Two separate lines.
-        let lines: Vec<&str> = log.lines().collect();
-        assert!(
-            lines.iter().any(|l| l.trim() == "1") && lines.iter().any(|l| l.trim() == "2"),
-            "log:\n{log}"
-        );
-    }
-
-    #[test]
-    fn put_at_hold_within_iteration() {
-        let mut s = session();
-        // First PUT holds the line with @, second PUT appends and releases.
-        run(
-            "data _null_;\n  put 'A' @;\n  put 'B';\nrun;",
-            &mut s,
-        )
-        .unwrap();
-        let log = s.log.into_string();
-        assert!(log.contains("AB"), "log:\n{log}");
-    }
-
-    #[test]
-    fn put_double_at_holds_across_iterations() {
-        let mut s = session();
-        // Each iteration appends its value to the SAME held line via @@.
-        run(
-            "data _null_;\n  do i = 1 to 3;\n    put i @@;\n  end;\nrun;",
-            &mut s,
-        )
-        .unwrap();
-        let log = s.log.into_string();
-        // All three on one line: "1 2 3" (list output separators).
-        assert!(log.contains("1 2 3"), "log:\n{log}");
+        let lines = put_log_lines(&s.log.into_string());
+        // Ordre PDV : Age (num) puis Name (char) — l'ordre des colonnes de
+        // l'input.
+        assert_eq!(lines, vec!["Age=14 Name=Alfred"]);
     }
 
     #[test]
     fn file_print_routes_to_listing() {
         let mut s = session();
+        write_class(&s, "inp");
         run(
-            "data _null_;\n  x = 99;\n  file print;\n  put 'val=' x;\nrun;",
+            "data _null_; set inp; if name='Alfred'; file print; put 'in listing' name; run;",
             &mut s,
         )
         .unwrap();
         let listing = s.listing.into_string();
-        assert!(listing.contains("val= 99"), "listing:\n{listing}");
-        // Nothing written to the log body for this PUT.
+        assert!(
+            listing.contains("in listing Alfred"),
+            "listing was: {listing}"
+        );
+        // Rien dans le log côté PUT.
         let log = s.log.into_string();
-        assert!(!log.contains("val="), "log:\n{log}");
+        assert!(!log.contains("in listing"), "log was: {log}");
     }
 
     #[test]
-    fn file_log_explicit() {
+    fn file_log_explicit_routes_to_log() {
         let mut s = session();
         run(
-            "data _null_;\n  x = 5;\n  file log;\n  put 'x is ' x;\nrun;",
+            "data _null_; x = 7; file log; put 'val' x; run;",
             &mut s,
         )
         .unwrap();
-        let log = s.log.into_string();
-        assert!(log.contains("x is  5") || log.contains("x is 5"), "log:\n{log}");
+        let lines = put_log_lines(&s.log.into_string());
+        assert_eq!(lines, vec!["val 7"]);
     }
 
     #[test]
-    fn file_physical_path_written() {
+    fn file_path_writes_external_file() {
         let mut s = session();
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("sasrs_put_test_{}.txt", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        write_class(&s, "inp");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.txt");
+        let path_str = path.to_str().unwrap();
         let src = format!(
-            "data _null_;\n  do i = 1 to 2;\n    file '{}';\n    put 'line' i;\n  end;\nrun;",
-            path.display()
+            "data _null_; set inp; file '{path_str}'; put name age; run;"
         );
         run(&src, &mut s).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(content, "line 1\nline 2\n", "file content: {content:?}");
-        let _ = std::fs::remove_file(&path);
+        assert_eq!(content, "Alfred 14\nAlice .\nBarbara 13\n");
     }
 
     #[test]
-    fn put_pointer_col_and_skip() {
+    fn put_unknown_variable_errors() {
         let mut s = session();
-        run(
-            "data _null_;\n  put 'X' @5 'Y' +2 'Z';\nrun;",
-            &mut s,
-        )
-        .unwrap();
-        let log = s.log.into_string();
-        // 'X' at col1, 'Y' at col5, then +2 → col after Y is 6, +2 = col8, 'Z'.
-        // "X   Y Z" : X(1) pad to 5 -> "X   Y", col now 6, +2 -> col 8, "Y" was
-        // 1 char so col6; +2 => col8; pad cols 6,7 -> two spaces then Z at 8.
-        assert!(log.contains("X   Y  Z"), "log:\n{log}");
+        let res = run("data _null_; x = 1; put nosuchvar; run;", &mut s);
+        let err = res.err().expect("expected an error for an unknown PUT variable");
+        assert!(
+            err.to_string().contains("nosuchvar is not on the PUT statement"),
+            "got: {err}"
+        );
     }
 
     #[test]
-    fn put_dsd_quotes_value_with_delimiter() {
+    fn put_default_destination_is_log() {
+        let mut s = session();
+        // Sans FILE, un PUT écrit dans le LOG (défaut SAS).
+        run("data _null_; x = 42; put x; run;", &mut s).unwrap();
+        let lines = put_log_lines(&s.log.into_string());
+        assert_eq!(lines, vec!["42"]);
+        // Rien dans le listing.
+        assert!(!s.listing.into_string().contains("42"));
+    }
+
+    // =====================================================================
+    // M15.6 — CALL routines
+    // =====================================================================
+
+    fn num_col(ds: &SasDataset, name: &str) -> Vec<Option<f64>> {
+        let c = ds.df.column(name).unwrap().f64().unwrap();
+        (0..ds.n_obs()).map(|i| c.get(i)).collect()
+    }
+    fn str_col(ds: &SasDataset, name: &str) -> Vec<String> {
+        let c = ds.df.column(name).unwrap().str().unwrap();
+        (0..ds.n_obs()).map(|i| c.get(i).unwrap_or("").to_string()).collect()
+    }
+
+    // ---- CALL MISSING ---------------------------------------------------
+
+    #[test]
+    fn call_missing_sets_numeric_to_missing() {
         let mut s = session();
         run(
-            "data _null_;\n  length a $ 20;\n  a = 'Smith, John';\n  b = 1;\n  file print dsd;\n  put a b;\nrun;",
+            "data out; x = 5; y = 10; call missing(x); output; run;",
             &mut s,
         )
         .unwrap();
-        let listing = s.listing.into_string();
-        // DSD: comma delimiter, value with comma quoted.
-        assert!(listing.contains("\"Smith, John\",1"), "listing:\n{listing}");
+        let ds = read_work(&s, "out");
+        assert_eq!(num_col(&ds, "x"), vec![None]);
+        assert_eq!(num_col(&ds, "y"), vec![Some(10.0)]);
     }
 
     #[test]
-    fn put_char_missing_is_blank_num_missing_is_dot() {
+    fn call_missing_sets_char_to_empty() {
         let mut s = session();
         run(
-            "data _null_;\n  length c $ 3;\n  put 'n=' n 'c=[' c ']';\nrun;",
+            "data out; length name $10; name = 'Alice'; call missing(name); output; run;",
             &mut s,
         )
         .unwrap();
-        let log = s.log.into_string();
-        // List output: a single blank precedes each VARIABLE value, not
-        // literals. n uninitialized numeric → '.', c blank (length 3 but
-        // stored trimmed → empty). So: "n=" + " ." + "c=[" + " " + "]".
-        assert!(log.contains("n= .c=[ ]"), "log:\n{log}");
+        let ds = read_work(&s, "out");
+        assert_eq!(str_col(&ds, "name"), vec![String::new()]);
+    }
+
+    #[test]
+    fn call_missing_multiple_vars_mixed_types() {
+        let mut s = session();
+        run(
+            "data out; length c $5; a = 1; b = 2; c = 'hi'; call missing(a, b, c); output; run;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        assert_eq!(num_col(&ds, "a"), vec![None]);
+        assert_eq!(num_col(&ds, "b"), vec![None]);
+        assert_eq!(str_col(&ds, "c"), vec![String::new()]);
+    }
+
+    // ---- CALL EXECUTE ---------------------------------------------------
+
+    #[test]
+    fn call_execute_queues_literal_code() {
+        let mut s = session();
+        run(
+            "data _null_; call execute('data q; v = 7; run;'); run;",
+            &mut s,
+        )
+        .unwrap();
+        // L'étape elle-même ne fait que mettre en file (rejeu = exécuteur).
+        assert_eq!(
+            s.call_execute_queue,
+            vec!["data q; v = 7; run;".to_string()]
+        );
+    }
+
+    #[test]
+    fn call_execute_queues_per_row_in_order() {
+        let mut s = session();
+        write_class(&s, "inp");
+        run(
+            "data _null_; set inp; call execute('proc print; '||name); run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(s.call_execute_queue.len(), 3);
+        assert!(s.call_execute_queue[0].contains("Alfred"));
+        assert!(s.call_execute_queue[2].contains("Barbara"));
+    }
+
+    #[test]
+    fn call_execute_requires_one_argument() {
+        let mut s = session();
+        let res = run("data _null_; call execute('a', 'b'); run;", &mut s);
+        assert!(res.is_err());
+    }
+
+    // ---- CALL SORTN / SORTC --------------------------------------------
+
+    #[test]
+    fn call_sortn_sorts_array_ascending() {
+        let mut s = session();
+        run(
+            "data out; array a{3} a1-a3; a1=3; a2=1; a3=2; call sortn(a); output; run;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        assert_eq!(num_col(&ds, "a1"), vec![Some(1.0)]);
+        assert_eq!(num_col(&ds, "a2"), vec![Some(2.0)]);
+        assert_eq!(num_col(&ds, "a3"), vec![Some(3.0)]);
+    }
+
+    #[test]
+    fn call_sortn_missing_sorts_first() {
+        let mut s = session();
+        // SAS collation: missing (.) is smaller than any number.
+        run(
+            "data out; array a{3} a1-a3; a1=5; a2=.; a3=1; call sortn(a); output; run;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        assert_eq!(num_col(&ds, "a1"), vec![None]);
+        assert_eq!(num_col(&ds, "a2"), vec![Some(1.0)]);
+        assert_eq!(num_col(&ds, "a3"), vec![Some(5.0)]);
+    }
+
+    #[test]
+    fn call_sortc_sorts_char_array_ascending() {
+        let mut s = session();
+        run(
+            "data out; array c{3} $5 c1-c3; c1='pear'; c2='apple'; c3='kiwi'; \
+             call sortc(c); output; run;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        assert_eq!(str_col(&ds, "c1"), vec!["apple".to_string()]);
+        assert_eq!(str_col(&ds, "c2"), vec!["kiwi".to_string()]);
+        assert_eq!(str_col(&ds, "c3"), vec!["pear".to_string()]);
+    }
+
+    #[test]
+    fn call_sortn_explicit_var_list() {
+        let mut s = session();
+        run(
+            "data out; x=9; y=2; z=5; call sortn(x, y, z); output; run;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        assert_eq!(num_col(&ds, "x"), vec![Some(2.0)]);
+        assert_eq!(num_col(&ds, "y"), vec![Some(5.0)]);
+        assert_eq!(num_col(&ds, "z"), vec![Some(9.0)]);
+    }
+
+    // ---- CALL SYMPUTX ---------------------------------------------------
+
+    #[test]
+    fn call_symputx_trims_value() {
+        let mut s = session();
+        run(
+            "data _null_; length v $20; v = '   hi   '; call symputx('a', v); run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(s.macro_engine.get_symbol("a").as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn call_symputx_numeric_no_blanks() {
+        let mut s = session();
+        run("data _null_; call symputx('n', 42); run;", &mut s).unwrap();
+        assert_eq!(s.macro_engine.get_symbol("n").as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn call_symput_vs_symputx_value_trimming() {
+        // SYMPUT keeps leading blanks of a char value; SYMPUTX trims them.
+        let mut s = session();
+        run(
+            "data _null_; length v $10; v = '  x'; call symput('a', v); call symputx('b', v); run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(s.macro_engine.get_symbol("a").as_deref(), Some("  x"));
+        assert_eq!(s.macro_engine.get_symbol("b").as_deref(), Some("x"));
+    }
+
+    // ---- CALL CATS ------------------------------------------------------
+
+    #[test]
+    fn call_cats_concatenates_stripped() {
+        let mut s = session();
+        run(
+            "data out; length r $20; a='  foo '; b=' bar'; call cats(r, a, b); output; run;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        assert_eq!(str_col(&ds, "r"), vec!["foobar".to_string()]);
+    }
+
+    #[test]
+    fn call_cats_mixed_num_and_char() {
+        let mut s = session();
+        run(
+            "data out; length r $20; call cats(r, 'x', 12, 'y'); output; run;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        assert_eq!(str_col(&ds, "r"), vec!["x12y".to_string()]);
+    }
+
+    #[test]
+    fn call_cats_truncates_to_result_length() {
+        let mut s = session();
+        run(
+            "data out; length r $3; call cats(r, 'abcdef'); output; run;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        assert_eq!(str_col(&ds, "r"), vec!["abc".to_string()]);
+    }
+
+    // ---- CALL SCAN ------------------------------------------------------
+
+    #[test]
+    fn call_scan_extracts_nth_word() {
+        let mut s = session();
+        run(
+            "data out; length w $10; call scan('alpha beta gamma', 2, w); output; run;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        assert_eq!(str_col(&ds, "w"), vec!["beta".to_string()]);
+    }
+
+    #[test]
+    fn call_scan_negative_index_from_end() {
+        let mut s = session();
+        run(
+            "data out; length w $10; call scan('a b c', -1, w); output; run;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        assert_eq!(str_col(&ds, "w"), vec!["c".to_string()]);
+    }
+
+    #[test]
+    fn call_scan_custom_delimiter() {
+        let mut s = session();
+        run(
+            "data out; length w $10; call scan('a,b,c', 2, w, ','); output; run;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        assert_eq!(str_col(&ds, "w"), vec!["b".to_string()]);
+    }
+
+    // ---- CALL LABEL -----------------------------------------------------
+
+    #[test]
+    fn call_label_returns_label() {
+        let mut s = session();
+        run(
+            "data out; length lbl $40; x = 1; label x = 'My X Variable'; \
+             call label(x, lbl); output; run;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        assert_eq!(str_col(&ds, "lbl"), vec!["My X Variable".to_string()]);
+    }
+
+    #[test]
+    fn call_label_falls_back_to_name_when_no_label() {
+        let mut s = session();
+        run(
+            "data out; length lbl $40; weight = 1; call label(weight, lbl); output; run;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        // No label declared → SAS returns the variable name.
+        assert_eq!(str_col(&ds, "lbl"), vec!["weight".to_string()]);
+    }
+
+    // ---- CALL VNAME -----------------------------------------------------
+
+    #[test]
+    fn call_vname_returns_variable_name() {
+        let mut s = session();
+        run(
+            "data out; length nm $32; Height = 1; call vname(Height, nm); output; run;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        // Name preserved with first-reference casing.
+        assert_eq!(str_col(&ds, "nm"), vec!["Height".to_string()]);
+    }
+
+    #[test]
+    fn call_vname_on_array_element() {
+        let mut s = session();
+        run(
+            "data out; length nm $32; array a{3} a1-a3; call vname(a{2}, nm); output; run;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        assert_eq!(str_col(&ds, "nm"), vec!["a2".to_string()]);
+    }
+
+    #[test]
+    fn unknown_call_routine_errors() {
+        let mut s = session();
+        let res = run("data _null_; call frobnicate(1); run;", &mut s);
+        let err = res.err().expect("expected error for unknown CALL routine");
+        assert!(err.to_string().contains("not yet implemented"), "got: {err}");
+    }
+
+    // ── SELECT / WHEN / OTHERWISE (M16.1) ────────────────────────────────
+
+    #[test]
+    fn select_selector_form_matches_first_value() {
+        // Sélecteur numérique : age 14 → "teen", . → autre, 13 → "kid".
+        let mut s = session();
+        write_class(&s, "inp");
+        run(
+            "data out; set inp; length grp $8; \
+             select (age); \
+               when (13) grp='kid'; \
+               when (14, 15) grp='teen'; \
+               otherwise grp='other'; \
+             end; \
+             run;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        // age = 14, missing, 13.
+        assert_eq!(
+            str_col(&ds, "grp"),
+            vec!["teen".to_string(), "other".to_string(), "kid".to_string()]
+        );
+    }
+
+    #[test]
+    fn select_selector_multiple_values_in_one_when() {
+        // Une seule clause liste plusieurs valeurs ; n'importe laquelle suffit.
+        let mut s = session();
+        run(
+            "data out; \
+             do x = 1 to 4; \
+               select (x); \
+                 when (1, 3) flag = 1; \
+                 otherwise flag = 0; \
+               end; \
+               output; \
+             end; \
+             run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(num_at(&s, "out", "flag", 0), Some(1.0)); // x=1
+        assert_eq!(num_at(&s, "out", "flag", 1), Some(0.0)); // x=2
+        assert_eq!(num_at(&s, "out", "flag", 2), Some(1.0)); // x=3
+        assert_eq!(num_at(&s, "out", "flag", 3), Some(0.0)); // x=4
+    }
+
+    #[test]
+    fn select_selector_char_form() {
+        // Sélecteur caractère ; comparaison ignore les blancs finaux (sas_cmp).
+        let mut s = session();
+        run(
+            "data out; length sex $1 desc $8; \
+             sex = 'F'; \
+             select (sex); \
+               when ('M') desc = 'male'; \
+               when ('F') desc = 'female'; \
+               otherwise desc = 'unknown'; \
+             end; \
+             output; \
+             run;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        assert_eq!(str_col(&ds, "desc"), vec!["female".to_string()]);
+    }
+
+    #[test]
+    fn select_boolean_form_first_true_wins() {
+        // Forme booléenne : conditions évaluées dans l'ordre, première vraie.
+        let mut s = session();
+        run(
+            "data out; length band $8; \
+             do x = 5 to 25 by 10; \
+               select; \
+                 when (x < 10) band = 'low'; \
+                 when (x < 20) band = 'mid'; \
+                 otherwise band = 'high'; \
+               end; \
+               output; \
+             end; \
+             run;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        // x = 5, 15, 25.
+        assert_eq!(
+            str_col(&ds, "band"),
+            vec!["low".to_string(), "mid".to_string(), "high".to_string()]
+        );
+    }
+
+    #[test]
+    fn select_boolean_form_range_condition() {
+        // Plage exprimée par une condition booléenne 1 <= x <= 10.
+        let mut s = session();
+        run(
+            "data out; length r $8; \
+             do x = 0 to 15 by 5; \
+               select; \
+                 when (x >= 1 and x <= 10) r = 'in'; \
+                 otherwise r = 'out'; \
+               end; \
+               output; \
+             end; \
+             run;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        // x = 0(out), 5(in), 10(in), 15(out).
+        assert_eq!(
+            str_col(&ds, "r"),
+            vec![
+                "out".to_string(),
+                "in".to_string(),
+                "in".to_string(),
+                "out".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn select_when_do_block_runs_all_statements() {
+        // Le corps d'un WHEN peut être un do; ... end; (plusieurs statements).
+        let mut s = session();
+        run(
+            "data out; x = 2; \
+             select (x); \
+               when (2) do; a = 10; b = 20; end; \
+               otherwise do; a = 0; b = 0; end; \
+             end; \
+             output; \
+             run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(num_at(&s, "out", "a", 0), Some(10.0));
+        assert_eq!(num_at(&s, "out", "b", 0), Some(20.0));
+    }
+
+    #[test]
+    fn select_no_fall_through() {
+        // Pas de fall-through : seule la PREMIÈRE clause vraie s'exécute,
+        // même si une clause suivante correspondrait aussi.
+        let mut s = session();
+        run(
+            "data out; x = 1; n = 0; \
+             select (x); \
+               when (1) n = n + 1; \
+               when (1) n = n + 100; \
+               otherwise n = n + 1000; \
+             end; \
+             output; \
+             run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(num_at(&s, "out", "n", 0), Some(1.0));
+    }
+
+    #[test]
+    fn select_missing_value_matches_dot() {
+        // `. = .` est vrai en SAS : un WHEN (.) capture le sélecteur missing.
+        let mut s = session();
+        write_class(&s, "inp");
+        run(
+            "data out; set inp; length tag $8; \
+             select (age); \
+               when (.) tag = 'na'; \
+               otherwise tag = 'ok'; \
+             end; \
+             run;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        // age = 14, missing, 13.
+        assert_eq!(
+            str_col(&ds, "tag"),
+            vec!["ok".to_string(), "na".to_string(), "ok".to_string()]
+        );
+    }
+
+    #[test]
+    fn select_no_otherwise_no_match_is_runtime_error() {
+        // Sans OTHERWISE et sans WHEN correspondant : erreur runtime (SAS).
+        let mut s = session();
+        let err = run(
+            "data out; x = 99; select (x); when (1) y = 1; end; run;",
+            &mut s,
+        )
+        .err()
+        .unwrap();
+        assert!(
+            err.to_string().contains("does not match any clause"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn select_no_otherwise_with_match_is_ok() {
+        // Sans OTHERWISE mais avec un WHEN correspondant : pas d'erreur.
+        let mut s = session();
+        run(
+            "data out; x = 1; select (x); when (1) y = 7; end; output; run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(num_at(&s, "out", "y", 0), Some(7.0));
+    }
+
+    #[test]
+    fn select_empty_when_body_is_noop() {
+        // `when (1) ;` corps vide : la clause est prise mais ne fait rien
+        // (pas de fall-through vers OTHERWISE).
+        let mut s = session();
+        run(
+            "data out; x = 1; y = 5; \
+             select (x); \
+               when (1) ; \
+               otherwise y = 0; \
+             end; \
+             output; \
+             run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(num_at(&s, "out", "y", 0), Some(5.0));
+    }
+
+    #[test]
+    fn select_selector_evaluated_once_via_subsetting() {
+        // Le sélecteur est une expression : 2*x. x=3 → 6 → "six".
+        let mut s = session();
+        run(
+            "data out; length w $8; x = 3; \
+             select (2 * x); \
+               when (6) w = 'six'; \
+               otherwise w = 'no'; \
+             end; \
+             output; \
+             run;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        assert_eq!(str_col(&ds, "w"), vec!["six".to_string()]);
+    }
+
+    // ── M16.3 : DO sur liste de valeurs, DO OVER, RETAIN littéraux date ───
+
+    #[test]
+    fn do_list_numeric_explicit_values() {
+        // `do i = 1, 3, 5, 7;` — somme et dernière valeur.
+        let mut s = session();
+        run(
+            "data out; s = 0; do i = 1, 3, 5, 7; s = s + i; end; run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(num_at(&s, "out", "s", 0), Some(16.0));
+        // À la sortie d'une liste, l'index garde la DERNIÈRE valeur (≠ TO).
+        assert_eq!(num_at(&s, "out", "i", 0), Some(7.0));
+    }
+
+    #[test]
+    fn do_list_unordered_values() {
+        // Ordre quelconque honoré tel quel : 5, 1, 9.
+        let mut s = session();
+        run(
+            "data out; n = 0; do i = 5, 1, 9; n + 1; last = i; end; run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(num_at(&s, "out", "n", 0), Some(3.0));
+        assert_eq!(num_at(&s, "out", "last", 0), Some(9.0));
+    }
+
+    #[test]
+    fn do_list_single_value() {
+        // `do i = 42;` — liste à un élément (boucle une fois).
+        let mut s = session();
+        run("data out; c = 0; do i = 42; c + 1; end; run;", &mut s).unwrap();
+        assert_eq!(num_at(&s, "out", "c", 0), Some(1.0));
+        assert_eq!(num_at(&s, "out", "i", 0), Some(42.0));
+    }
+
+    #[test]
+    fn do_list_character_values() {
+        // `do color = 'red', 'blue', 'green';` — char.
+        let mut s = session();
+        run(
+            "data out; length color $5; n = 0; \
+             do color = 'red', 'blue', 'green'; n + 1; end; run;",
+            &mut s,
+        )
+        .unwrap();
+        // Dernière valeur conservée ; n = 3.
+        assert_eq!(num_at(&s, "out", "n", 0), Some(3.0));
+        let ds = read_work(&s, "out");
+        assert_eq!(str_col(&ds, "color"), vec!["green".to_string()]);
+    }
+
+    #[test]
+    fn do_list_mixed_range_and_explicit() {
+        // `do i = 1 to 5 by 2, 10, 20 to 22;` → 1,3,5,10,20,21,22 (7 valeurs).
+        let mut s = session();
+        run(
+            "data out; n = 0; s = 0; \
+             do i = 1 to 5 by 2, 10, 20 to 22; n + 1; s = s + i; end; run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(num_at(&s, "out", "n", 0), Some(7.0));
+        // 1+3+5+10+20+21+22 = 82.
+        assert_eq!(num_at(&s, "out", "s", 0), Some(82.0));
+        // Dernière valeur = 22.
+        assert_eq!(num_at(&s, "out", "i", 0), Some(22.0));
+    }
+
+    #[test]
+    fn do_list_range_first_then_values() {
+        // `1 to 12 by 2, 0` : c'est une LISTE (à cause de la virgule) → le
+        // range énumère 1,3,5,7,9,11 puis la valeur 0 ; 7 tours, index final 0.
+        let mut s = session();
+        run(
+            "data out; n = 0; do month = 1 to 12 by 2, 0; n + 1; end; run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(num_at(&s, "out", "n", 0), Some(7.0));
+        // En LISTE, l'index garde la dernière valeur (≠ TO classique).
+        assert_eq!(num_at(&s, "out", "month", 0), Some(0.0));
+    }
+
+    #[test]
+    fn do_over_1d_iterates_all_elements() {
+        // DO OVER 1-D : `arr` nu = élément courant ; on double chaque élément.
+        let mut s = session();
+        run(
+            "data out; array a{5} v1-v5; \
+             do i = 1 to 5; a{i} = i; end; \
+             do over a; a = a * 10; end; run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(num_at(&s, "out", "v1", 0), Some(10.0));
+        assert_eq!(num_at(&s, "out", "v2", 0), Some(20.0));
+        assert_eq!(num_at(&s, "out", "v3", 0), Some(30.0));
+        assert_eq!(num_at(&s, "out", "v4", 0), Some(40.0));
+        assert_eq!(num_at(&s, "out", "v5", 0), Some(50.0));
+    }
+
+    #[test]
+    fn do_over_1d_reads_current_element_into_accumulator() {
+        // `arr` en lecture nue dans une accumulation.
+        let mut s = session();
+        run(
+            "data out; array a{4} v1-v4 (3 6 9 12); \
+             tot = 0; do over a; tot = tot + a; end; run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(num_at(&s, "out", "tot", 0), Some(30.0));
+    }
+
+    #[test]
+    fn do_over_static_indexed_access_inside_loop() {
+        // Accès indexé `a{1}` reste STATIQUE même dans DO OVER : on lit le
+        // premier élément à chaque tour.
+        let mut s = session();
+        run(
+            "data out; array a{3} v1-v3 (5 6 7); \
+             firstsum = 0; do over a; firstsum = firstsum + a{1}; end; run;",
+            &mut s,
+        )
+        .unwrap();
+        // a{1}=5 lu 3 fois → 15.
+        assert_eq!(num_at(&s, "out", "firstsum", 0), Some(15.0));
+    }
+
+    #[test]
+    fn do_over_multidim_row_major_order() {
+        // DO OVER sur un array 2×3 : itération row-major (= ordre des slots).
+        // On affecte des valeurs croissantes par tour pour vérifier l'ordre.
+        let mut s = session();
+        run(
+            "data out; array m{2,3} v1-v6; \
+             k = 0; do over m; k + 1; m = k; end; run;",
+            &mut s,
+        )
+        .unwrap();
+        // Row-major : v1=1, v2=2, ..., v6=6.
+        assert_eq!(num_at(&s, "out", "v1", 0), Some(1.0));
+        assert_eq!(num_at(&s, "out", "v2", 0), Some(2.0));
+        assert_eq!(num_at(&s, "out", "v3", 0), Some(3.0));
+        assert_eq!(num_at(&s, "out", "v4", 0), Some(4.0));
+        assert_eq!(num_at(&s, "out", "v5", 0), Some(5.0));
+        assert_eq!(num_at(&s, "out", "v6", 0), Some(6.0));
+    }
+
+    #[test]
+    fn do_over_char_array() {
+        // DO OVER sur array caractère : uppercase de chaque élément.
+        let mut s = session();
+        run(
+            "data out; array c{3} $3 a b cc; \
+             a = 'foo'; b = 'bar'; cc = 'baz'; \
+             do over c; c = upcase(c); end; run;",
+            &mut s,
+        )
+        .unwrap();
+        let ds = read_work(&s, "out");
+        assert_eq!(str_col(&ds, "a"), vec!["FOO".to_string()]);
+        assert_eq!(str_col(&ds, "b"), vec!["BAR".to_string()]);
+        assert_eq!(str_col(&ds, "cc"), vec!["BAZ".to_string()]);
+    }
+
+    #[test]
+    fn retain_date_literal_bare_suffix() {
+        // `retain d 21710d;` — 21710 est la valeur SAS date (2019-06-14).
+        let mut s = session();
+        run("data out; retain d 21710d; run;", &mut s).unwrap();
+        assert_eq!(num_at(&s, "out", "d", 0), Some(21710.0));
+    }
+
+    #[test]
+    fn retain_date_literal_quoted() {
+        // `retain d '01JAN1960'd;` — l'époque SAS = 0.
+        let mut s = session();
+        run("data out; retain d '01JAN1960'd; run;", &mut s).unwrap();
+        assert_eq!(num_at(&s, "out", "d", 0), Some(0.0));
+        // '02JAN1960'd = 1.
+        let mut s2 = session();
+        run("data out; retain e '02JAN1960'd; run;", &mut s2).unwrap();
+        assert_eq!(num_at(&s2, "out", "e", 0), Some(1.0));
+    }
+
+    #[test]
+    fn retain_datetime_literal() {
+        // `retain dt '01JAN1960 00:00:00'dt;` = 0 secondes depuis l'époque.
+        let mut s = session();
+        run(
+            "data out; retain dt '01JAN1960 00:00:00'dt; run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(num_at(&s, "out", "dt", 0), Some(0.0));
+        // '01JAN1960 00:01:00'dt = 60 secondes.
+        let mut s2 = session();
+        run(
+            "data out; retain dt '01JAN1960 00:01:00'dt; run;",
+            &mut s2,
+        )
+        .unwrap();
+        assert_eq!(num_at(&s2, "out", "dt", 0), Some(60.0));
+    }
+
+    #[test]
+    fn retain_date_literal_is_retained_across_iterations() {
+        // La valeur initiale issue d'un littéral date est bien RETENUE :
+        // on l'incrémente à chaque obs lue.
+        let mut s = session();
+        write_class(&s, "inp");
+        run(
+            "data out; set inp; retain d 100d; d = d + 1; run;",
+            &mut s,
+        )
+        .unwrap();
+        // 100 (initial) +1 par obs : 101, 102, 103.
+        assert_eq!(num_at(&s, "out", "d", 0), Some(101.0));
+        assert_eq!(num_at(&s, "out", "d", 1), Some(102.0));
+        assert_eq!(num_at(&s, "out", "d", 2), Some(103.0));
+    }
+
+    #[test]
+    fn do_over_then_index_value_independent() {
+        // Intégration M16.2 : DO OVER puis accès indexé hors boucle.
+        let mut s = session();
+        run(
+            "data out; array a{3} x y z (1 2 3); \
+             do over a; a = a + 100; end; \
+             p = a{2}; run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(num_at(&s, "out", "x", 0), Some(101.0));
+        assert_eq!(num_at(&s, "out", "y", 0), Some(102.0));
+        assert_eq!(num_at(&s, "out", "z", 0), Some(103.0));
+        assert_eq!(num_at(&s, "out", "p", 0), Some(102.0));
+    }
+
+    // ── M16.4 : SET options END= / NOBS= / POINT= + multi-datasets ────────
+
+    fn run_err(src: &str, session: &mut Session) -> String {
+        let file = SourceFile::new(src);
+        let mut ts = StatementStream::new(&file).unwrap();
+        assert!(ts.next().is_kw("data"));
+        let ast = crate::parser::datastep::parse_data_step(&mut ts).unwrap();
+        match compile(&ast, session).and_then(|p| execute(p, session)) {
+            Ok(_) => panic!("expected an error, got Ok"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// SET de 3 datasets : concaténation dans l'ordre, comptes par dataset.
+    #[test]
+    fn set_three_datasets_concatenates_in_order() {
+        let mut s = session();
+        write_num_ds(&s, "a", &[("x", some(&[1.0, 2.0]))]);
+        write_num_ds(&s, "b", &[("x", some(&[3.0]))]);
+        write_num_ds(&s, "c", &[("x", some(&[4.0, 5.0]))]);
+        let stats = run("data out; set a b c; run;", &mut s).unwrap();
+        assert_eq!(col(&s, "out", "x"), some(&[1.0, 2.0, 3.0, 4.0, 5.0]));
+        assert_eq!(
+            stats.read,
+            vec![
+                ("WORK.A".to_string(), 2),
+                ("WORK.B".to_string(), 1),
+                ("WORK.C".to_string(), 2),
+            ]
+        );
+    }
+
+    /// END= sur un seul dataset : 0 sauf la dernière obs.
+    #[test]
+    fn end_option_single_dataset() {
+        let mut s = session();
+        write_num_ds(&s, "a", &[("x", some(&[10.0, 20.0, 30.0]))]);
+        run("data out; set a end=eof; flag = eof; run;", &mut s).unwrap();
+        assert_eq!(col(&s, "out", "flag"), some(&[0.0, 0.0, 1.0]));
+        // eof n'est PAS écrite en sortie (variable automatique).
+        assert!(read_work(&s, "out").df.column("eof").is_err());
+    }
+
+    /// END= permet une logique « dernière observation » (totaux).
+    #[test]
+    fn end_option_drives_last_obs_logic() {
+        let mut s = session();
+        write_num_ds(&s, "a", &[("x", some(&[1.0, 2.0, 3.0, 4.0]))]);
+        run(
+            "data out; set a end=eof; retain total 0; total + x; \
+             if eof then output; run;",
+            &mut s,
+        )
+        .unwrap();
+        // Une seule obs sortie : le total final.
+        assert_eq!(read_work(&s, "out").n_obs(), 1);
+        assert_eq!(num_at(&s, "out", "total", 0), Some(10.0));
+    }
+
+    /// END= avec plusieurs datasets : 1 seulement après la dernière obs du
+    /// DERNIER dataset.
+    #[test]
+    fn end_option_multiple_datasets() {
+        let mut s = session();
+        write_num_ds(&s, "a", &[("x", some(&[1.0, 2.0]))]);
+        write_num_ds(&s, "b", &[("x", some(&[3.0]))]);
+        run("data out; set a b end=eof; flag = eof; run;", &mut s).unwrap();
+        assert_eq!(col(&s, "out", "flag"), some(&[0.0, 0.0, 1.0]));
+    }
+
+    /// END= avec WHERE= : la dernière obs RETENUE porte eof=1.
+    #[test]
+    fn end_option_with_where() {
+        let mut s = session();
+        write_num_ds(&s, "a", &[("x", some(&[1.0, 2.0, 3.0, 4.0]))]);
+        run(
+            "data out; set a(where=(x <= 2)) end=eof; flag = eof; run;",
+            &mut s,
+        )
+        .unwrap();
+        // Seules x=1 et x=2 passent ; eof=1 sur x=2.
+        assert_eq!(col(&s, "out", "x"), some(&[1.0, 2.0]));
+        assert_eq!(col(&s, "out", "flag"), some(&[0.0, 1.0]));
+    }
+
+    /// END= avec BY (interclassement) : 1 sur la toute dernière obs servie.
+    #[test]
+    fn end_option_with_by() {
+        let mut s = session();
+        write_num_ds(&s, "a", &[("k", some(&[1.0, 3.0]))]);
+        write_num_ds(&s, "b", &[("k", some(&[2.0, 4.0]))]);
+        run(
+            "data out; set a b end=eof; by k; flag = eof; run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(col(&s, "out", "k"), some(&[1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(col(&s, "out", "flag"), some(&[0.0, 0.0, 0.0, 1.0]));
+    }
+
+    /// NOBS= : disponible AVANT la boucle (somme d'observations).
+    #[test]
+    fn nobs_option_available_before_loop() {
+        let mut s = session();
+        write_num_ds(&s, "a", &[("x", some(&[10.0, 20.0, 30.0]))]);
+        run("data out; set a nobs=n; cnt = n; run;", &mut s).unwrap();
+        // n est constant = 3 pour chaque obs.
+        assert_eq!(col(&s, "out", "cnt"), some(&[3.0, 3.0, 3.0]));
+        assert_eq!(col(&s, "out", "n"), some(&[3.0, 3.0, 3.0]));
+    }
+
+    /// NOBS= total sur plusieurs datasets.
+    #[test]
+    fn nobs_option_total_across_datasets() {
+        let mut s = session();
+        write_num_ds(&s, "a", &[("x", some(&[1.0, 2.0]))]);
+        write_num_ds(&s, "b", &[("x", some(&[3.0, 4.0, 5.0]))]);
+        run("data out; set a b nobs=n; cnt = n; run;", &mut s).unwrap();
+        assert_eq!(col(&s, "out", "cnt"), some(&[5.0, 5.0, 5.0, 5.0, 5.0]));
+    }
+
+    /// NOBS= utilisable pour une initialisation AVANT toute lecture (le test
+    /// le plus parlant : un `_N_ = 1` avec `if _n_ = 1` initialise un tableau
+    /// dimensionné par n). Ici, on vérifie juste l'accès dès la 1re itération.
+    #[test]
+    fn nobs_usable_for_initialization() {
+        let mut s = session();
+        write_num_ds(&s, "a", &[("x", some(&[7.0, 8.0]))]);
+        run(
+            "data out; set a nobs=n; if _n_ = 1 then half = n / 2; \
+             retain half; run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(col(&s, "out", "half"), some(&[1.0, 1.0]));
+    }
+
+    /// POINT= : accès direct via une boucle DO 1..NOBS + OUTPUT explicite.
+    #[test]
+    fn point_option_direct_access_loop() {
+        let mut s = session();
+        write_num_ds(&s, "a", &[("x", some(&[11.0, 22.0, 33.0]))]);
+        run(
+            "data out; do i = 1 to n; set a point=i nobs=n; output; end; stop; run;",
+            &mut s,
+        )
+        .unwrap();
+        // Toutes les obs, dans l'ordre de l'index.
+        assert_eq!(col(&s, "out", "x"), some(&[11.0, 22.0, 33.0]));
+    }
+
+    /// POINT= : lecture inverse (index décroissant).
+    #[test]
+    fn point_option_reverse_order() {
+        let mut s = session();
+        write_num_ds(&s, "a", &[("x", some(&[11.0, 22.0, 33.0]))]);
+        run(
+            "data out; do i = n to 1 by -1; set a point=i nobs=n; output; end; stop; run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(col(&s, "out", "x"), some(&[33.0, 22.0, 11.0]));
+    }
+
+    /// POINT= : accès à UNE obs précise (1-based).
+    #[test]
+    fn point_option_single_index() {
+        let mut s = session();
+        write_num_ds(&s, "a", &[("x", some(&[11.0, 22.0, 33.0]))]);
+        run(
+            "data out; p = 2; set a point=p; output; stop; run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(read_work(&s, "out").n_obs(), 1);
+        assert_eq!(num_at(&s, "out", "x", 0), Some(22.0));
+    }
+
+    /// POINT= désactive l'output implicite : sans OUTPUT, rien n'est écrit.
+    #[test]
+    fn point_option_disables_implicit_output() {
+        let mut s = session();
+        write_num_ds(&s, "a", &[("x", some(&[11.0, 22.0]))]);
+        // OUTPUT absent → 0 obs écrite (et STOP évite la boucle infinie).
+        run("data out; p = 1; set a point=p; stop; run;", &mut s).unwrap();
+        assert_eq!(read_work(&s, "out").n_obs(), 0);
+    }
+
+    /// POINT= index missing → erreur runtime « Error in variable ».
+    #[test]
+    fn point_option_missing_index_errors() {
+        let mut s = session();
+        write_num_ds(&s, "a", &[("x", some(&[11.0, 22.0]))]);
+        // p jamais affecté → missing.
+        let e = run_err("data out; set a point=p; output; stop; run;", &mut s);
+        assert!(e.contains("Error in variable"), "got: {e}");
+    }
+
+    /// POINT= index hors bornes (0) → erreur runtime.
+    #[test]
+    fn point_option_zero_index_errors() {
+        let mut s = session();
+        write_num_ds(&s, "a", &[("x", some(&[11.0, 22.0]))]);
+        let e = run_err("data out; p = 0; set a point=p; output; stop; run;", &mut s);
+        assert!(e.contains("Error in variable"), "got: {e}");
+    }
+
+    /// POINT= index trop grand → erreur runtime.
+    #[test]
+    fn point_option_out_of_bounds_errors() {
+        let mut s = session();
+        write_num_ds(&s, "a", &[("x", some(&[11.0, 22.0]))]);
+        let e = run_err("data out; p = 99; set a point=p; output; stop; run;", &mut s);
+        assert!(e.contains("Error in variable"), "got: {e}");
+    }
+
+    /// POINT= avec plusieurs datasets : index GLOBAL sur la concaténation.
+    #[test]
+    fn point_option_multiple_datasets_global_index() {
+        let mut s = session();
+        write_num_ds(&s, "a", &[("x", some(&[11.0, 22.0]))]);
+        write_num_ds(&s, "b", &[("x", some(&[33.0, 44.0]))]);
+        run(
+            "data out; do i = 1 to n; set a b point=i nobs=n; output; end; stop; run;",
+            &mut s,
+        )
+        .unwrap();
+        // n = 4 (total), index 1..4 parcourt a puis b.
+        assert_eq!(col(&s, "out", "x"), some(&[11.0, 22.0, 33.0, 44.0]));
+    }
+
+    /// POINT= incompatible avec BY → erreur de compilation/exécution.
+    #[test]
+    fn point_option_with_by_errors() {
+        let mut s = session();
+        write_num_ds(&s, "a", &[("k", some(&[1.0, 2.0]))]);
+        let e = run_err(
+            "data out; set a point=p; by k; output; stop; run;",
+            &mut s,
+        );
+        assert!(e.contains("POINT="), "got: {e}");
+    }
+
+    /// POINT= + END= : eof=1 quand l'index pointe la dernière obs.
+    #[test]
+    fn point_option_with_end() {
+        let mut s = session();
+        write_num_ds(&s, "a", &[("x", some(&[11.0, 22.0, 33.0]))]);
+        run(
+            "data out; do i = 1 to n; set a point=i nobs=n end=eof; \
+             flag = eof; output; end; stop; run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(col(&s, "out", "flag"), some(&[0.0, 0.0, 1.0]));
+    }
+
+    /// POINT= : re-lecture de la même obs (contrôle d'itération manuel).
+    #[test]
+    fn point_option_reread_same_obs() {
+        let mut s = session();
+        write_num_ds(&s, "a", &[("x", some(&[11.0, 22.0, 33.0]))]);
+        run(
+            "data out; do i = 1, 1, 3; set a point=i; output; end; stop; run;",
+            &mut s,
+        )
+        .unwrap();
+        // Index 1, 1, 3 → re-lecture autorisée.
+        assert_eq!(col(&s, "out", "x"), some(&[11.0, 11.0, 33.0]));
+    }
+
+    /// Plusieurs SET *statements* restent refusés (hors périmètre M16.4).
+    #[test]
+    fn multiple_set_statements_still_error() {
+        let mut s = session();
+        write_num_ds(&s, "a", &[("x", some(&[1.0]))]);
+        write_num_ds(&s, "b", &[("x", some(&[2.0]))]);
+        let e = run_err("data out; set a; set b; run;", &mut s);
+        assert!(e.contains("Multiple SET statements"), "got: {e}");
+    }
+
+    /// END=/NOBS= combinés : compteur de fin + total.
+    #[test]
+    fn end_and_nobs_combined() {
+        let mut s = session();
+        write_num_ds(&s, "a", &[("x", some(&[5.0, 6.0, 7.0]))]);
+        run(
+            "data out; set a end=eof nobs=n; \
+             if eof then last_total = n; retain last_total; run;",
+            &mut s,
+        )
+        .unwrap();
+        // n est connu partout ; last_total posé sur eof.
+        assert_eq!(num_at(&s, "out", "last_total", 2), Some(3.0));
+    }
+
+    // ── M16.5 : UPDATE / MODIFY ──────────────────────────────────────────
+
+    /// Écrit un dataset avec une colonne char `key` et des colonnes num.
+    /// `keys` = valeurs de la clé char ; `cols` = (nom, valeurs num).
+    fn write_keyed_ds(
+        session: &Session,
+        table: &str,
+        key: &str,
+        keys: &[&str],
+        cols: &[(&str, Vec<Option<f64>>)],
+    ) {
+        let mut columns: Vec<Column> = Vec::new();
+        let mut vars: Vec<VarMeta> = Vec::new();
+        columns.push(Series::new(key.into(), keys.to_vec()).into());
+        vars.push(VarMeta {
+            name: key.to_string(),
+            ty: VarType::Char,
+            length: 8,
+            format: None,
+            label: None,
+        });
+        for (name, vals) in cols {
+            columns.push(Series::new((*name).into(), vals.clone()).into());
+            vars.push(VarMeta {
+                name: (*name).to_string(),
+                ty: VarType::Num,
+                length: 8,
+                format: None,
+                label: None,
+            });
+        }
+        let df = DataFrame::new(columns).unwrap();
+        session
+            .libs
+            .get("WORK")
+            .unwrap()
+            .write(table, &SasDataset { df, vars })
+            .unwrap();
+    }
+
+    // ----- UPDATE -----
+
+    /// UPDATE de base : transaction superpose le maître par clé (match).
+    #[test]
+    fn update_basic_overlay() {
+        let mut s = session();
+        // maître : id=1,2,3 ; x=10,20,30
+        write_num_ds(&s, "mas", &[("id", some(&[1.0, 2.0, 3.0])), ("x", some(&[10.0, 20.0, 30.0]))]);
+        // transaction : id=2 ; x=99
+        write_num_ds(&s, "tra", &[("id", some(&[2.0])), ("x", some(&[99.0]))]);
+        let stats = run("data mas; update mas tra key=id; run;", &mut s).unwrap();
+        assert_eq!(col(&s, "mas", "id"), some(&[1.0, 2.0, 3.0]));
+        // id=2 mis à jour à 99 ; les autres inchangés.
+        assert_eq!(col(&s, "mas", "x"), some(&[10.0, 99.0, 30.0]));
+        assert_eq!(stats.written, vec![("WORK.MAS".to_string(), 3, 2)]);
+        // Deux NOTEs de lecture (maître + transaction).
+        assert_eq!(
+            stats.read,
+            vec![("WORK.MAS".to_string(), 3), ("WORK.TRA".to_string(), 1)]
+        );
+    }
+
+    /// UPDATE : une clé maître sans transaction correspondante reste inchangée.
+    #[test]
+    fn update_no_match_unchanged() {
+        let mut s = session();
+        write_num_ds(&s, "mas", &[("id", some(&[1.0, 2.0])), ("x", some(&[10.0, 20.0]))]);
+        write_num_ds(&s, "tra", &[("id", some(&[9.0])), ("x", some(&[99.0]))]);
+        run("data mas; update mas tra key=id; run;", &mut s).unwrap();
+        assert_eq!(col(&s, "mas", "x"), some(&[10.0, 20.0]));
+    }
+
+    /// UPDATE : une valeur transaction MANQUANTE ne superpose pas (no-update).
+    #[test]
+    fn update_missing_transaction_skips_overlay() {
+        let mut s = session();
+        write_num_ds(
+            &s,
+            "mas",
+            &[("id", some(&[1.0, 2.0])), ("x", some(&[10.0, 20.0])), ("y", some(&[1.0, 2.0]))],
+        );
+        // transaction id=1 : x=. (manquant → pas de MAJ), y=77 (MAJ).
+        write_num_ds(
+            &s,
+            "tra",
+            &[("id", some(&[1.0])), ("x", vec![None]), ("y", some(&[77.0]))],
+        );
+        run("data mas; update mas tra key=id; run;", &mut s).unwrap();
+        // x inchangé (transaction manquante) ; y mis à jour.
+        assert_eq!(col(&s, "mas", "x"), some(&[10.0, 20.0]));
+        assert_eq!(col(&s, "mas", "y"), some(&[77.0, 2.0]));
+    }
+
+    /// UPDATE : la variable clé n'est jamais écrasée par la transaction.
+    #[test]
+    fn update_key_not_overwritten() {
+        let mut s = session();
+        write_num_ds(&s, "mas", &[("id", some(&[5.0])), ("x", some(&[1.0]))]);
+        // La transaction porte la même clé 5 ; x=42.
+        write_num_ds(&s, "tra", &[("id", some(&[5.0])), ("x", some(&[42.0]))]);
+        run("data mas; update mas tra key=id; run;", &mut s).unwrap();
+        assert_eq!(col(&s, "mas", "id"), some(&[5.0]));
+        assert_eq!(col(&s, "mas", "x"), some(&[42.0]));
+    }
+
+    /// UPDATE : plusieurs transactions pour une clé → seule la PREMIÈRE compte.
+    #[test]
+    fn update_multiple_transactions_first_wins() {
+        let mut s = session();
+        write_num_ds(&s, "mas", &[("id", some(&[1.0])), ("x", some(&[10.0]))]);
+        write_num_ds(&s, "tra", &[("id", some(&[1.0, 1.0])), ("x", some(&[20.0, 30.0]))]);
+        run("data mas; update mas tra key=id; run;", &mut s).unwrap();
+        // Première transaction (20) appliquée, la seconde (30) ignorée.
+        assert_eq!(col(&s, "mas", "x"), some(&[20.0]));
+    }
+
+    /// UPDATE : une transaction sans maître correspondant est IGNORÉE (v1).
+    #[test]
+    fn update_unmatched_transaction_ignored() {
+        let mut s = session();
+        write_num_ds(&s, "mas", &[("id", some(&[1.0])), ("x", some(&[10.0]))]);
+        write_num_ds(&s, "tra", &[("id", some(&[1.0, 2.0])), ("x", some(&[11.0, 22.0]))]);
+        let stats = run("data mas; update mas tra key=id; run;", &mut s).unwrap();
+        // id=2 (sans maître) n'est PAS inséré : 1 obs en sortie.
+        assert_eq!(col(&s, "mas", "id"), some(&[1.0]));
+        assert_eq!(col(&s, "mas", "x"), some(&[11.0]));
+        assert_eq!(stats.written, vec![("WORK.MAS".to_string(), 1, 2)]);
+    }
+
+    /// UPDATE avec WHERE= sur le maître : les obs filtrées ne sont ni mises à
+    /// jour ni sorties.
+    #[test]
+    fn update_master_where() {
+        let mut s = session();
+        write_num_ds(&s, "mas", &[("id", some(&[1.0, 2.0, 3.0])), ("x", some(&[10.0, 20.0, 30.0]))]);
+        write_num_ds(&s, "tra", &[("id", some(&[2.0])), ("x", some(&[99.0]))]);
+        let stats = run(
+            "data out; update mas(where=(id>=2)) tra key=id; run;",
+            &mut s,
+        )
+        .unwrap();
+        // id=1 filtré ; id=2 mis à jour, id=3 inchangé.
+        assert_eq!(col(&s, "out", "id"), some(&[2.0, 3.0]));
+        assert_eq!(col(&s, "out", "x"), some(&[99.0, 30.0]));
+        // 2 obs maître lues (id=1 rejeté).
+        assert_eq!(stats.read[0], ("WORK.MAS".to_string(), 2));
+    }
+
+    /// UPDATE avec plusieurs variables clé.
+    #[test]
+    fn update_multiple_keys() {
+        let mut s = session();
+        write_num_ds(
+            &s,
+            "mas",
+            &[("k1", some(&[1.0, 1.0])), ("k2", some(&[1.0, 2.0])), ("x", some(&[10.0, 20.0]))],
+        );
+        // Met à jour seulement (1,2).
+        write_num_ds(
+            &s,
+            "tra",
+            &[("k1", some(&[1.0])), ("k2", some(&[2.0])), ("x", some(&[99.0]))],
+        );
+        run("data mas; update mas tra key=k1 k2; run;", &mut s).unwrap();
+        assert_eq!(col(&s, "mas", "x"), some(&[10.0, 99.0]));
+    }
+
+    /// UPDATE avec clé CARACTÈRE (insensible aux blancs finaux).
+    #[test]
+    fn update_char_key() {
+        let mut s = session();
+        write_keyed_ds(&s, "mas", "name", &["a", "b", "c"], &[("x", some(&[1.0, 2.0, 3.0]))]);
+        write_keyed_ds(&s, "tra", "name", &["b"], &[("x", some(&[20.0]))]);
+        run("data mas; update mas tra key=name; run;", &mut s).unwrap();
+        assert_eq!(col(&s, "mas", "x"), some(&[1.0, 20.0, 3.0]));
+    }
+
+    /// UPDATE : la transaction apporte une NOUVELLE variable absente du maître.
+    #[test]
+    fn update_new_variable_from_transaction() {
+        let mut s = session();
+        write_num_ds(&s, "mas", &[("id", some(&[1.0, 2.0])), ("x", some(&[10.0, 20.0]))]);
+        write_num_ds(&s, "tra", &[("id", some(&[1.0])), ("z", some(&[5.0]))]);
+        run("data mas; update mas tra key=id; run;", &mut s).unwrap();
+        // z existe (du maître absent → missing), posée pour id=1.
+        assert_eq!(col(&s, "mas", "z"), vec![Some(5.0), None]);
+    }
+
+    /// UPDATE : KEY= absente d'un dataset → erreur de compilation.
+    #[test]
+    fn update_key_not_on_transaction_errors() {
+        let mut s = session();
+        write_num_ds(&s, "mas", &[("id", some(&[1.0])), ("x", some(&[10.0]))]);
+        write_num_ds(&s, "tra", &[("other", some(&[1.0])), ("x", some(&[20.0]))]);
+        let e = run_err("data mas; update mas tra key=id; run;", &mut s);
+        assert!(e.contains("KEY variable id"), "got: {e}");
+    }
+
+    /// UPDATE : KEY= obligatoire (erreur de parsing si absente).
+    #[test]
+    fn update_requires_key_option() {
+        // Parsing seul : KEY= absente → erreur de parsing (pas d'exécution).
+        let file = SourceFile::new("data mas; update mas tra; run;");
+        let mut ts = StatementStream::new(&file).unwrap();
+        assert!(ts.next().is_kw("data"));
+        let err = crate::parser::datastep::parse_data_step(&mut ts).unwrap_err();
+        assert!(err.to_string().to_uppercase().contains("KEY"), "got: {err}");
+    }
+
+    /// UPDATE avec BY : FIRST./LAST. exposés sur les groupes BY du maître.
+    #[test]
+    fn update_with_by_first_last() {
+        let mut s = session();
+        // maître trié par g : g=1,1,2 ; x=10,20,30.
+        write_num_ds(
+            &s,
+            "mas",
+            &[("g", some(&[1.0, 1.0, 2.0])), ("id", some(&[1.0, 2.0, 3.0])), ("x", some(&[10.0, 20.0, 30.0]))],
+        );
+        write_num_ds(&s, "tra", &[("id", some(&[2.0])), ("x", some(&[99.0]))]);
+        run(
+            "data out; update mas tra key=id; by g; \
+             f = first.g; l = last.g; run;",
+            &mut s,
+        )
+        .unwrap();
+        // id=2 mis à jour ; FIRST.g sur les 1res obs de chaque groupe g.
+        assert_eq!(col(&s, "out", "x"), some(&[10.0, 99.0, 30.0]));
+        assert_eq!(col(&s, "out", "f"), some(&[1.0, 0.0, 1.0]));
+        assert_eq!(col(&s, "out", "l"), some(&[0.0, 1.0, 1.0]));
+    }
+
+    /// UPDATE avec BY : la mise à jour reste pilotée par KEY= au sein des
+    /// groupes BY (chaque obs maître conserve son comportement).
+    #[test]
+    fn update_with_by_groups_update() {
+        let mut s = session();
+        write_num_ds(
+            &s,
+            "mas",
+            &[("g", some(&[1.0, 2.0])), ("id", some(&[1.0, 2.0])), ("x", some(&[10.0, 20.0]))],
+        );
+        write_num_ds(&s, "tra", &[("id", some(&[1.0, 2.0])), ("x", some(&[100.0, 200.0]))]);
+        run("data out; update mas tra key=id; by g; run;", &mut s).unwrap();
+        assert_eq!(col(&s, "out", "x"), some(&[100.0, 200.0]));
+    }
+
+    /// UPDATE : le corps peut calculer des variables dérivées.
+    #[test]
+    fn update_with_derived_body_statement() {
+        let mut s = session();
+        write_num_ds(&s, "mas", &[("id", some(&[1.0, 2.0])), ("x", some(&[10.0, 20.0]))]);
+        write_num_ds(&s, "tra", &[("id", some(&[1.0])), ("x", some(&[100.0]))]);
+        run("data out; update mas tra key=id; d = x * 2; run;", &mut s).unwrap();
+        // x après MAJ : 100, 20 ; d = 200, 40.
+        assert_eq!(col(&s, "out", "x"), some(&[100.0, 20.0]));
+        assert_eq!(col(&s, "out", "d"), some(&[200.0, 40.0]));
+    }
+
+    // ----- MODIFY -----
+
+    /// MODIFY de base : une modification par assignation persiste en place.
+    #[test]
+    fn modify_basic_assign_persists() {
+        let mut s = session();
+        write_num_ds(&s, "d", &[("id", some(&[1.0, 2.0, 3.0])), ("x", some(&[10.0, 20.0, 30.0]))]);
+        let stats = run("data d; modify d; x = x + 1; run;", &mut s).unwrap();
+        assert_eq!(col(&s, "d", "x"), some(&[11.0, 21.0, 31.0]));
+        // Réécriture en place : même nombre d'obs/variables.
+        assert_eq!(stats.written, vec![("WORK.D".to_string(), 3, 2)]);
+        assert_eq!(stats.read, vec![("WORK.D".to_string(), 3)]);
+        assert_eq!(s.last_dataset.as_deref(), Some("WORK.D"));
+    }
+
+    /// MODIFY : conditionnel (modifie seulement certaines obs).
+    #[test]
+    fn modify_conditional_update() {
+        let mut s = session();
+        write_num_ds(&s, "d", &[("id", some(&[1.0, 2.0, 3.0])), ("x", some(&[10.0, 20.0, 30.0]))]);
+        run("data d; modify d; if id = 2 then x = 999; run;", &mut s).unwrap();
+        assert_eq!(col(&s, "d", "x"), some(&[10.0, 999.0, 30.0]));
+    }
+
+    /// MODIFY : OUTPUT explicite est INTERDIT (erreur de compilation).
+    #[test]
+    fn modify_output_not_allowed() {
+        let mut s = session();
+        write_num_ds(&s, "d", &[("x", some(&[1.0]))]);
+        let e = run_err("data d; modify d; output; run;", &mut s);
+        assert!(e.contains("OUTPUT statement is not allowed"), "got: {e}");
+    }
+
+    /// MODIFY avec KEY= (lecture séquentielle, clés présentes).
+    #[test]
+    fn modify_with_key() {
+        let mut s = session();
+        write_num_ds(&s, "d", &[("id", some(&[1.0, 2.0])), ("x", some(&[10.0, 20.0]))]);
+        run("data d; modify d key=id; x = x * 10; run;", &mut s).unwrap();
+        assert_eq!(col(&s, "d", "x"), some(&[100.0, 200.0]));
+    }
+
+    /// MODIFY + NOBS= : le total est disponible avant la boucle.
+    #[test]
+    fn modify_nobs_available() {
+        let mut s = session();
+        write_num_ds(&s, "d", &[("x", some(&[5.0, 6.0, 7.0]))]);
+        run("data d; modify d nobs=n; x = n; run;", &mut s).unwrap();
+        // Chaque obs reçoit le total = 3.
+        assert_eq!(col(&s, "d", "x"), some(&[3.0, 3.0, 3.0]));
+    }
+
+    /// MODIFY + POINT= : accès direct piloté par un DO, modifie toutes les obs.
+    #[test]
+    fn modify_point_loop_all() {
+        let mut s = session();
+        write_num_ds(&s, "d", &[("x", some(&[10.0, 20.0, 30.0]))]);
+        let stats = run(
+            "data d; do p = 1 to 3; modify d point=p; x = x + 100; end; run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(col(&s, "d", "x"), some(&[110.0, 120.0, 130.0]));
+        // 3 obs traitées, 3 réécrites.
+        assert_eq!(stats.read, vec![("WORK.D".to_string(), 3)]);
+        assert_eq!(stats.written, vec![("WORK.D".to_string(), 3, 1)]);
+    }
+
+    /// MODIFY + POINT= : accès direct ciblé (une seule obs modifiée).
+    #[test]
+    fn modify_point_single_row() {
+        let mut s = session();
+        write_num_ds(&s, "d", &[("x", some(&[10.0, 20.0, 30.0]))]);
+        run(
+            "data d; do p = 2 to 2; modify d point=p; x = 999; end; run;",
+            &mut s,
+        )
+        .unwrap();
+        // Seule la 2e obs change.
+        assert_eq!(col(&s, "d", "x"), some(&[10.0, 999.0, 30.0]));
+    }
+
+    /// MODIFY : char + num, modification d'une colonne char persiste.
+    #[test]
+    fn modify_char_column() {
+        let mut s = session();
+        write_keyed_ds(&s, "d", "grp", &["a", "a", "b"], &[("x", some(&[1.0, 2.0, 3.0]))]);
+        run("data d; modify d; if x >= 2 then grp = 'z'; run;", &mut s).unwrap();
+        assert_eq!(
+            col_str(&s, "d", "grp"),
+            vec![Some("a".into()), Some("z".into()), Some("z".into())]
+        );
+    }
+
+    /// MODIFY : KEY= absente du dataset → erreur de compilation.
+    #[test]
+    fn modify_key_not_present_errors() {
+        let mut s = session();
+        write_num_ds(&s, "d", &[("x", some(&[1.0]))]);
+        let e = run_err("data d; modify d key=nope; run;", &mut s);
+        assert!(e.contains("KEY variable nope"), "got: {e}");
+    }
+
+    /// UPDATE/MODIFY exclusif : pas plus d'une source par étape.
+    #[test]
+    fn update_after_set_is_error() {
+        let mut s = session();
+        write_num_ds(&s, "a", &[("id", some(&[1.0]))]);
+        write_num_ds(&s, "b", &[("id", some(&[1.0]))]);
+        let e = run_err("data out; set a; update a b key=id; run;", &mut s);
+        assert!(e.contains("Only one SET, MERGE, UPDATE, or MODIFY"), "got: {e}");
+    }
+
+    /// MODIFY après MODIFY → erreur.
+    #[test]
+    fn modify_twice_is_error() {
+        let mut s = session();
+        write_num_ds(&s, "a", &[("x", some(&[1.0]))]);
+        write_num_ds(&s, "b", &[("x", some(&[1.0]))]);
+        let e = run_err("data a; modify a; modify b; run;", &mut s);
+        assert!(e.contains("Only one SET, MERGE, UPDATE, or MODIFY"), "got: {e}");
+    }
+
+    // ── M16.6 : LINK / RETURN / GOTO / labels / RETAIN _ALL_ ─────────────
+
+    /// LINK/RETURN de base : appel d'une sous-routine étiquetée, retour après.
+    /// Structure SAS idiomatique : la ligne principale se termine par un RETURN
+    /// (output implicite), puis les sous-routines suivent.
+    #[test]
+    fn link_basic_call_and_return() {
+        let mut s = session();
+        run(
+            "data out; x = 1; link sub; y = x; return; \
+             sub: x = 10; return; \
+             run;",
+            &mut s,
+        )
+        .unwrap();
+        // x=1, LINK sub → x=10, RETURN → reprise : y=x=10, RETURN principal →
+        // output implicite (la sous-routine n'est pas exécutée en chute).
+        assert_eq!(col(&s, "out", "x"), vec![Some(10.0)]);
+        assert_eq!(col(&s, "out", "y"), vec![Some(10.0)]);
+    }
+
+    /// LINK imbriqué : la pile d'adresses de retour est correcte.
+    #[test]
+    fn link_nested_stack() {
+        let mut s = session();
+        run(
+            "data out; a = 0; link one; a = a + 1; return; \
+             one: a = a + 10; link two; a = a + 100; return; \
+             two: a = a + 1000; return; \
+             run;",
+            &mut s,
+        )
+        .unwrap();
+        // a: 0 → link one → +10 (10) → link two → +1000 (1010) → return one
+        // → +100 (1110) → return main → +1 (1111). stop.
+        assert_eq!(col(&s, "out", "a"), vec![Some(1111.0)]);
+    }
+
+    /// GOTO : saut inconditionnel (les statements entre le GOTO et la cible
+    /// sont ignorés).
+    #[test]
+    fn goto_unconditional_jump() {
+        let mut s = session();
+        run(
+            "data out; x = 1; goto skip; x = 999; skip: y = x; run;",
+            &mut s,
+        )
+        .unwrap();
+        // x=1, GOTO skip → x=999 sauté, y=x=1 ; chute en fin → output implicite.
+        assert_eq!(col(&s, "out", "x"), vec![Some(1.0)]);
+        assert_eq!(col(&s, "out", "y"), vec![Some(1.0)]);
+    }
+
+    /// GOTO qui sort d'une boucle DO (termine la boucle prématurément).
+    #[test]
+    fn goto_breaks_out_of_do_loop() {
+        let mut s = session();
+        run(
+            "data out; total = 0; \
+             do i = 1 to 100; total = total + i; if i = 5 then goto done; end; \
+             done: ; run;",
+            &mut s,
+        )
+        .unwrap();
+        // 1+2+3+4+5 = 15 ; la boucle est terminée par le GOTO à i=5.
+        assert_eq!(col(&s, "out", "total"), vec![Some(15.0)]);
+        assert_eq!(col(&s, "out", "i"), vec![Some(5.0)]);
+    }
+
+    /// GOTO avec plusieurs étiquettes : ciblage correct.
+    #[test]
+    fn goto_multiple_labels_targets_correctly() {
+        let mut s = session();
+        run(
+            "data out; x = 1; goto third; \
+             first: r = 1; goto fin; \
+             second: r = 2; goto fin; \
+             third: r = 3; goto fin; \
+             fin: ; run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(col(&s, "out", "r"), vec![Some(3.0)]);
+    }
+
+    /// Étiquette sur divers statements (ici un bloc DO et une assignation).
+    #[test]
+    fn label_on_various_statements() {
+        let mut s = session();
+        run(
+            "data out; goto blk; a = 1; \
+             blk: do; a = 7; b = 8; end; \
+             after: c = 9; run;",
+            &mut s,
+        )
+        .unwrap();
+        // GOTO blk saute `a = 1` ; le bloc DO étiqueté pose a=7,b=8 ; puis c=9.
+        assert_eq!(col(&s, "out", "a"), vec![Some(7.0)]);
+        assert_eq!(col(&s, "out", "b"), vec![Some(8.0)]);
+        assert_eq!(col(&s, "out", "c"), vec![Some(9.0)]);
+    }
+
+    /// RETURN sans LINK actif : termine l'itération (output implicite), pas une
+    /// erreur. La variable assignée APRÈS le RETURN n'est pas affectée.
+    #[test]
+    fn return_without_link_ends_iteration() {
+        let mut s = session();
+        let stats = run(
+            "data out; x = 1; return; x = 2; run;",
+            &mut s,
+        )
+        .unwrap();
+        // RETURN sans LINK → fin d'itération avec output implicite : x=1.
+        assert_eq!(stats.written, vec![("WORK.OUT".to_string(), 1, 1)]);
+        assert_eq!(col(&s, "out", "x"), vec![Some(1.0)]);
+    }
+
+    /// GOTO vers une étiquette inexistante : erreur de compilation.
+    #[test]
+    fn goto_undefined_label_compile_error() {
+        let mut s = session();
+        let e = run_err("data out; x = 1; goto nowhere; run;", &mut s);
+        assert!(
+            e.contains("NOWHERE") && e.contains("not defined"),
+            "got: {e}"
+        );
+    }
+
+    /// LINK vers une étiquette inexistante : erreur de compilation.
+    #[test]
+    fn link_undefined_label_compile_error() {
+        let mut s = session();
+        let e = run_err("data out; x = 1; link nowhere; run;", &mut s);
+        assert!(
+            e.contains("NOWHERE") && e.contains("not defined"),
+            "got: {e}"
+        );
+    }
+
+    /// Étiquette définie deux fois : erreur de compilation.
+    #[test]
+    fn duplicate_label_compile_error() {
+        let mut s = session();
+        let e = run_err("data out; lbl: x = 1; lbl: x = 2; goto lbl; run;", &mut s);
+        assert!(e.contains("LBL") && e.contains("more than once"), "got: {e}");
+    }
+
+    /// GOTO vers une étiquette imbriquée dans un bloc DO : non supporté (erreur).
+    #[test]
+    fn goto_into_nested_block_compile_error() {
+        let mut s = session();
+        let e = run_err(
+            "data out; goto inner; do; inner: x = 1; end; stop; run;",
+            &mut s,
+        );
+        assert!(e.contains("INNER") && e.contains("nested"), "got: {e}");
+    }
+
+    /// RETAIN _ALL_ : toutes les variables connues sont retenues à travers les
+    /// itérations.
+    #[test]
+    fn retain_all_retains_every_variable() {
+        let mut s = session();
+        write_num_ds(&s, "inp", &[("x", some(&[1.0, 2.0, 3.0]))]);
+        run(
+            "data out; set inp; retain a b; a = 0; b = 0; retain _all_; \
+             a = a + x; b = b + 1; run;",
+            &mut s,
+        )
+        .unwrap();
+        // a et b retenus (cumul) : a = 1,3,6 ; b = 1,2,3. Mais `a=0;b=0;` les
+        // remet à 0 AVANT le cumul, à CHAQUE itération → a=x, b=1. On teste donc
+        // que la retenue n'empêche pas la ré-assignation explicite : a=1,2,3.
+        assert_eq!(col(&s, "out", "a"), vec![Some(1.0), Some(2.0), Some(3.0)]);
+        assert_eq!(col(&s, "out", "b"), vec![Some(1.0), Some(1.0), Some(1.0)]);
+    }
+
+    /// RETAIN _ALL_ : effet cumulatif réel (pas de remise à missing entre
+    /// itérations) pour une variable jamais ré-initialisée. `t` est initialisé
+    /// à 0 à la 1re itération seulement, puis RETAIN _ALL_ le préserve.
+    #[test]
+    fn retain_all_accumulates() {
+        let mut s = session();
+        write_num_ds(&s, "inp", &[("x", some(&[1.0, 2.0, 3.0, 4.0]))]);
+        run(
+            "data out; set inp; if _n_ = 1 then t = 0; retain _all_; t = t + x; run;",
+            &mut s,
+        )
+        .unwrap();
+        // t=0 à la 1re obs, retenu ensuite (jamais remis à missing) → cumul :
+        // 1, 3, 6, 10.
+        assert_eq!(
+            col(&s, "out", "t"),
+            vec![Some(1.0), Some(3.0), Some(6.0), Some(10.0)]
+        );
+    }
+
+    /// RETAIN _ALL_ mélangé à un RETAIN explicite avec valeur initiale : la
+    /// valeur initiale du RETAIN explicite est honorée.
+    #[test]
+    fn retain_all_mixed_with_explicit_retain() {
+        let mut s = session();
+        write_num_ds(&s, "inp", &[("x", some(&[1.0, 2.0, 3.0]))]);
+        run(
+            "data out; set inp; retain base 100; if _n_ = 1 then sum = 0; \
+             retain _all_; sum = sum + x; run;",
+            &mut s,
+        )
+        .unwrap();
+        // base retenu avec init 100 (jamais réassigné) ; sum cumulé.
+        assert_eq!(
+            col(&s, "out", "base"),
+            vec![Some(100.0), Some(100.0), Some(100.0)]
+        );
+        assert_eq!(col(&s, "out", "sum"), vec![Some(1.0), Some(3.0), Some(6.0)]);
+    }
+
+    /// Variable créée APRÈS RETAIN _ALL_ : NON retenue automatiquement (remise à
+    /// missing à chaque itération).
+    #[test]
+    fn variable_created_after_retain_all_not_retained() {
+        let mut s = session();
+        write_num_ds(&s, "inp", &[("x", some(&[5.0, 6.0, 7.0]))]);
+        run(
+            "data out; set inp; retain _all_; later = later + x; run;",
+            &mut s,
+        )
+        .unwrap();
+        // `later` n'existe PAS au point du RETAIN _ALL_ (créée par sa 1re
+        // référence ensuite) → non retenue → remise à missing chaque itération
+        // → later = . + x = . (missing propagé).
+        assert_eq!(col(&s, "out", "later"), vec![None, None, None]);
+    }
+
+    /// LINK dans une boucle : l'itération de la boucle reprend après le retour.
+    #[test]
+    fn link_inside_do_loop_continues_iteration() {
+        let mut s = session();
+        run(
+            "data out; total = 0; \
+             do i = 1 to 4; link addit; end; \
+             return; \
+             addit: total = total + i; return; \
+             run;",
+            &mut s,
+        )
+        .unwrap();
+        // total = 1+2+3+4 = 10 ; la boucle continue après chaque RETURN.
+        assert_eq!(col(&s, "out", "total"), vec![Some(10.0)]);
+        assert_eq!(col(&s, "out", "i"), vec![Some(5.0)]);
+    }
+
+    /// Modifications de variables dans le code LINKé : persistance (PDV partagé).
+    #[test]
+    fn link_modifications_persist() {
+        let mut s = session();
+        run(
+            "data out; x = 5; y = 0; link doit; z = x + y; return; \
+             doit: x = x * 2; y = 100; return; run;",
+            &mut s,
+        )
+        .unwrap();
+        // doit : x=10, y=100 (persistants) ; z = 10 + 100 = 110.
+        assert_eq!(col(&s, "out", "x"), vec![Some(10.0)]);
+        assert_eq!(col(&s, "out", "y"), vec![Some(100.0)]);
+        assert_eq!(col(&s, "out", "z"), vec![Some(110.0)]);
+    }
+
+    /// Entrées multiples vers la même étiquette via LINK (réutilisation).
+    #[test]
+    fn multiple_link_entries_same_label() {
+        let mut s = session();
+        run(
+            "data out; c = 0; link bump; link bump; link bump; return; \
+             bump: c = c + 1; return; run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(col(&s, "out", "c"), vec![Some(3.0)]);
+    }
+
+    /// GOTO en arrière formant une boucle, terminée par une condition.
+    #[test]
+    fn goto_backward_forms_loop() {
+        let mut s = session();
+        run(
+            "data out; n = 0; \
+             loop: n = n + 1; if n < 5 then goto loop; \
+             run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(col(&s, "out", "n"), vec![Some(5.0)]);
+    }
+
+    /// LINK depuis une sous-routine LINK vers une troisième : pile à 2 niveaux,
+    /// chaque RETURN reprend au bon endroit.
+    #[test]
+    fn link_chain_returns_in_order() {
+        let mut s = session();
+        run(
+            "data out; trace = 0; link a; trace = trace * 10 + 9; return; \
+             a: trace = trace * 10 + 1; link b; trace = trace * 10 + 2; return; \
+             b: trace = trace * 10 + 3; return; \
+             run;",
+            &mut s,
+        )
+        .unwrap();
+        // 0 → a: *10+1 = 1 → b: *10+3 = 13 → ret a: *10+2 = 132 → ret main:
+        // *10+9 = 1329.
+        assert_eq!(col(&s, "out", "trace"), vec![Some(1329.0)]);
+    }
+
+    /// `go to label;` (forme en deux mots) équivalente à `goto label;`.
+    #[test]
+    fn go_to_two_word_form() {
+        let mut s = session();
+        run(
+            "data out; x = 1; go to skip; x = 999; skip: ; run;",
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(col(&s, "out", "x"), vec![Some(1.0)]);
+    }
+
+    /// GOTO/LINK fonctionnent sur plusieurs itérations d'un SET (la pile de
+    /// retour est ré-initialisée à chaque itération).
+    #[test]
+    fn link_resets_per_iteration() {
+        let mut s = session();
+        write_num_ds(&s, "inp", &[("x", some(&[1.0, 2.0, 3.0]))]);
+        run(
+            "data out; set inp; link dbl; stop_marker: ; goto past; \
+             dbl: d = x * 2; return; \
+             past: ; run;",
+            &mut s,
+        )
+        .unwrap();
+        // Chaque itération : link dbl (d=2x), retour, goto past (saute rien),
+        // output implicite. d = 2,4,6 sur les 3 obs.
+        assert_eq!(
+            col(&s, "out", "d"),
+            vec![Some(2.0), Some(4.0), Some(6.0)]
+        );
+    }
+
+    /// RETAIN _ALL_ n'autorise pas de valeur initiale.
+    #[test]
+    fn retain_all_rejects_initial_value() {
+        let mut s = session();
+        let e = run_err("data out; x = 1; retain _all_ 5; run;", &mut s);
+        assert!(e.contains("initial value"), "got: {e}");
     }
 }

@@ -33,7 +33,6 @@ pub fn write_class_parquet(dir: &Path) {
     ParquetWriter::new(&mut file).finish(&mut df).unwrap();
 }
 
-/// Petit CSV d'entrée pour les fixtures M14 (PROC IMPORT, LIBNAME CSV).
 /// Écrit `<dir>/pets.csv` à côté de `class.parquet` ; ignoré par les
 /// fixtures qui ne le référencent pas (chemin relatif → snapshots stables).
 pub fn write_pets_csv(dir: &Path) {

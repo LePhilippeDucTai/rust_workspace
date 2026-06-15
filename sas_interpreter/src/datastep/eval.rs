@@ -36,7 +36,6 @@ use crate::ast::{BinaryOp, Expr, UnaryOp};
 use crate::value::Value;
 use std::collections::HashMap;
 
-#[derive(Default)]
 pub struct EvalCtx {
     pub missing_generated: u32,
     pub division_by_zero: u32,
@@ -47,9 +46,9 @@ pub struct EvalCtx {
     /// Erreur fatale (fonction inconnue, indice d'array hors bornes...) —
     /// stoppe l'étape.
     pub fatal: Option<String>,
-    /// Arrays 1-D de l'étape : nom UPPERCASE → slots PDV des éléments
+    /// Arrays de l'étape : nom UPPERCASE → définition (slots + dimensions)
     /// (copié depuis `StepProgram.arrays` par l'exécuteur).
-    pub arrays: HashMap<String, Vec<usize>>,
+    pub arrays: HashMap<String, super::ArrayDef>,
     /// Flags de groupe BY `(nom UPPERCASE, first, last)`, dans l'ordre du
     /// BY — mis à jour par le Runner à chaque observation servie par
     /// l'interclassement. Servent les variables automatiques FIRST.x /
@@ -79,12 +78,46 @@ pub struct EvalCtx {
     /// la feature `macros` il reflète l'état des `%let`/symput antérieurs ;
     /// sous le build par défaut il est vide (aucune résolution macro).
     pub macro_symbols: HashMap<String, String>,
-    /// Mode `--deterministic` : sous ce drapeau, les fonctions dépendantes de
-    /// l'horloge (`TODAY`/`DATE`/`DATETIME`) renvoient une valeur FIGÉE
-    /// (le 01JAN1960, soit la date 0 / le datetime 0) afin que les snapshots
-    /// restent stables. Câblé depuis `Session::deterministic` par l'exécuteur ;
-    /// `false` par défaut (chemin horloge réelle).
-    pub deterministic: bool,
+    /// RNG state for RAND*, RANUNI, RANNOR, RANEXP, RANBIN, CALL STREAMINIT
+    /// (M15.5). Uses a simple LCG seeded at construction time. CALL STREAMINIT
+    /// resets it. Box-Muller stores a spare normal variate in `rng_spare`.
+    pub rng_state: u64,
+    /// Cached spare normal variate from Box-Muller (set when a pair is
+    /// generated; consumed on the next RANNOR call).
+    pub rng_spare: Option<f64>,
+    /// `DO OVER` actifs (M16.3) : nom d'array UPPERCASE → slot PDV de
+    /// l'élément courant. Une référence NUE au nom de l'array (lecture ou
+    /// écriture) y est redirigée. Empilé/dépilé par le Runner à chaque tour.
+    pub do_over: HashMap<String, usize>,
+    /// Variable END= du SET (M16.4) : `(nom UPPERCASE, valeur 0/1)`. Mise à
+    /// jour par le Runner après chaque lecture (1 = dernière obs lue). Servie
+    /// comme variable automatique (jamais de slot PDV).
+    pub end_flag: Option<(String, f64)>,
+}
+
+impl Default for EvalCtx {
+    fn default() -> Self {
+        EvalCtx {
+            missing_generated: 0,
+            division_by_zero: 0,
+            note_num_to_char: false,
+            note_char_to_num: false,
+            invalid_data: 0,
+            error_flag: false,
+            fatal: None,
+            arrays: HashMap::new(),
+            by_flags: Vec::new(),
+            in_flags: Vec::new(),
+            lag_queues: HashMap::new(),
+            symput_writes: Vec::new(),
+            macro_symbols: HashMap::new(),
+            // Default seed: 1960 (SAS epoch year), shifted to avoid zero.
+            rng_state: 0x0000_0007_A120_1960_u64,
+            rng_spare: None,
+            do_over: HashMap::new(),
+            end_flag: None,
+        }
+    }
 }
 
 /// Coerce une `Value` en f64 pour un CONTEXTE NUMÉRIQUE (arithmétique,
@@ -162,30 +195,38 @@ pub fn eval(expr: &Expr, pdv: &Pdv, ctx: &mut EvalCtx) -> Value {
         Expr::Binary { op, left, right } => eval_binary(*op, left, right, pdv, ctx),
         Expr::In { expr, list } => eval_in(expr, list, pdv, ctx),
         Expr::Call { name, args } => eval_call(name, args, pdv, ctx),
-        Expr::Index { name, index } => eval_array_ref(name, index, pdv, ctx),
+        Expr::Index { name, indices } => eval_array_ref(name, indices, pdv, ctx),
     }
 }
 
-/// Référence d'array indexée `arr{i}` (rvalue). L'indice est coercé en
-/// numérique puis ARRONDI au plus proche ; missing ou hors 1..=dim →
-/// erreur fatale "Array subscript out of range." qui stoppe l'étape
-/// (comme SAS).
-fn eval_array_ref(name: &str, index: &Expr, pdv: &Pdv, ctx: &mut EvalCtx) -> Value {
-    let idx_val = eval(index, pdv, ctx);
-    if ctx.fatal.is_some() {
-        return Value::missing();
+/// Référence d'array indexée `arr{i}` / `arr{i,j,k}` (rvalue). Chaque indice
+/// est coercé en numérique puis ARRONDI au plus proche ; missing, hors
+/// bornes, ou nombre d'indices invalide → erreur fatale "Array subscript out
+/// of range." qui stoppe l'étape (comme SAS). Un index unique sur un array
+/// multi-dim est interprété linéairement (row-major).
+fn eval_array_ref(name: &str, indices: &[Expr], pdv: &Pdv, ctx: &mut EvalCtx) -> Value {
+    let mut idxs: Vec<i64> = Vec::with_capacity(indices.len());
+    for index in indices {
+        let idx_val = eval(index, pdv, ctx);
+        if ctx.fatal.is_some() {
+            return Value::missing();
+        }
+        match coerce_num(&idx_val, ctx).map(f64::round) {
+            Some(i) => idxs.push(i as i64),
+            None => {
+                ctx.fatal = Some("ERROR: Array subscript out of range.".to_string());
+                return Value::missing();
+            }
+        }
     }
-    let idx = coerce_num(&idx_val, ctx).map(f64::round);
-    let Some(slots) = ctx.arrays.get(&name.to_uppercase()) else {
+    let Some(def) = ctx.arrays.get(&name.to_uppercase()) else {
         // Impossible après compile() ; garde-fou.
         ctx.fatal = Some(format!("ERROR: Undeclared array referenced: {name}."));
         return Value::missing();
     };
-    match idx {
-        Some(i) if i >= 1.0 && i <= slots.len() as f64 => {
-            pdv.get(slots[i as usize - 1]).clone()
-        }
-        _ => {
+    match def.linear_index(&idxs) {
+        Some(lin) => pdv.get(def.slots[lin]).clone(),
+        None => {
             ctx.fatal = Some("ERROR: Array subscript out of range.".to_string());
             Value::missing()
         }
@@ -228,6 +269,15 @@ fn eval_var(name: &str, pdv: &Pdv, ctx: &mut EvalCtx) -> Value {
     // Variable IN= d'un MERGE : automatique 0/1 servie depuis le contexte.
     if let Some((_, flag)) = ctx.in_flags.iter().find(|(n, _)| *n == upper) {
         return Value::Num(if *flag { 1.0 } else { 0.0 });
+    }
+    // Variable END= du SET (M16.4) : automatique 0/1 servie depuis le contexte.
+    if let Some((_, v)) = ctx.end_flag.as_ref().filter(|(n, _)| *n == upper) {
+        return Value::Num(*v);
+    }
+    // `DO OVER arr` actif : une référence nue à `arr` désigne l'élément
+    // courant (M16.3).
+    if let Some(slot) = ctx.do_over.get(&upper) {
+        return pdv.get(*slot).clone();
     }
     match pdv.slot(name) {
         Some(slot) => pdv.get(slot).clone(),
@@ -329,6 +379,16 @@ fn normalize_comparison(l: Value, r: Value, ctx: &mut EvalCtx) -> (Value, Value)
     }
 }
 
+/// Égalité fidèle SAS de deux valeurs déjà évaluées (M16.1, pour SELECT
+/// sélecteur). Réutilise exactement la sémantique de l'opérateur `=` :
+/// alignement des types mixtes via `normalize_comparison` (note de
+/// conversion char→num le cas échéant) puis `sas_cmp` (`. = .` est vrai,
+/// comparaison char insensible aux blancs finaux).
+pub(crate) fn sas_values_equal(l: Value, r: Value, ctx: &mut EvalCtx) -> bool {
+    let (l, r) = normalize_comparison(l, r, ctx);
+    l.sas_cmp(&r) == std::cmp::Ordering::Equal
+}
+
 /// Comparaison fidèle SAS : on traduit l'`Ordering` de `sas_cmp` en
 /// booléen numérique 1.0/0.0. Les missings sont comparables (`. = .` vrai,
 /// `. < 0` vrai) : c'est `sas_cmp` qui encode cet ordre total.
@@ -418,19 +478,52 @@ fn eval_in(expr: &Expr, list: &[Expr], pdv: &Pdv, ctx: &mut EvalCtx) -> Value {
 /// une variable du PDV) ; sinon déléguer à `functions::call`. Fonction
 /// inconnue → ERROR fatal.
 fn eval_call(name: &str, args: &[Expr], pdv: &Pdv, ctx: &mut EvalCtx) -> Value {
-    // `dim(arr)` : 1 argument dont le nom est un array déclaré → dimension.
-    // Sinon, délégation normale (les fonctions ne connaissent pas DIM →
-    // erreur fonction inconnue).
-    if name.eq_ignore_ascii_case("dim")
-        && args.len() == 1
+    // `dim(arr)` / `hbound(arr[, n])` / `lbound(arr[, n])` : le 1er argument
+    // nomme un array déclaré → fonctions de bornes. DIM/HBOUND renvoient la
+    // borne supérieure de la dimension n (défaut 1) ; LBOUND = 1 (SAS).
+    let is_dim = name.eq_ignore_ascii_case("dim");
+    let is_hbound = name.eq_ignore_ascii_case("hbound");
+    let is_lbound = name.eq_ignore_ascii_case("lbound");
+    if (is_dim || is_hbound || is_lbound)
+        && !args.is_empty()
         && let Expr::Var(n) | Expr::Index { name: n, .. } = &args[0]
-        && let Some(slots) = ctx.arrays.get(&n.to_uppercase())
+        && let Some(def) = ctx.arrays.get(&n.to_uppercase()).cloned()
     {
-        return Value::Num(slots.len() as f64);
+        // Dimension demandée (argument 2 optionnel, défaut 1).
+        let which = if args.len() >= 2 {
+            let dv = eval(&args[1], pdv, ctx);
+            if ctx.fatal.is_some() {
+                return Value::missing();
+            }
+            match coerce_num(&dv, ctx).map(f64::round) {
+                Some(d) if d >= 1.0 => d as usize,
+                _ => {
+                    ctx.fatal = Some(format!(
+                        "ERROR: Invalid dimension argument to {}.",
+                        name.to_uppercase()
+                    ));
+                    return Value::missing();
+                }
+            }
+        } else {
+            1
+        };
+        if which > def.dims.len() {
+            ctx.fatal = Some(format!(
+                "ERROR: Invalid dimension argument to {}.",
+                name.to_uppercase()
+            ));
+            return Value::missing();
+        }
+        if is_lbound {
+            return Value::Num(1.0);
+        }
+        // DIM et HBOUND coïncident (borne inférieure = 1).
+        return Value::Num(def.dims[which - 1] as f64);
     }
-    // `arr(i)` : l'array masque la fonction homonyme (résolution SAS).
-    if args.len() == 1 && ctx.arrays.contains_key(&name.to_uppercase()) {
-        return eval_array_ref(name, &args[0], pdv, ctx);
+    // `arr(i)` / `arr(i,j)` : l'array masque la fonction homonyme (SAS).
+    if !args.is_empty() && ctx.arrays.contains_key(&name.to_uppercase()) {
+        return eval_array_ref(name, args, pdv, ctx);
     }
     // LAGn / DIFn : NE PEUVENT PAS être de simples fonctions car elles ont
     // besoin de l'identité du SITE D'APPEL (chaque LAG/DIF lexical possède sa
@@ -573,6 +666,7 @@ mod tests {
             retained: false,
             from_input: false,
             format: None,
+            temporary: false,
         }
     }
 
@@ -584,6 +678,7 @@ mod tests {
             retained: false,
             from_input: false,
             format: None,
+            temporary: false,
         }
     }
 
@@ -1194,5 +1289,254 @@ mod tests {
 
         // Deux files distinctes ont bien été créées.
         assert_eq!(ctx.lag_queues.len(), 2);
+    }
+
+    // ── M15.7 : couverture complémentaire LAG/LAGn/DIF/DIFn ───────────────
+
+    /// Helper : exécute le site `e` une fois par valeur de `x`, et compare la
+    /// suite des retours à `expected`. Réutilise le MÊME `Expr` et le MÊME
+    /// `EvalCtx` (= un site lexical à travers la boucle implicite).
+    fn run_site(e: &Expr, inputs: &[Value], expected: &[Value]) {
+        assert_eq!(inputs.len(), expected.len());
+        let mut pdv = pdv_with(vec![(num_var("x"), Value::Num(0.0))]);
+        let slot = pdv.slot("x").unwrap();
+        let mut ctx = EvalCtx::default();
+        for (i, (inp, exp)) in inputs.iter().zip(expected.iter()).enumerate() {
+            pdv.set(slot, inp.clone());
+            assert_eq!(&eval(e, &pdv, &mut ctx), exp, "appel #{}", i + 1);
+        }
+    }
+
+    fn call(name: &str) -> Expr {
+        Expr::Call {
+            name: name.to_string(),
+            args: vec![var("x")],
+        }
+    }
+
+    /// parse_lag_dif : LAG sans chiffre vaut n=1, DIF idem.
+    #[test]
+    fn parse_lag_dif_bare_is_one() {
+        assert_eq!(parse_lag_dif("LAG"), Some((1, false)));
+        assert_eq!(parse_lag_dif("DIF"), Some((1, true)));
+    }
+
+    /// parse_lag_dif : un suffixe à plusieurs chiffres est lu en entier.
+    #[test]
+    fn parse_lag_dif_multidigit_suffix() {
+        assert_eq!(parse_lag_dif("LAG10"), Some((10, false)));
+        assert_eq!(parse_lag_dif("DIF250"), Some((250, true)));
+    }
+
+    /// parse_lag_dif : insensible à la casse, mixte inclus.
+    #[test]
+    fn parse_lag_dif_case_insensitive() {
+        assert_eq!(parse_lag_dif("Lag3"), Some((3, false)));
+        assert_eq!(parse_lag_dif("dIf4"), Some((4, true)));
+    }
+
+    /// parse_lag_dif : ne capture PAS les fonctions homonymes au préfixe
+    /// (LAGUERRE n'existe pas mais une fonction LOGxxx ne doit pas matcher).
+    #[test]
+    fn parse_lag_dif_rejects_non_matching() {
+        assert_eq!(parse_lag_dif("LOG"), None);
+        assert_eq!(parse_lag_dif("DIFX"), None);
+        assert_eq!(parse_lag_dif("LAG2A"), None);
+        assert_eq!(parse_lag_dif("X"), None);
+    }
+
+    /// LAG3 : missing sur les 3 premiers appels, puis la valeur d'il y a 3.
+    #[test]
+    fn lag3_returns_value_from_three_calls_ago() {
+        run_site(
+            &call("LAG3"),
+            &[
+                Value::Num(1.0),
+                Value::Num(2.0),
+                Value::Num(3.0),
+                Value::Num(4.0),
+                Value::Num(5.0),
+            ],
+            &[
+                Value::missing(),
+                Value::missing(),
+                Value::missing(),
+                Value::Num(1.0),
+                Value::Num(2.0),
+            ],
+        );
+    }
+
+    /// DIF2 : x - LAG2(x). Missing tant que LAG2 n'a pas de valeur.
+    #[test]
+    fn dif2_computes_second_difference() {
+        // x : 1,2,4,7,11 → DIF2 : .,.,4-1=3,7-2=5,11-4=7
+        run_site(
+            &call("DIF2"),
+            &[
+                Value::Num(1.0),
+                Value::Num(2.0),
+                Value::Num(4.0),
+                Value::Num(7.0),
+                Value::Num(11.0),
+            ],
+            &[
+                Value::missing(),
+                Value::missing(),
+                Value::Num(3.0),
+                Value::Num(5.0),
+                Value::Num(7.0),
+            ],
+        );
+    }
+
+    /// LAG propage un x manquant dans sa file : le missing ressort au bon rang.
+    #[test]
+    fn lag_propagates_missing_input() {
+        // x : 5, ., 9 → LAG1 : ., 5, .
+        run_site(
+            &call("LAG"),
+            &[Value::Num(5.0), Value::missing(), Value::Num(9.0)],
+            &[Value::missing(), Value::Num(5.0), Value::missing()],
+        );
+    }
+
+    /// DIF : si la valeur retardée est manquante (poussée plus tôt), le résultat
+    /// est manquant même quand x courant est présent.
+    #[test]
+    fn dif_missing_lagged_yields_missing() {
+        // x : ., 10 → DIF1 : . (rien en file), . (lag=., x=10)
+        run_site(
+            &call("DIF"),
+            &[Value::missing(), Value::Num(10.0)],
+            &[Value::missing(), Value::missing()],
+        );
+    }
+
+    /// LAG conserve la valeur missing SPÉCIALE telle quelle (.A reste .A).
+    #[test]
+    fn lag_preserves_special_missing() {
+        let special = Value::Missing(MissingKind::Letter(0)); // .A
+        run_site(
+            &call("LAG"),
+            &[special.clone(), Value::Num(3.0)],
+            &[Value::missing(), special.clone()],
+        );
+    }
+
+    /// DIF : un missing spécial dans x courant rend le résultat manquant.
+    #[test]
+    fn dif_special_missing_current_yields_missing() {
+        let special = Value::Missing(MissingKind::Letter(25)); // .Z
+        run_site(
+            &call("DIF"),
+            &[Value::Num(4.0), special],
+            &[Value::missing(), Value::missing()],
+        );
+    }
+
+    /// LAG d'une expression (pas une simple variable) : argument évalué UNE fois,
+    /// file FIFO sur la valeur calculée.
+    #[test]
+    fn lag_of_expression() {
+        // site = LAG(x + 1) ; x : 1,2,3 → arg : 2,3,4 → LAG : .,2,3
+        let e = Expr::Call {
+            name: "LAG".to_string(),
+            args: vec![bin(BinaryOp::Add, var("x"), num(1.0))],
+        };
+        run_site(
+            &e,
+            &[Value::Num(1.0), Value::Num(2.0), Value::Num(3.0)],
+            &[Value::missing(), Value::Num(2.0), Value::Num(3.0)],
+        );
+    }
+
+    /// DIF d'une constante : x - lag(x) = 0 dès que la file est amorcée.
+    #[test]
+    fn dif_of_constant_is_zero_after_warmup() {
+        run_site(
+            &call("DIF"),
+            &[Value::Num(7.0), Value::Num(7.0), Value::Num(7.0)],
+            &[Value::missing(), Value::Num(0.0), Value::Num(0.0)],
+        );
+    }
+
+    /// LAG sur valeurs négatives et fractionnaires (pas de troncature).
+    #[test]
+    fn lag_handles_negative_and_fractional() {
+        run_site(
+            &call("LAG"),
+            &[Value::Num(-1.5), Value::Num(2.25)],
+            &[Value::missing(), Value::Num(-1.5)],
+        );
+    }
+
+    /// DIF sur valeurs fractionnaires : différence exacte.
+    #[test]
+    fn dif_fractional() {
+        run_site(
+            &call("DIF"),
+            &[Value::Num(1.5), Value::Num(4.0)],
+            &[Value::missing(), Value::Num(2.5)],
+        );
+    }
+
+    /// Trois sites LAG distincts → trois files indépendantes, indexées ptr.
+    #[test]
+    fn three_lag_sites_independent() {
+        let mut pdv = pdv_with(vec![(num_var("x"), Value::Num(0.0))]);
+        let slot = pdv.slot("x").unwrap();
+        let a = call("LAG");
+        let b = call("LAG");
+        let c = call("LAG2");
+        let mut ctx = EvalCtx::default();
+
+        pdv.set(slot, Value::Num(1.0));
+        assert_eq!(eval(&a, &pdv, &mut ctx), Value::missing());
+        assert_eq!(eval(&b, &pdv, &mut ctx), Value::missing());
+        assert_eq!(eval(&c, &pdv, &mut ctx), Value::missing());
+
+        pdv.set(slot, Value::Num(2.0));
+        assert_eq!(eval(&a, &pdv, &mut ctx), Value::Num(1.0));
+        assert_eq!(eval(&b, &pdv, &mut ctx), Value::Num(1.0));
+        assert_eq!(eval(&c, &pdv, &mut ctx), Value::missing());
+
+        pdv.set(slot, Value::Num(3.0));
+        assert_eq!(eval(&c, &pdv, &mut ctx), Value::Num(1.0));
+
+        assert_eq!(ctx.lag_queues.len(), 3);
+    }
+
+    /// LAG et DIF au MÊME site lexical seraient impossibles (noms différents),
+    /// mais LAG(x) et DIF(x) sont deux sites distincts → files distinctes,
+    /// le DIF n'emprunte pas la file du LAG.
+    #[test]
+    fn lag_and_dif_sites_do_not_share_queue() {
+        let mut pdv = pdv_with(vec![(num_var("x"), Value::Num(0.0))]);
+        let slot = pdv.slot("x").unwrap();
+        let lag = call("LAG");
+        let dif = call("DIF");
+        let mut ctx = EvalCtx::default();
+
+        // Appel 1.
+        pdv.set(slot, Value::Num(10.0));
+        assert_eq!(eval(&lag, &pdv, &mut ctx), Value::missing());
+        assert_eq!(eval(&dif, &pdv, &mut ctx), Value::missing());
+        // Appel 2 : chacun amorcé sur sa propre file.
+        pdv.set(slot, Value::Num(15.0));
+        assert_eq!(eval(&lag, &pdv, &mut ctx), Value::Num(10.0));
+        assert_eq!(eval(&dif, &pdv, &mut ctx), Value::Num(5.0));
+        assert_eq!(ctx.lag_queues.len(), 2);
+    }
+
+    /// LAG sur une longue séquence : la file ne garde jamais plus de n éléments
+    /// (invariant interne), et le retard est constant.
+    #[test]
+    fn lag1_long_sequence_constant_delay() {
+        let e = call("LAG");
+        let inputs: Vec<Value> = (1..=20).map(|i| Value::Num(i as f64)).collect();
+        let mut expected = vec![Value::missing()];
+        expected.extend((1..20).map(|i| Value::Num(i as f64)));
+        run_site(&e, &inputs, &expected);
     }
 }

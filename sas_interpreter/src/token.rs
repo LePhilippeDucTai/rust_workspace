@@ -36,12 +36,6 @@ pub enum TokenKind {
     Str { value: String, suffix: StrSuffix },
     /// `%name` — reserved for the macro facility (later phase).
     MacroCall(String),
-    /// Raw inline data captured after a `DATALINES;`/`CARDS;` statement (M14.1).
-    /// Each element is one raw source line (verbatim, trailing CR/LF stripped),
-    /// up to but excluding the terminator line (`;` or, for `DATALINES4`/`CARDS4`,
-    /// `;;;;`). The lexer captures these literally so arbitrary data text never
-    /// has to lex as SAS tokens.
-    DataLines(Vec<String>),
     Semi,
     LParen,
     RParen,
@@ -69,10 +63,15 @@ pub enum TokenKind {
     Ge,
     /// `$` (char marker in LENGTH/INPUT/FORMAT statements)
     Dollar,
-    /// `@` (column pointer control in INPUT/PUT statements, M14.1)
+    /// `@` (column pointer / line hold in INPUT/PUT — M14).
     At,
-    /// `:` (informat modifier in list INPUT, M14.1)
+    /// `:` (format modifier in INPUT/PUT, label separator — M14).
     Colon,
+    /// Données verbatim capturées après `datalines;`/`cards;` (M14). Le
+    /// lexer bascule en mode verbatim après le `;` qui termine un statement
+    /// `datalines`/`cards`/`datalines4`/`cards4` et émet ce token portant les
+    /// lignes brutes (terminateur exclu).
+    DataLines(Vec<String>),
     /// `=` (assignment or comparison depending on context)
     Eq,
     /// `^=`, `~=`, `ne`

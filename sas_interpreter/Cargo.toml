@@ -25,7 +25,6 @@ s3 = ["polars/cloud", "polars/aws"]
 polars = { version = "0.46", features = [
     "lazy",
     "parquet",
-    "csv",
     "dtype-date",
     "dtype-datetime",
     "dtype-time",
@@ -39,6 +38,7 @@ polars = { version = "0.46", features = [
     "cross_join",
     "semi_anti_join",
     "rank",
+    "csv",
 ] }
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"

@@ -122,42 +122,6 @@ fn run_one_block(block: Result<Block>, session: &mut Session) {
 fn exec_global(stmt: &GlobalStmt, session: &mut Session) {
     match stmt {
         GlobalStmt::Libname { libref, engine, path } => {
-            // M14.4 : engine CSV → CsvLibrary; engine XLSX → not-implemented error.
-            // engine None (default) or unknown → existing DirLibrary (Parquet) behaviour.
-            let engine_upper = engine.as_deref().unwrap_or("").to_ascii_uppercase();
-
-            // XLSX engine: deferred with a clear error message.
-            if engine_upper == "XLSX" {
-                session.log.error(
-                    "LIBNAME engine XLSX is not yet implemented in this build.",
-                );
-                return;
-            }
-
-            // CSV engine: register a CsvLibrary backed by the directory.
-            if engine_upper == "CSV" {
-                let p = PathBuf::from(path);
-                let abs = if p.is_absolute() {
-                    p
-                } else {
-                    session.base_dir.join(p)
-                };
-                let shown = if session.deterministic {
-                    path.clone()
-                } else {
-                    abs.display().to_string()
-                };
-                match session.libs.assign_csv(libref, abs) {
-                    Ok(()) => session.log.note(&format!(
-                        "Libref {} was successfully assigned as follows:\n      Engine:        CSV\n      Physical Name: {shown}",
-                        libref.to_uppercase()
-                    )),
-                    Err(e) => session.log.error(&e.to_string()),
-                }
-                return;
-            }
-
-            // Default / no engine: existing DirLibrary (Parquet) behaviour — UNCHANGED.
             // M13 : routage cloud. Quand la feature `s3` est active et que le
             // chemin commence par `s3://`, on enregistre une `S3Library`
             // (bucket/prefix) au lieu d'une `DirLibrary`. Le chemin affiché
@@ -166,6 +130,7 @@ fn exec_global(stmt: &GlobalStmt, session: &mut Session) {
             // n'est pas compilé : un chemin `s3://...` est traité comme
             // aujourd'hui (résolu comme un répertoire local, qui n'existe pas →
             // erreur runtime habituelle).
+            // M13 : routage cloud s3://.
             #[cfg(feature = "s3")]
             if path.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("s3://")) {
                 match session.libs.assign_uri(libref, path) {
@@ -176,6 +141,18 @@ fn exec_global(stmt: &GlobalStmt, session: &mut Session) {
                     Err(e) => session.log.error(&e.to_string()),
                 }
                 return;
+            }
+
+            // M14.4 : XLSX engine deferral — emit an error and return.
+            match engine.as_deref().map(|e| e.to_ascii_uppercase()).as_deref() {
+                Some("XLSX") | Some("EXCEL") | Some("XLS") => {
+                    session.log.error(
+                        "LIBNAME engine XLSX is not yet implemented in this build \
+                         (the calamine/rust_xlsxwriter crates are not available).",
+                    );
+                    return;
+                }
+                _ => {}
             }
 
             let p = PathBuf::from(path);
@@ -191,12 +168,28 @@ fn exec_global(stmt: &GlobalStmt, session: &mut Session) {
             } else {
                 abs.display().to_string()
             };
-            match session.libs.assign(libref, abs) {
-                Ok(()) => session.log.note(&format!(
-                    "Libref {} was successfully assigned as follows:\n      Engine:        PARQUET\n      Physical Name: {shown}",
-                    libref.to_uppercase()
-                )),
-                Err(e) => session.log.error(&e.to_string()),
+
+            // M14.4 : branch on engine.
+            match engine.as_deref().map(|e| e.to_ascii_uppercase()).as_deref() {
+                Some("CSV") => {
+                    match session.libs.assign_csv(libref, abs) {
+                        Ok(()) => session.log.note(&format!(
+                            "Libref {} was successfully assigned as follows:\n      Engine:        CSV\n      Physical Name: {shown}",
+                            libref.to_uppercase()
+                        )),
+                        Err(e) => session.log.error(&e.to_string()),
+                    }
+                }
+                // None | Some("PARQUET") | Some("BASE") | Some("V9") | _ → parquet path
+                _ => {
+                    match session.libs.assign(libref, abs) {
+                        Ok(()) => session.log.note(&format!(
+                            "Libref {} was successfully assigned as follows:\n      Engine:        PARQUET\n      Physical Name: {shown}",
+                            libref.to_uppercase()
+                        )),
+                        Err(e) => session.log.error(&e.to_string()),
+                    }
+                }
             }
         }
         GlobalStmt::LibnameClear { libref } => match session.libs.clear(libref) {
@@ -284,6 +277,34 @@ fn exec_data_step(ast: &crate::ast::DataStepAst, session: &mut Session) {
     }
     // SAS imprime la NOTE de timing même quand l'étape a échoué.
     session.log.step_used("DATA statement", &timer);
+    // CALL EXECUTE (M15.6) : le code mis en file pendant l'étape s'exécute
+    // APRÈS son RUN. On draine la file et on rejoue le code concaténé comme un
+    // programme SAS à part entière (il repasse donc par le processeur macro et
+    // les statements globaux/DATA/PROC). Garde de profondeur : le code rejoué
+    // peut lui-même générer du CALL EXECUTE, mais on traite la file en boucle
+    // tant qu'elle se remplit.
+    run_call_execute_queue(session);
+}
+
+/// Rejoue (M15.6) le code mis en file par CALL EXECUTE. Chaque entrée est un
+/// fragment SAS ; on les concatène (séparés par un saut de ligne) et on les
+/// exécute via `run_program`. Si le rejeu re-remplit la file (CALL EXECUTE
+/// imbriqué), on boucle, avec une garde de profondeur anti-récursion infinie.
+fn run_call_execute_queue(session: &mut Session) {
+    let mut depth = 0;
+    while !session.call_execute_queue.is_empty() {
+        depth += 1;
+        if depth > 1000 {
+            session.log.error(
+                "CALL EXECUTE generated too many nested steps (possible infinite loop); stopping.",
+            );
+            session.call_execute_queue.clear();
+            return;
+        }
+        let code = std::mem::take(&mut session.call_execute_queue).join("\n");
+        let src = SourceFile::new(code);
+        let _ = run_program(&src, session);
+    }
 }
 
 #[cfg(test)]
@@ -538,5 +559,123 @@ mod tests {
             .log
             .contains("There were 1 observations read from the data set WORK.ZZ."));
         assert!(out.listing.contains("3.5"));
+    }
+
+    /// M14.4 — LIBNAME XLSX emits a clear deferral error.
+    #[test]
+    fn libname_xlsx_engine_deferred_error() {
+        let out = run_det("libname xl xlsx '/tmp';");
+        // The log must contain an ERROR message about XLSX not being available.
+        assert!(
+            out.log.contains("ERROR"),
+            "expected ERROR in log: {}",
+            out.log
+        );
+        assert!(
+            out.log.to_ascii_lowercase().contains("xlsx"),
+            "expected 'xlsx' in error: {}",
+            out.log
+        );
+    }
+
+    /// M14.4 — LIBNAME EXCEL (synonym for XLSX) also deferred.
+    #[test]
+    fn libname_excel_engine_deferred_error() {
+        let out = run_det("libname xl excel '/tmp';");
+        assert!(out.log.contains("ERROR"), "expected ERROR: {}", out.log);
+    }
+
+    /// M14.4 — LIBNAME with CSV engine assigns and reads back a table.
+    #[test]
+    fn libname_csv_engine_end_to_end() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        // Write a CSV file in the temp dir.
+        let csv_path = tmp.path().join("scores.csv");
+        let mut f = std::fs::File::create(&csv_path).unwrap();
+        writeln!(f, "id,score").unwrap();
+        writeln!(f, "1,100").unwrap();
+        writeln!(f, "2,200").unwrap();
+        drop(f);
+
+        let src = format!(
+            "libname csv1 csv '{}';\n\
+             data work.out; set csv1.scores; run;\n\
+             proc print data=work.out; run;\n",
+            tmp.path().display()
+        );
+        let out = crate::run(
+            &src,
+            crate::RunOptions {
+                work_dir: None,
+                base_dir: None,
+                deterministic: true,
+                vectorize: false,
+            },
+        );
+        assert_eq!(out.exit_code, 0, "log:\n{}", out.log);
+        assert!(
+            out.log.contains("Engine:        CSV"),
+            "expected CSV engine note: {}",
+            out.log
+        );
+        assert!(
+            out.log.contains("2 observations"),
+            "expected 2 obs note: {}",
+            out.log
+        );
+    }
+
+    /// M14.4 — LIBNAME without engine (no engine field) → parquet path unchanged.
+    #[test]
+    fn libname_no_engine_uses_parquet_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = crate::run(
+            &format!("libname p '{}';", tmp.path().display()),
+            crate::RunOptions {
+                work_dir: None,
+                base_dir: None,
+                deterministic: true,
+                vectorize: false,
+            },
+        );
+        assert_eq!(out.exit_code, 0, "log:\n{}", out.log);
+        assert!(out.log.contains("Engine:        PARQUET"), "{}", out.log);
+    }
+
+    // ---- M15.6 — CALL EXECUTE end-to-end (post-step replay) -------------
+
+    /// CALL EXECUTE queues code that runs AFTER the current step's RUN.
+    #[test]
+    fn call_execute_runs_queued_step_after_run() {
+        let out = run_det(
+            "data _null_; call execute('data made; v = 7; output; run;'); run;\n\
+             proc print data=made; run;\n",
+        );
+        assert_eq!(out.exit_code, 0, "log was:\n{}", out.log);
+        // The queued DATA step created WORK.MADE.
+        assert!(
+            out.log
+                .contains("The data set WORK.MADE has 1 observations and 1 variables."),
+            "log was:\n{}",
+            out.log
+        );
+        assert!(out.listing.contains('7'), "listing:\n{}", out.listing);
+    }
+
+    /// CALL EXECUTE, one per input row, builds several statements that run in
+    /// order after the generating step.
+    #[test]
+    fn call_execute_per_row_generates_multiple_steps() {
+        let out = run_det(
+            "data seed; do i = 1 to 3; output; end; run;\n\
+             data _null_; set seed; \
+               call execute('data g'||left(put(i,1.))||'; x=i_val; run;'); run;\n",
+        );
+        assert_eq!(out.exit_code, 0, "log was:\n{}", out.log);
+        // Three datasets were generated (WORK.G1, WORK.G2, WORK.G3).
+        assert!(out.log.contains("WORK.G1"), "log:\n{}", out.log);
+        assert!(out.log.contains("WORK.G2"), "log:\n{}", out.log);
+        assert!(out.log.contains("WORK.G3"), "log:\n{}", out.log);
     }
 }

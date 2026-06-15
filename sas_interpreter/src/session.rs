@@ -48,6 +48,13 @@ pub struct Session {
     /// la référence ; le fast-path ne s'active que pour les étapes que
     /// `fastpath::eligible` prouve équivalentes.
     pub vectorize: bool,
+    /// CALL EXECUTE (M15.6) : file de code SAS produit par `call execute(...)`
+    /// pendant une étape DATA, mis en attente pour exécution APRÈS l'étape.
+    /// L'exécuteur (`executor::exec_data_step`) draine cette file et rejoue le
+    /// code concaténé comme un programme SAS à part entière, une fois l'étape
+    /// terminée (sémantique SAS : les instructions CALL EXECUTE s'exécutent
+    /// après le RUN de l'étape qui les a générées).
+    pub call_execute_queue: Vec<String>,
 }
 
 impl Session {
@@ -68,6 +75,21 @@ impl Session {
             format_catalog: crate::formats::FormatCatalog::default(),
             macro_engine: crate::preprocess::MacroEngine::new(deterministic),
             vectorize: false,
+            call_execute_queue: Vec::new(),
         })
+    }
+
+    /// Résout un chemin de fichier externe (INFILE/FILE, PROC IMPORT/EXPORT) :
+    /// absolu → tel quel ; relatif → joint à `base_dir` (le répertoire de
+    /// travail de la session, comme pour les chemins LIBNAME). Garantit un
+    /// comportement cohérent et déterministe (les fixtures relatives résolvent
+    /// sous le tempdir du harnais, pas sous le CWD du processus).
+    pub fn resolve_path(&self, path: &str) -> PathBuf {
+        let p = PathBuf::from(path);
+        if p.is_absolute() {
+            p
+        } else {
+            self.base_dir.join(p)
+        }
     }
 }

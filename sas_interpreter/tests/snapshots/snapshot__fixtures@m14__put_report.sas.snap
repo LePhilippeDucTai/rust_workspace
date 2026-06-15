@@ -6,24 +6,54 @@ input_file: sas_interpreter/tests/fixtures/m14/put_report.sas
 ==== LOG ====
 
 1     data _null_;
-2       infile datalines;
-3       input name $ age height;
-4       file print;
-5       put 'Student: ' name @20 'Age:' age 3. @32 'Ht:' height 6.1;
-6     datalines;
-7     Alfred 14 69.0
-8     Alice 13 56.5
-9     Henry 14 63.5
-10    ;
-11    run;
-NOTE: 3 records were read from the infile DATALINES.
+2       x = 3.14159;
+3       name = 'Claude';
+4       put 'Valeur pi = ' x 8.4;
+5       put 'Nom       = ' name $;
+6     run;
+Valeur pi =  3.1416
+Nom       =  Claude
+NOTE: DATA statement used (Total process time):
+            real time           0.00 seconds
+            cpu time            0.00 seconds
+
+7     data _null_;
+8       do i = 1 to 5;
+9         put i @;
+10      end;
+11      put;
+12    run;
+1 2 3 4 5
+NOTE: DATA statement used (Total process time):
+            real time           0.00 seconds
+            cpu time            0.00 seconds
+
+13    data _null_;
+14      a = 1; b = 2; c = 'abc';
+15      put _all_;
+16    run;
+a=1 b=2 c=abc
+NOTE: DATA statement used (Total process time):
+            real time           0.00 seconds
+            cpu time            0.00 seconds
+
+17    data _null_;
+18      file print;
+19      put 'Titre du rapport via PUT FILE PRINT';
+20      put '------------------------------------';
+21      do i = 1 to 3;
+22        put 'Ligne ' i;
+23      end;
+24    run;
 NOTE: DATA statement used (Total process time):
             real time           0.00 seconds
             cpu time            0.00 seconds
 
 ==== LISTING ====
-Student:  Alfred   Age: 14     Ht:  69.0
-Student:  Alice    Age: 13     Ht:  56.5
-Student:  Henry    Age: 14     Ht:  63.5
+Titre du rapport via PUT FILE PRINT
+------------------------------------
+Ligne  1
+Ligne  2
+Ligne  3
 
 ==== EXIT 0 ====

@@ -57,13 +57,6 @@ impl LogWriter {
         self.message("NOTE", msg);
     }
 
-    /// Écrit une ligne de PUT verbatim dans le journal (M14.2 : `FILE LOG` ou
-    /// `PUT` sans destination). Pas de préfixe NOTE/WARNING : la ligne est le
-    /// texte produit par le DATA step tel quel.
-    pub fn put_line(&mut self, line: &str) {
-        self.raw(line);
-    }
-
     pub fn warning(&mut self, msg: &str) {
         self.warnings += 1;
         self.message("WARNING", msg);
@@ -72,6 +65,13 @@ impl LogWriter {
     pub fn error(&mut self, msg: &str) {
         self.errors += 1;
         self.message("ERROR", msg);
+    }
+
+    /// A verbatim line written by a DATA step PUT to `file log;` (M14.2):
+    /// no "NOTE:" prefix, no source numbering — just the rendered text,
+    /// through the same buffer as every other log line.
+    pub fn put_line(&mut self, line: &str) {
+        self.raw(line);
     }
 
     /// Forward a pre-prefixed line ("NOTE: ..." / "WARNING: ...") coming

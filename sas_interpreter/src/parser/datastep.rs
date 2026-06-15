@@ -74,8 +74,8 @@
 
 use super::{is_block_head_kw, validate_sas_name, StatementStream};
 use crate::ast::{
-    AttribItem, DataStepAst, DsStmt, Expr, InfileOptions, InfileSource, InputItem, LengthSpec,
-    PutDest, PutItem,
+    AttribItem, DataStepAst, DoListItem, DsStmt, Expr, InfileOptions, InfileSource, InputItem,
+    LengthSpec, PutDest, PutItem, WhenClause,
 };
 use crate::error::{Result, SasError};
 use crate::token::{Span, StrSuffix, TokenKind};
@@ -103,6 +103,11 @@ pub fn parse_data_step(ts: &mut StatementStream) -> Result<DataStepAst> {
             TokenKind::Star => {
                 // Commentaire-statement `* texte ;` : sauter silencieusement.
                 ts.skip_to_semi();
+            }
+            TokenKind::DataLines(_) => {
+                // Bloc verbatim orphelin (déjà consommé par `parse_datalines`
+                // dans le cas normal) : ignoré par robustesse.
+                ts.next();
             }
             TokenKind::Ident(s) => {
                 let lower = s.to_ascii_lowercase();
@@ -197,12 +202,39 @@ fn parse_statement(ts: &mut StatementStream) -> Result<DsStmt> {
         }
     };
 
+    // Étiquette de statement (M16.6) : `label_name: <statement>`. Un identifiant
+    // suivi d'un `:` introduit une étiquette. On consomme `ident :`, puis on
+    // parse récursivement le statement étiqueté (un seul). Détecté AVANT le
+    // dispatch par mot-clé : n'importe quel identifiant peut être une étiquette.
+    if ts.peek2().kind == TokenKind::Colon {
+        let name = head; // déjà en minuscules ; conservé tel quel (résolu en MAJ)
+        ts.next(); // ident d'étiquette
+        ts.next(); // `:`
+        // Étiquette suivie d'un `;` : statement étiqueté VIDE (no-op), licite en
+        // SAS (`fin: ;`). Le corps est un bloc vide.
+        if ts.peek().kind == TokenKind::Semi {
+            ts.next(); // `;`
+            return Ok(DsStmt::Labeled {
+                name,
+                stmt: Box::new(DsStmt::Block(Vec::new())),
+            });
+        }
+        let stmt = parse_statement(ts)?;
+        return Ok(DsStmt::Labeled {
+            name,
+            stmt: Box::new(stmt),
+        });
+    }
+
     match head.as_str() {
         "set" => parse_set(ts),
         "merge" => parse_merge(ts),
+        "update" => parse_update(ts),
+        "modify" => parse_modify(ts),
         "by" => parse_by(ts),
         "if" => parse_if(ts),
         "do" => parse_do(ts),
+        "select" => parse_select(ts),
         "output" => {
             // `output;` → toutes les sorties (liste vide) ;
             // `output a [b...];` → sorties ciblées (noms seuls, sans
@@ -225,6 +257,14 @@ fn parse_statement(ts: &mut StatementStream) -> Result<DsStmt> {
             ts.next();
             ts.expect_semi()?;
             Ok(DsStmt::Stop)
+        }
+        // GOTO (M16.6) : `goto label;` ou `go to label;` (deux tokens).
+        "goto" | "go" => parse_goto(ts, &head),
+        "link" => parse_link(ts),
+        "return" => {
+            ts.next();
+            ts.expect_semi()?;
+            Ok(DsStmt::Return)
         }
         "keep" => {
             ts.next();
@@ -249,9 +289,7 @@ fn parse_statement(ts: &mut StatementStream) -> Result<DsStmt> {
         "input" => parse_input(ts),
         "file" => parse_file(ts),
         "put" => parse_put(ts),
-        "datalines" | "cards" | "lines" | "datalines4" | "cards4" | "lines4" => {
-            parse_datalines(ts)
-        }
+        "datalines" | "cards" | "datalines4" | "cards4" => parse_datalines(ts),
         // `end` ne devrait pas apparaître en tête hors d'un bloc `do`.
         "end" => Err(SasError::parse(
             "no matching DO for END.",
@@ -284,24 +322,28 @@ fn parse_statement(ts: &mut StatementStream) -> Result<DsStmt> {
                     ts.expect_semi()?;
                     Ok(DsStmt::Sum { var, expr })
                 }
-                // `arr{i} = e;` / `arr[i] = e;` : assignation indexée.
+                // `arr{i} = e;` / `arr[i] = e;` / `arr{i,j} = e;` :
+                // assignation indexée (mono- ou multi-dimensionnelle).
                 TokenKind::LBrace | TokenKind::LBracket => {
-                    let Expr::Index { name, index } = super::expr::parse_index(ts, var)?
+                    let Expr::Index { name, indices } = super::expr::parse_index(ts, var)?
                     else {
                         unreachable!("parse_index always returns Expr::Index");
                     };
-                    parse_assign_indexed_tail(ts, name, *index)
+                    parse_assign_indexed_tail(ts, name, indices)
                 }
-                // `arr(i) = e;` : forme à parenthèses — le nom sera validé
-                // array à la COMPILATION (ici on parse l'indice).
+                // `arr(i) = e;` / `arr(i,j) = e;` : forme à parenthèses — le
+                // nom sera validé array à la COMPILATION (ici on parse les
+                // indices, séparés par des virgules).
                 TokenKind::LParen => {
                     ts.next(); // `(`
-                    let index = super::expr::parse_expr(ts)?;
-                    if ts.peek().kind == TokenKind::Comma {
-                        return Err(SasError::parse(
-                            "Multi-dimensional arrays are not yet implemented.",
-                            ts.peek().span,
-                        ));
+                    let mut indices = Vec::new();
+                    loop {
+                        indices.push(super::expr::parse_expr(ts)?);
+                        if ts.peek().kind == TokenKind::Comma {
+                            ts.next();
+                            continue;
+                        }
+                        break;
                     }
                     if ts.peek().kind != TokenKind::RParen {
                         return Err(SasError::parse(
@@ -313,7 +355,7 @@ fn parse_statement(ts: &mut StatementStream) -> Result<DsStmt> {
                         ));
                     }
                     ts.next(); // `)`
-                    parse_assign_indexed_tail(ts, var, index)
+                    parse_assign_indexed_tail(ts, var, indices)
                 }
                 _ => Err(SasError::parse(
                     format!(
@@ -325,6 +367,61 @@ fn parse_statement(ts: &mut StatementStream) -> Result<DsStmt> {
             }
         }
     }
+}
+
+/// `goto label;` / `go to label;` (M16.6). Le mot-clé de tête (`goto` ou `go`)
+/// a déjà été identifié ; pour `go`, on consomme le `to` qui suit. La cible est
+/// un identifiant unique (résolu en MAJUSCULES à la compilation).
+fn parse_goto(ts: &mut StatementStream, head: &str) -> Result<DsStmt> {
+    let kw_tok = ts.peek().clone();
+    ts.next(); // `goto` ou `go`
+    if head == "go" {
+        // Forme `go to label;` : le token suivant DOIT être `to`.
+        match ts.peek().ident() {
+            Some(w) if w.eq_ignore_ascii_case("to") => {
+                ts.next();
+            }
+            _ => {
+                return Err(SasError::parse(
+                    "expected TO after GO (use `go to label;` or `goto label;`)",
+                    ts.peek().span,
+                ));
+            }
+        }
+    }
+    let label_tok = ts.peek().clone();
+    let label = match label_tok.ident() {
+        Some(s) => s.to_string(),
+        None => {
+            return Err(SasError::parse(
+                "expected a statement label after GOTO",
+                kw_tok.span,
+            ));
+        }
+    };
+    ts.next(); // label
+    ts.expect_semi()?;
+    Ok(DsStmt::Goto(label))
+}
+
+/// `link label;` (M16.6). La cible est un identifiant unique (résolu en
+/// MAJUSCULES à la compilation).
+fn parse_link(ts: &mut StatementStream) -> Result<DsStmt> {
+    let kw_tok = ts.peek().clone();
+    ts.next(); // `link`
+    let label_tok = ts.peek().clone();
+    let label = match label_tok.ident() {
+        Some(s) => s.to_string(),
+        None => {
+            return Err(SasError::parse(
+                "expected a statement label after LINK",
+                kw_tok.span,
+            ));
+        }
+    };
+    ts.next(); // label
+    ts.expect_semi()?;
+    Ok(DsStmt::Link(label))
 }
 
 /// `set spec [spec]* ;` — un ou plusieurs datasets (M3), chacun avec ses
@@ -340,11 +437,61 @@ fn parse_set(ts: &mut StatementStream) -> Result<DsStmt> {
         ));
     }
     let mut specs = Vec::new();
-    while ts.peek().ident().is_some() {
+    // Liste des datasets : un identifiant SUIVI de `=` est une option de
+    // niveau statement (`end=`/`nobs=`/`point=`), pas un dataset → on arrête
+    // la liste et on bascule sur le parsing des options.
+    while ts.peek().ident().is_some() && ts.peek2().kind != TokenKind::Eq {
         specs.push(ts.parse_dataset_spec()?);
     }
+    let options = parse_set_options(ts)?;
     ts.expect_semi()?;
-    Ok(DsStmt::Set(specs))
+    Ok(DsStmt::Set { specs, options })
+}
+
+/// Options de niveau statement du SET (M16.4) : `end=v`, `nobs=v`, `point=v`,
+/// dans n'importe quel ordre, chacune au plus une fois. Toute autre clé →
+/// erreur de parsing.
+fn parse_set_options(ts: &mut StatementStream) -> Result<crate::ast::SetOptions> {
+    let mut options = crate::ast::SetOptions::default();
+    while let Some(kw) = ts.peek().ident() {
+        if ts.peek2().kind != TokenKind::Eq {
+            break;
+        }
+        let kw = kw.to_ascii_lowercase();
+        let kw_tok = ts.peek().clone();
+        ts.next(); // keyword
+        ts.next(); // `=`
+        let var_tok = ts.peek().clone();
+        let var = match var_tok.ident() {
+            Some(v) => v.to_string(),
+            None => {
+                return Err(SasError::parse(
+                    "expected a variable name after SET option",
+                    var_tok.span,
+                ));
+            }
+        };
+        ts.next(); // variable name
+        let slot = match kw.as_str() {
+            "end" => &mut options.end,
+            "nobs" => &mut options.nobs,
+            "point" => &mut options.point,
+            other => {
+                return Err(SasError::parse(
+                    format!("unknown SET option {other}="),
+                    kw_tok.span,
+                ));
+            }
+        };
+        if slot.is_some() {
+            return Err(SasError::parse(
+                format!("SET option {kw}= specified more than once"),
+                kw_tok.span,
+            ));
+        }
+        *slot = Some(var);
+    }
+    Ok(options)
 }
 
 /// `merge spec [spec]* ;` — un ou plusieurs datasets (M3), chacun avec ses
@@ -366,6 +513,158 @@ fn parse_merge(ts: &mut StatementStream) -> Result<DsStmt> {
     }
     ts.expect_semi()?;
     Ok(DsStmt::Merge(specs))
+}
+
+/// `update master[(where=(...))] transaction key=k1 k2;` (M16.5) — fusion
+/// maître/transaction. Le maître et la transaction sont deux références de
+/// dataset ; seul le maître accepte des options de dataset (en pratique
+/// `(where=(...))`, dont on extrait l'expression). `key=` est OBLIGATOIRE et
+/// porte une liste (≥1) de noms de variables clé séparés par des espaces.
+fn parse_update(ts: &mut StatementStream) -> Result<DsStmt> {
+    let upd_tok = ts.peek().clone();
+    ts.next(); // `update`
+    if ts.peek().kind == TokenKind::Semi {
+        return Err(SasError::parse(
+            "Statement UPDATE without a dataset is not yet implemented.",
+            upd_tok.span,
+        ));
+    }
+    // Le maître peut porter des options de dataset (where=). On ne retient
+    // que `where=` (keep/drop/rename/in= sur UPDATE non supportés → erreur).
+    let master_spec = ts.parse_dataset_spec()?;
+    let opts = &master_spec.options;
+    if opts.keep.is_some()
+        || opts.drop.is_some()
+        || !opts.rename.is_empty()
+        || opts.in_.is_some()
+    {
+        return Err(SasError::parse(
+            "Only the WHERE= data set option is supported on the UPDATE master data set.",
+            upd_tok.span,
+        ));
+    }
+    let master_where = master_spec.options.where_.clone();
+    let master = master_spec.dref;
+    // La transaction : une simple référence (pas d'options).
+    let transaction = ts.parse_dataset_ref()?;
+    // `key=` obligatoire.
+    let key_vars = parse_key_option(ts)?;
+    if key_vars.is_empty() {
+        return Err(SasError::parse(
+            "An UPDATE statement requires a KEY= option with at least one variable.",
+            upd_tok.span,
+        ));
+    }
+    ts.expect_semi()?;
+    Ok(DsStmt::Update {
+        master,
+        master_where,
+        transaction,
+        key_vars,
+    })
+}
+
+/// `modify dataset [key=k1 k2] [point=p] [nobs=n];` (M16.5) — modification en
+/// place. Le dataset est une référence simple ; `key=` (optionnel) porte la
+/// liste de clés ; `point=`/`nobs=` (optionnels) nomment des variables comme
+/// pour SET. Les options apparaissent dans n'importe quel ordre.
+fn parse_modify(ts: &mut StatementStream) -> Result<DsStmt> {
+    let mod_tok = ts.peek().clone();
+    ts.next(); // `modify`
+    if ts.peek().kind == TokenKind::Semi {
+        return Err(SasError::parse(
+            "Statement MODIFY without a dataset is not yet implemented.",
+            mod_tok.span,
+        ));
+    }
+    let dataset = ts.parse_dataset_ref()?;
+    let mut key_vars: Vec<String> = Vec::new();
+    let mut point: Option<String> = None;
+    let mut nobs: Option<String> = None;
+    // Options `key=`/`point=`/`nobs=` (chacune au plus une fois).
+    while let Some(kw) = ts.peek().ident() {
+        if ts.peek2().kind != TokenKind::Eq {
+            break;
+        }
+        let kw = kw.to_ascii_lowercase();
+        let kw_tok = ts.peek().clone();
+        match kw.as_str() {
+            "key" => {
+                if !key_vars.is_empty() {
+                    return Err(SasError::parse(
+                        "MODIFY option KEY= specified more than once",
+                        kw_tok.span,
+                    ));
+                }
+                key_vars = parse_key_option(ts)?;
+            }
+            "point" | "nobs" => {
+                ts.next(); // keyword
+                ts.next(); // `=`
+                let var_tok = ts.peek().clone();
+                let Some(v) = var_tok.ident().map(str::to_string) else {
+                    return Err(SasError::parse(
+                        "expected a variable name after MODIFY option",
+                        var_tok.span,
+                    ));
+                };
+                ts.next();
+                let slot = if kw == "point" { &mut point } else { &mut nobs };
+                if slot.is_some() {
+                    return Err(SasError::parse(
+                        format!("MODIFY option {kw}= specified more than once"),
+                        kw_tok.span,
+                    ));
+                }
+                *slot = Some(v);
+            }
+            other => {
+                return Err(SasError::parse(
+                    format!("unknown MODIFY option {other}="),
+                    kw_tok.span,
+                ));
+            }
+        }
+    }
+    ts.expect_semi()?;
+    Ok(DsStmt::Modify {
+        dataset,
+        key_vars,
+        point,
+        nobs,
+    })
+}
+
+/// Parse l'option `key=v1 v2 ...` (M16.5) : consomme `key`, `=`, puis une
+/// liste de noms de variables (au moins zéro ; l'appelant impose le minimum).
+/// La liste s'arrête au prochain Ident SUIVI de `=` (option suivante) ou au
+/// `;`. À l'entrée, `ts.peek()` doit être `key` ; sinon liste vide.
+fn parse_key_option(ts: &mut StatementStream) -> Result<Vec<String>> {
+    if !ts.peek().is_kw("key") {
+        return Ok(Vec::new());
+    }
+    ts.next(); // `key`
+    if ts.peek().kind != TokenKind::Eq {
+        return Err(SasError::parse(
+            "expected '=' after KEY",
+            ts.peek().span,
+        ));
+    }
+    ts.next(); // `=`
+    let mut vars = Vec::new();
+    while let Some(name) = ts.peek().ident() {
+        // Un Ident suivi de `=` est l'option suivante (point=/nobs=), pas une
+        // variable clé.
+        if ts.peek2().kind == TokenKind::Eq {
+            break;
+        }
+        let name = name.to_string();
+        let span = ts.peek().span;
+        validate_sas_name(&name, span)?;
+        vars.push(name);
+        ts.next();
+    }
+    Ok(vars)
 }
 
 /// `call <name>(arg [, arg]*);` (M11.5) — appel d'une CALL routine. On
@@ -416,84 +715,47 @@ fn parse_call_routine(ts: &mut StatementStream) -> Result<DsStmt> {
     Ok(DsStmt::CallRoutine { name, args })
 }
 
-/// `datalines;`/`cards;`/`lines;` (+ variantes `4`) → `DsStmt::Datalines`.
-/// Le lexer a déjà capturé les lignes brutes dans un `TokenKind::DataLines`
-/// qui SUIT le `;` du statement : on consomme le mot-clé, le `;`, puis le
-/// token `DataLines`. Un `datalines;` sans bloc de données (EOF immédiat)
-/// donne une liste vide.
-fn parse_datalines(ts: &mut StatementStream) -> Result<DsStmt> {
-    ts.next(); // datalines / cards / lines (+ variante 4)
-    ts.expect_semi()?;
-    let lines = match &ts.peek().kind {
-        TokenKind::DataLines(lines) => {
-            let lines = lines.clone();
-            ts.next();
-            lines
-        }
-        // Pas de token DataLines (cas dégénéré : datalines en fin de source) :
-        // bloc vide.
-        _ => Vec::new(),
-    };
-    Ok(DsStmt::Datalines { lines })
-}
-
-/// `infile <source> <options>;` (M14.1). Source : un littéral chaîne
-/// (chemin) ou le mot-clé `datalines`/`cards`. Options reconnues :
-/// `DLM=`/`DELIMITER=`, `DSD`, `FIRSTOBS=`, `OBS=`, `MISSOVER`,
-/// `TRUNCOVER`, `STOPOVER`, `LRECL=`. Option inconnue → erreur "not yet
-/// implemented." propre.
+/// `infile <source> [options] ;` (M14). La source est un littéral chemin
+/// (`'fichier.txt'`) OU le mot-clé `datalines`/`cards` (source inline).
+/// Options reconnues : `DELIMITER=`/`DLM=`, `DSD`, `FIRSTOBS=`, `OBS=`,
+/// `MISSOVER`, `TRUNCOVER`, `STOPOVER`, `LRECL=`. Une option inconnue →
+/// erreur claire.
 fn parse_infile(ts: &mut StatementStream) -> Result<DsStmt> {
     ts.next(); // `infile`
     let src_tok = ts.peek().clone();
     let source = match &src_tok.kind {
-        TokenKind::Str { value, .. } => {
+        TokenKind::Str {
+            value,
+            suffix: StrSuffix::None | StrSuffix::Name,
+        } => {
+            let s = value.clone();
             ts.next();
-            InfileSource::Path(value.clone())
+            InfileSource::Path(s)
         }
-        TokenKind::Ident(s)
-            if matches!(
-                s.to_ascii_lowercase().as_str(),
-                "datalines" | "cards" | "lines"
-            ) =>
+        TokenKind::Ident(name)
+            if name.eq_ignore_ascii_case("datalines") || name.eq_ignore_ascii_case("cards") =>
         {
             ts.next();
             InfileSource::Datalines
         }
-        // Un fileref nu (ex. `infile myfile;`) n'est pas couvert : seuls les
-        // chemins littéraux et DATALINES le sont.
-        TokenKind::Ident(_) => {
-            return Err(SasError::parse(
-                "INFILE with a fileref is not yet implemented; use a quoted physical path or DATALINES.",
-                src_tok.span,
-            ));
-        }
         _ => {
             return Err(SasError::parse(
-                "expected a quoted file path or DATALINES after INFILE",
+                "expected a quoted file path or DATALINES/CARDS after INFILE",
                 src_tok.span,
             ));
         }
     };
-
     let mut options = InfileOptions::default();
     loop {
         let tok = ts.peek().clone();
         match &tok.kind {
-            TokenKind::Semi => break,
+            TokenKind::Semi => {
+                ts.next();
+                return Ok(DsStmt::Infile { source, options });
+            }
             TokenKind::Ident(name) => {
                 let lower = name.to_ascii_lowercase();
                 match lower.as_str() {
-                    "dlm" | "delimiter" => {
-                        ts.next();
-                        if ts.peek().kind != TokenKind::Eq {
-                            return Err(SasError::parse(
-                                "expected '=' after the DLM=/DELIMITER= INFILE option",
-                                ts.peek().span,
-                            ));
-                        }
-                        ts.next(); // `=`
-                        options.delimiter = Some(parse_delimiter_value(ts)?);
-                    }
                     "dsd" => {
                         ts.next();
                         options.dsd = true;
@@ -510,24 +772,30 @@ fn parse_infile(ts: &mut StatementStream) -> Result<DsStmt> {
                         ts.next();
                         options.stopover = true;
                     }
+                    "delimiter" | "dlm" => {
+                        ts.next();
+                        expect_eq(ts, &lower)?;
+                        options.delimiter = Some(parse_infile_delimiter(ts)?);
+                    }
                     "firstobs" => {
                         ts.next();
-                        options.firstobs = Some(parse_infile_uint(ts, "FIRSTOBS=")?);
+                        expect_eq(ts, &lower)?;
+                        options.firstobs = Some(parse_infile_count(ts, "FIRSTOBS")?);
                     }
                     "obs" => {
                         ts.next();
-                        options.obs = Some(parse_infile_uint(ts, "OBS=")?);
+                        expect_eq(ts, &lower)?;
+                        options.obs = Some(parse_infile_count(ts, "OBS")?);
                     }
                     "lrecl" => {
                         ts.next();
-                        options.lrecl = Some(parse_infile_uint(ts, "LRECL=")?);
+                        expect_eq(ts, &lower)?;
+                        // LRECL est conservé mais reste un no-op fonctionnel.
+                        options.lrecl = Some(parse_infile_count(ts, "LRECL")?);
                     }
-                    other => {
+                    _ => {
                         return Err(SasError::parse(
-                            format!(
-                                "The INFILE option {} is not yet implemented.",
-                                other.to_uppercase()
-                            ),
+                            format!("INFILE option {} is not supported.", lower.to_uppercase()),
                             tok.span,
                         ));
                     }
@@ -541,564 +809,448 @@ fn parse_infile(ts: &mut StatementStream) -> Result<DsStmt> {
             }
         }
     }
-    ts.expect_semi()?;
-    Ok(DsStmt::Infile { source, options })
 }
 
-/// Valeur d'un `DLM=`/`DELIMITER=` : un littéral chaîne (ex. `dlm=','`) ou
-/// un seul caractère non quoté lexable (ex. `dlm=,` n'est pas lexable comme
-/// chaîne — on accepte donc la forme quotée et, par robustesse, un Ident
-/// d'un caractère). On exige au moins un caractère.
-fn parse_delimiter_value(ts: &mut StatementStream) -> Result<String> {
+/// Consomme le `=` d'une option `nom=valeur`.
+fn expect_eq(ts: &mut StatementStream, opt: &str) -> Result<()> {
+    if ts.peek().kind != TokenKind::Eq {
+        return Err(SasError::parse(
+            format!("expected '=' after the INFILE option {}", opt.to_uppercase()),
+            ts.peek().span,
+        ));
+    }
+    ts.next();
+    Ok(())
+}
+
+/// Valeur d'un `DELIMITER=`/`DLM=` : une chaîne littérale (`','`, `'09'x`
+/// non géré) ou un identifiant/caractère isolé. On accepte une chaîne ou un
+/// token simple ; on en garde la valeur textuelle.
+fn parse_infile_delimiter(ts: &mut StatementStream) -> Result<String> {
     let tok = ts.peek().clone();
     match &tok.kind {
-        TokenKind::Str { value, .. } => {
+        TokenKind::Str {
+            value,
+            suffix: StrSuffix::None | StrSuffix::Name,
+        } => {
+            let s = value.clone();
             ts.next();
-            Ok(value.clone())
+            Ok(s)
         }
-        // Forme non quotée d'un caractère lexé comme identifiant (rare).
-        TokenKind::Ident(s) if s.chars().count() == 1 => {
+        // Un identifiant nu (`dlm=x`) ou un caractère seul.
+        TokenKind::Ident(s) => {
             let s = s.clone();
             ts.next();
             Ok(s)
         }
         _ => Err(SasError::parse(
-            "expected a quoted delimiter after DLM=/DELIMITER=",
+            "expected a delimiter (quoted string or character) after DELIMITER=/DLM=",
             tok.span,
         )),
     }
 }
 
-/// Valeur entière positive d'une option INFILE (FIRSTOBS=/OBS=/LRECL=).
-fn parse_infile_uint(ts: &mut StatementStream, opt: &str) -> Result<usize> {
-    if ts.peek().kind != TokenKind::Eq {
+/// Entier positif d'une option INFILE (`FIRSTOBS=`, `OBS=`, `LRECL=`).
+fn parse_infile_count(ts: &mut StatementStream, opt: &str) -> Result<usize> {
+    let tok = ts.peek().clone();
+    let TokenKind::Num(n) = tok.kind else {
         return Err(SasError::parse(
-            format!("expected '=' after the {opt} INFILE option"),
-            ts.peek().span,
+            format!("expected a positive integer after {opt}="),
+            tok.span,
+        ));
+    };
+    if n.fract() != 0.0 || n < 1.0 {
+        return Err(SasError::parse(
+            format!("the value of {opt}= must be a positive integer"),
+            tok.span,
         ));
     }
-    ts.next(); // `=`
-    let tok = ts.peek().clone();
-    match &tok.kind {
-        TokenKind::Num(n) if *n >= 1.0 && n.fract() == 0.0 => {
-            ts.next();
-            Ok(*n as usize)
-        }
-        _ => Err(SasError::parse(
-            format!("expected a positive integer for the {opt} INFILE option"),
-            tok.span,
-        )),
-    }
+    ts.next();
+    Ok(n as usize)
 }
 
-/// `input <items>;` (M14.1). Trois styles mêlés : list (`name`, `name $`,
-/// `name :informat.`), column (`name 1-10`, `name $ 1-10`), formatted
-/// (`@col name informat.`, `name informat.`). Pointeurs `@n`, `+n`, `/`.
-/// `@@` (hold) non couvert → erreur "not yet implemented.".
+/// `input <items> ;` (M14). Modes pris en charge :
+/// - liste : `name $ age` ;
+/// - colonne : `name $ 1-10 age 11-13` ;
+/// - formaté : `name $char10. d date9.` ;
+/// - pointeurs `@n`, `+n`, `/`, hold `@`/`@@`, modificateur `:`.
+///
+/// On lit les tokens jusqu'au `;` final (consommé). Le `$` se rapporte à la
+/// variable qui PRÉCÈDE (forme `name $`).
 fn parse_input(ts: &mut StatementStream) -> Result<DsStmt> {
     ts.next(); // `input`
     let mut items: Vec<InputItem> = Vec::new();
     loop {
         let tok = ts.peek().clone();
         match &tok.kind {
-            TokenKind::Semi => break,
-            // Pointeur `@col` (`@1`, `@12`). `@@` (hold) non couvert → erreur.
-            TokenKind::At => {
-                items.push(parse_at_pointer(ts)?);
+            TokenKind::Semi => {
+                ts.next();
+                return Ok(DsStmt::Input(items));
             }
-            // `+n` : saut relatif du pointeur.
+            // `@@` (double hold) ou `@n` (pointeur de colonne) ou `@` (hold).
+            TokenKind::At => {
+                let at_end = tok.span.end;
+                ts.next(); // `@`
+                if ts.peek().kind == TokenKind::At {
+                    ts.next(); // second `@`
+                    items.push(InputItem::HoldLineDouble);
+                } else if let TokenKind::Num(n) = ts.peek().kind {
+                    // `@n` : pointeur ADJACENT (`@5`) ou espacé (`@ 5`) —
+                    // SAS tolère les deux.
+                    if n.fract() != 0.0 || n < 1.0 {
+                        return Err(SasError::parse(
+                            "the column pointer @n must be a positive integer",
+                            ts.peek().span,
+                        ));
+                    }
+                    ts.next();
+                    items.push(InputItem::ColumnPointer(n as usize));
+                } else {
+                    // `@` final (hold simple) — doit être suivi du `;`.
+                    let _ = at_end;
+                    items.push(InputItem::HoldLine);
+                }
+            }
+            // `+n` : avance relative du curseur.
             TokenKind::Plus => {
                 ts.next(); // `+`
-                let n = parse_input_uint(ts, "the + column-pointer")?;
-                items.push(InputItem::PointerSkip(n));
+                let n_tok = ts.peek().clone();
+                let TokenKind::Num(n) = n_tok.kind else {
+                    return Err(SasError::parse(
+                        "expected a positive integer after '+' in the INPUT statement",
+                        n_tok.span,
+                    ));
+                };
+                if n.fract() != 0.0 || n < 0.0 {
+                    return Err(SasError::parse(
+                        "the column skip +n must be a non-negative integer",
+                        n_tok.span,
+                    ));
+                }
+                ts.next();
+                items.push(InputItem::SkipColumns(n as usize));
             }
-            // `/` : ligne suivante.
+            // `/` : passage à la ligne d'entrée suivante.
             TokenKind::Slash => {
                 ts.next();
                 items.push(InputItem::NextLine);
             }
-            TokenKind::Ident(_) => {
-                items.push(parse_input_var(ts)?);
+            // Un nom de variable, éventuellement suivi de `$`, de colonnes
+            // `a-b`, d'un `:`-modificateur et/ou d'un informat.
+            TokenKind::Ident(name) => {
+                let name = name.clone();
+                validate_sas_name(&name, tok.span)?;
+                ts.next();
+                let item = parse_input_var(ts, name)?;
+                items.push(item);
             }
             _ => {
                 return Err(SasError::parse(
-                    "expected a variable name or column pointer in the INPUT statement",
+                    "expected a variable name, column pointer or ';' in the INPUT statement",
                     tok.span,
                 ));
             }
         }
     }
-    ts.expect_semi()?;
-    if items.is_empty() {
-        return Err(SasError::parse(
-            "The INPUT statement must list at least one variable.",
-            ts.peek().span,
-        ));
-    }
-    Ok(DsStmt::Input { items })
 }
 
-/// `@col` : positionne le pointeur de colonne (1-based). `@@` (hold du
-/// pointeur entre itérations) n'est pas couvert → erreur "not yet
-/// implemented.". `@expr` (colonne dynamique) non couvert non plus.
-fn parse_at_pointer(ts: &mut StatementStream) -> Result<InputItem> {
-    let at_tok = ts.peek().clone();
-    ts.next(); // `@`
-    if ts.peek().kind == TokenKind::At {
-        return Err(SasError::parse(
-            "The line-hold specifier @@ is not yet implemented.",
-            at_tok.span,
-        ));
-    }
-    let tok = ts.peek().clone();
-    match tok.kind {
-        TokenKind::Num(n) if n.fract() == 0.0 && n >= 1.0 => {
-            ts.next();
-            Ok(InputItem::PointerCol(n as usize))
-        }
-        _ => Err(SasError::parse(
-            "expected a column number after '@' in the INPUT statement",
-            tok.span,
-        )),
-    }
-}
-
-/// Une variable d'INPUT : `name`, `name $`, `name :informat.`,
-/// `name informat.`, `name col1-col2`, `name $ col1-col2`.
-fn parse_input_var(ts: &mut StatementStream) -> Result<InputItem> {
-    let name_tok = ts.peek().clone();
-    let name = name_tok
-        .ident()
-        .expect("caller matched an Ident")
-        .to_string();
-    super::validate_sas_name(&name, name_tok.span)?;
-    ts.next(); // nom
-
+/// Suffixe d'une variable INPUT : `[$] [a-b | [:] informat]`.
+fn parse_input_var(ts: &mut StatementStream, name: String) -> Result<InputItem> {
     let mut is_char = false;
-    let mut informat: Option<String> = None;
-    let mut col_range: Option<(usize, usize)> = None;
-
-    // `$` (caractère).
-    if ts.peek().kind == TokenKind::Dollar {
+    // `$` : variable caractère. Deux cas :
+    // - `$char10.` / `$10.` : le `$` ouvre un INFORMAT caractère (adjacent à
+    //   un Ident/Num) — on NE le consomme PAS ici, `read_format_token` le
+    //   lira en entier.
+    // - `$` isolé (suivi d'un espace, de colonnes, ou de la variable
+    //   suivante) : simple marqueur caractère du mode liste/colonne.
+    if ts.peek().kind == TokenKind::Dollar && !dollar_begins_informat(ts) {
         ts.next();
         is_char = true;
     }
-
-    // Modificateur `:` du list input : `name :informat.` (lecture séparée
-    // par délimiteurs mais en appliquant l'informat). Sémantiquement, pour
-    // nous, c'est un informat de list input (largeur non contraignante).
+    // `:` modificateur d'informat en mode liste.
+    let mut list_modifier = false;
     if ts.peek().kind == TokenKind::Colon {
         ts.next();
-        // Un informat caractère peut suivre sous la forme `$w.`.
-        if let Some(token) = try_parse_informat_token(ts)? {
-            if token.starts_with('$') {
-                is_char = true;
+        list_modifier = true;
+    }
+    // Mode colonne : `a-b` (a et b entiers, a-b adjacents au `-`).
+    if let TokenKind::Num(a) = ts.peek().kind {
+        // Distinguer `a-b` (colonnes) d'un informat `8.` : un informat a un
+        // `.` ; les colonnes ont un `-`. On regarde le token suivant.
+        if a.fract() == 0.0 && a >= 1.0 && ts.peek2().kind == TokenKind::Minus {
+            ts.next(); // a
+            ts.next(); // `-`
+            let b_tok = ts.peek().clone();
+            let TokenKind::Num(b) = b_tok.kind else {
+                return Err(SasError::parse(
+                    "expected the end column after '-' in the INPUT statement",
+                    b_tok.span,
+                ));
+            };
+            if b.fract() != 0.0 || b < a {
+                return Err(SasError::parse(
+                    "invalid column range in the INPUT statement",
+                    b_tok.span,
+                ));
             }
+            ts.next();
             return Ok(InputItem::Var {
                 name,
                 is_char,
-                col_range: None,
-                informat: Some(token),
+                cols: Some((a as usize, b as usize)),
+                informat: None,
+                list_modifier,
             });
         }
-        // `:` sans informat : list input ordinaire.
+    }
+    // Mode formaté : un informat suit (token de format `date9.`, `8.2`,
+    // `$char10.`, etc.). On le détecte par adjacence (comme FORMAT).
+    if input_informat_follows(ts) {
+        let token = super::expr::read_format_token(ts)?;
         return Ok(InputItem::Var {
             name,
             is_char,
-            col_range: None,
-            informat: None,
+            cols: None,
+            informat: Some(token),
+            list_modifier,
         });
     }
-
-    // Column input : `col1 - col2` ou `col1` (une seule colonne). On NE
-    // traite un `Num` en column input QUE s'il est entier et n'est PAS la
-    // largeur d'un informat. Discriminant : un `Num` entier suivi d'un `.`
-    // (ex. `10.`) ou un `Num` fractionnaire (ex. `5.2`) est un informat ;
-    // un `Num` suivi d'un `-` (plage) ou d'un séparateur d'item est une
-    // colonne.
-    if let TokenKind::Num(n) = ts.peek().kind {
-        let is_informat_width =
-            n.fract() != 0.0 || matches!(ts.peek2().kind, TokenKind::Dot);
-        if n.fract() == 0.0 && n >= 1.0 && !is_informat_width {
-            let start = n as usize;
-            ts.next(); // col de début
-            let end = if ts.peek().kind == TokenKind::Minus {
-                ts.next(); // `-`
-                let end_tok = ts.peek().clone();
-                match end_tok.kind {
-                    TokenKind::Num(e) if e.fract() == 0.0 && e >= 1.0 => {
-                        ts.next();
-                        e as usize
-                    }
-                    _ => {
-                        return Err(SasError::parse(
-                            "expected an ending column number after '-' in the INPUT statement",
-                            end_tok.span,
-                        ));
-                    }
-                }
-            } else {
-                start
-            };
-            if end < start {
-                return Err(SasError::parse(
-                    "INPUT column range end is before its start.",
-                    name_tok.span,
-                ));
-            }
-            col_range = Some((start, end));
-            // Forme `name 1-10 .d` (décimales sur column input) : non couverte.
-            return Ok(InputItem::Var {
-                name,
-                is_char,
-                col_range,
-                informat: None,
-            });
-        }
-    }
-
-    // Formatted input : un informat suit (`name 5.2`, `name $10.`,
-    // `name COMMA8.`, `name date9.`). Reconnu via un token de format,
-    // assemblé par `try_parse_informat_token`.
-    if let Some(mut token) = try_parse_informat_token(ts)? {
-        // Un informat commençant par `$` implique le caractère.
-        if token.starts_with('$') {
-            is_char = true;
-        } else if is_char {
-            // Un `$` a été consommé AVANT l'informat (`name $10.`) : le
-            // préfixer pour que FormatSpec reconnaisse un informat caractère.
-            token.insert(0, '$');
-        }
-        informat = Some(token);
-    }
-
+    // Mode liste pur.
     Ok(InputItem::Var {
         name,
         is_char,
-        col_range,
-        informat,
+        cols: None,
+        informat: None,
+        list_modifier,
     })
 }
 
-/// Entier positif (saut de pointeur `+n`).
-fn parse_input_uint(ts: &mut StatementStream, what: &str) -> Result<usize> {
-    let tok = ts.peek().clone();
-    match tok.kind {
-        TokenKind::Num(n) if n.fract() == 0.0 && n >= 0.0 => {
-            ts.next();
-            Ok(n as usize)
-        }
-        _ => Err(SasError::parse(
-            format!("expected a non-negative integer for {what}"),
-            tok.span,
-        )),
-    }
+/// Vrai si le `$` courant ouvre un informat caractère (`$char10.`, `$10.`,
+/// `$.`) : le token ADJACENT est un Ident ou un Num (qui formera le reste de
+/// l'informat). Un `$` isolé (suivi d'espace ou d'un nombre non adjacent =
+/// colonnes) reste un simple marqueur caractère.
+fn dollar_begins_informat(ts: &StatementStream) -> bool {
+    let cur = ts.peek();
+    let next = ts.peek2();
+    next.span.start == cur.span.end
+        && matches!(next.kind, TokenKind::Ident(_) | TokenKind::Num(_))
 }
 
-/// Tente de lire un token d'informat à la position courante. Un informat
-/// SAS s'écrit `name w. d` / `w. d` / `$ w.` etc. Le lexer découpe par ex.
-/// `5.2` en `Num(5.2)` et `$10.` en `Dollar Num(10) Dot`. On reconstruit
-/// donc le token textuel attendu par `FormatSpec::parse`. Renvoie `None` si
-/// aucun informat n'est présent (la variable était en list input simple).
-fn try_parse_informat_token(ts: &mut StatementStream) -> Result<Option<String>> {
-    // Cas `$w.` ou `$name w.` : un `$` déjà consommé par l'appelant signale
-    // le caractère, mais un `$` peut aussi introduire un informat ($CHAR.,
-    // $w.). Ici on traite les formes APRÈS le nom (et après un éventuel `$`).
-    let mut token = String::new();
-
-    // Informat caractère explicite `$CHARw.` / `$w.` introduit par un `$`.
-    if ts.peek().kind == TokenKind::Dollar {
-        ts.next();
-        token.push('$');
-    }
-
-    // Nom d'informat alphabétique optionnel (DATE, COMMA, CHAR, BEST...).
-    if let TokenKind::Ident(s) = &ts.peek().kind {
-        // Un identifiant n'est un nom d'informat QUE s'il est immédiatement
-        // suivi de chiffres et/ou d'un `.` (sinon c'est la variable
-        // suivante du list input). On le détecte en regardant le token
-        // suivant : Num ou Dot.
-        let next = &ts.peek2().kind;
-        let looks_like_informat = matches!(next, TokenKind::Num(_) | TokenKind::Dot);
-        if looks_like_informat {
-            token.push_str(s);
-            ts.next();
-        } else if !token.is_empty() {
-            // On a déjà consommé `$` : `$name` sans largeur = informat
-            // caractère nommé (rare) — on prend le nom.
-            token.push_str(s);
-            ts.next();
-        } else {
-            // Pas d'informat : rien à faire.
-            return Ok(None);
-        }
-    }
-
-    // Largeur `w` puis `. d` éventuels. Le lexer a pu produire :
-    //   `5.2`  → Num(5.2)
-    //   `5.`   → Num(5) Dot      (ou Num(5.0)? non : `5.` suivi d'un non-digit
-    //                              reste Num(5) puis Dot)
-    //   `10.`  → Num(10) Dot
-    //   `.`    → Dot
-    match ts.peek().kind {
+/// Vrai si un informat suit (mode formaté) : un `$`, un nombre porteur d'un
+/// point décimal (`5.2`, lexé en `Num(5.2)`) ou suivi d'un `.` adjacent
+/// (`8.`), ou un Ident adjacent à un morceau de format (`date9.`). Le cas du
+/// nombre suivi d'un `-` (plage de colonnes) est déjà traité plus haut.
+fn input_informat_follows(ts: &StatementStream) -> bool {
+    let cur = ts.peek();
+    match &cur.kind {
+        // `$char10.` : le `$` ouvre un informat caractère.
+        TokenKind::Dollar => true,
         TokenKind::Num(n) => {
-            ts.next();
-            // `Num(5.2)` : le lexer a fusionné largeur.décimales.
+            // `5.2` : le point décimal est DANS le token (partie fractionnaire).
             if n.fract() != 0.0 {
-                // Reconstituer "w.d" depuis la valeur flottante via sa
-                // représentation textuelle d'origine est ambigu ; on utilise
-                // la forme décimale brute.
-                token.push_str(&format_informat_num(n));
-            } else {
-                token.push_str(&format!("{}", n as i64));
-                // `.` éventuel (largeur entière suivie d'un point).
-                if ts.peek().kind == TokenKind::Dot {
-                    ts.next();
-                    token.push('.');
-                    // décimales éventuelles `d`.
-                    if let TokenKind::Num(d) = ts.peek().kind
-                        && d.fract() == 0.0
-                    {
-                        ts.next();
-                        token.push_str(&format!("{}", d as i64));
-                    }
-                }
+                return true;
             }
+            // `8.` : un `.` adjacent suit le nombre entier.
+            let next = ts.peek2();
+            next.span.start == cur.span.end && next.kind == TokenKind::Dot
         }
-        TokenKind::Dot => {
-            // `name .` : informat dégénéré ; on prend juste le `.`.
-            ts.next();
-            token.push('.');
-        }
-        _ => {
-            if token.is_empty() {
-                return Ok(None);
-            }
-            // `$` seul (ex. `name $`) a déjà été géré par l'appelant ; ici
-            // un `$` sans suite est un informat caractère par défaut.
-        }
+        // `date9.` : un Ident dont le morceau suivant adjacent est un format.
+        TokenKind::Ident(_) => ident_begins_format(ts),
+        _ => false,
     }
-
-    if token.is_empty() || token == "$" {
-        return Ok(None);
-    }
-    Ok(Some(token))
 }
 
-/// Représente un `Num(5.2)` (largeur.décimales) en token d'informat "5.2".
-fn format_informat_num(n: f64) -> String {
-    // n vaut par ex. 5.2 → "5.2". On reconstruit via une représentation
-    // décimale courte. Les informats w.d ont w et d entiers ; ici n encode
-    // w.d dans un f64, ce qui est intrinsèquement ambigu pour d≥2 chiffres.
-    // On formate avec suffisamment de précision puis on retire les zéros.
-    let s = format!("{n}");
-    s
-}
-
-/// `file <dest> <options>;` (M14.2). Destination : `'chemin'` (fichier),
-/// `LOG`, ou `PRINT`. Options reconnues : `DLM=`/`DELIMITER=`, `DSD`,
-/// `LRECL=` (acceptée puis ignorée). Un fileref nu (ex. `file myfile;`) ou
-/// une option inconnue → erreur "not yet implemented." propre.
+/// `file <dest> ;` (M14.2). La destination est un littéral chemin
+/// (`'sortie.txt'`) OU le mot-clé `log` / `print`. Toute autre forme →
+/// erreur claire. (Les options FILE — `LRECL=`, `MOD`... — ne sont pas
+/// supportées.)
 fn parse_file(ts: &mut StatementStream) -> Result<DsStmt> {
     ts.next(); // `file`
-    let dest_tok = ts.peek().clone();
-    let dest = match &dest_tok.kind {
-        TokenKind::Str { value, .. } => {
+    let tok = ts.peek().clone();
+    let dest = match &tok.kind {
+        TokenKind::Str {
+            value,
+            suffix: StrSuffix::None | StrSuffix::Name,
+        } => {
+            let s = value.clone();
             ts.next();
-            PutDest::Path(value.clone())
+            PutDest::Path(s)
         }
-        TokenKind::Ident(s) if s.eq_ignore_ascii_case("log") => {
+        TokenKind::Ident(name) if name.eq_ignore_ascii_case("log") => {
             ts.next();
             PutDest::Log
         }
-        TokenKind::Ident(s) if s.eq_ignore_ascii_case("print") => {
+        TokenKind::Ident(name) if name.eq_ignore_ascii_case("print") => {
             ts.next();
             PutDest::Print
         }
-        // Un fileref nu (ex. `file out;`) n'est pas couvert : seuls les
-        // chemins littéraux et LOG/PRINT le sont.
-        TokenKind::Ident(_) => {
-            return Err(SasError::parse(
-                "FILE with a fileref is not yet implemented; use a quoted physical path, LOG, or PRINT.",
-                dest_tok.span,
-            ));
-        }
         _ => {
             return Err(SasError::parse(
-                "expected a quoted file path, LOG, or PRINT after FILE",
-                dest_tok.span,
+                "expected a quoted file path, LOG or PRINT after FILE",
+                tok.span,
             ));
         }
     };
-
-    let mut delimiter: Option<String> = None;
-    let mut dsd = false;
-    loop {
-        let tok = ts.peek().clone();
-        match &tok.kind {
-            TokenKind::Semi => break,
-            TokenKind::Ident(name) => {
-                let lower = name.to_ascii_lowercase();
-                match lower.as_str() {
-                    "dlm" | "delimiter" => {
-                        ts.next();
-                        if ts.peek().kind != TokenKind::Eq {
-                            return Err(SasError::parse(
-                                "expected '=' after the DLM=/DELIMITER= FILE option",
-                                ts.peek().span,
-                            ));
-                        }
-                        ts.next(); // `=`
-                        delimiter = Some(parse_delimiter_value(ts)?);
-                    }
-                    "dsd" => {
-                        ts.next();
-                        dsd = true;
-                    }
-                    "lrecl" => {
-                        ts.next();
-                        // Acceptée puis ignorée.
-                        let _ = parse_infile_uint(ts, "LRECL=")?;
-                    }
-                    other => {
-                        return Err(SasError::parse(
-                            format!(
-                                "The FILE option {} is not yet implemented.",
-                                other.to_uppercase()
-                            ),
-                            tok.span,
-                        ));
-                    }
-                }
-            }
-            _ => {
-                return Err(SasError::parse("expected a FILE option or ';'", tok.span));
-            }
-        }
-    }
     ts.expect_semi()?;
-    Ok(DsStmt::File {
-        dest,
-        delimiter,
-        dsd,
-    })
+    Ok(DsStmt::File { dest })
 }
 
-/// `put <items>;` (M14.2). Items : variables (list `name`, formatted
-/// `name 5.2`/`name $10.`, named `name=`), littéraux quotés, pointeurs
-/// `@n`/`+n`, `/`, `_all_`, et maintien de ligne `@`/`@@` EN FIN de PUT.
+/// `put <items> ;` (M14.2). Miroir de sortie d'`input`. Modes pris en
+/// charge :
+/// - liste : `put name age` (format d'affichage de chaque variable) ;
+/// - nommé : `put name= age=` (`name=VALEUR`) ;
+/// - littéral : `put 'Report for' name` ;
+/// - formaté : `put x 8.2` / `put d date9.` ;
+/// - pointeurs `@n`, `+n`, `/`, hold `@`/`@@`, et `put _all_;`.
+///
+/// On lit les tokens jusqu'au `;` final (consommé).
 fn parse_put(ts: &mut StatementStream) -> Result<DsStmt> {
     ts.next(); // `put`
     let mut items: Vec<PutItem> = Vec::new();
     loop {
         let tok = ts.peek().clone();
         match &tok.kind {
-            TokenKind::Semi => break,
-            // Littéral quoté : écrit verbatim.
-            TokenKind::Str { value, .. } => {
+            TokenKind::Semi => {
                 ts.next();
-                items.push(PutItem::Literal(value.clone()));
+                return Ok(DsStmt::Put(items));
             }
-            // `@` : pointeur `@n` OU maintien de ligne `@`/`@@` en fin.
+            // `@@` (double hold), `@n` (pointeur de colonne) ou `@` (hold).
             TokenKind::At => {
                 ts.next(); // `@`
                 if ts.peek().kind == TokenKind::At {
-                    // `@@` : maintien à travers les itérations. Doit terminer
-                    // le PUT.
-                    ts.next();
-                    items.push(PutItem::HoldLineAcross);
-                    break;
-                }
-                // `@n` : pointeur de colonne ; `@` seul suivi de `;` = hold.
-                match ts.peek().kind {
-                    TokenKind::Num(n) if n.fract() == 0.0 && n >= 1.0 => {
-                        ts.next();
-                        items.push(PutItem::PointerCol(n as usize));
-                    }
-                    TokenKind::Semi => {
-                        items.push(PutItem::HoldLine);
-                        break;
-                    }
-                    _ => {
+                    ts.next(); // second `@`
+                    items.push(PutItem::HoldLineDouble);
+                } else if let TokenKind::Num(n) = ts.peek().kind {
+                    if n.fract() != 0.0 || n < 1.0 {
                         return Err(SasError::parse(
-                            "expected a column number after '@' (or ';' for line-hold) in the PUT statement",
+                            "the column pointer @n must be a positive integer",
                             ts.peek().span,
                         ));
                     }
+                    ts.next();
+                    items.push(PutItem::ColumnPointer(n as usize));
+                } else {
+                    // `@` final (hold simple) — doit être suivi du `;`.
+                    items.push(PutItem::HoldLine);
                 }
             }
-            // `+n` : saut relatif.
+            // `+n` : avance relative du curseur.
             TokenKind::Plus => {
                 ts.next(); // `+`
-                let n = parse_input_uint(ts, "the + column-pointer")?;
-                items.push(PutItem::PointerSkip(n));
+                let n_tok = ts.peek().clone();
+                let TokenKind::Num(n) = n_tok.kind else {
+                    return Err(SasError::parse(
+                        "expected a positive integer after '+' in the PUT statement",
+                        n_tok.span,
+                    ));
+                };
+                if n.fract() != 0.0 || n < 0.0 {
+                    return Err(SasError::parse(
+                        "the column skip +n must be a non-negative integer",
+                        n_tok.span,
+                    ));
+                }
+                ts.next();
+                items.push(PutItem::SkipColumns(n as usize));
             }
-            // `/` : ligne suivante.
+            // `/` : passage à la ligne de sortie suivante.
             TokenKind::Slash => {
                 ts.next();
                 items.push(PutItem::NextLine);
             }
-            TokenKind::Ident(_) => {
-                items.push(parse_put_var(ts)?);
+            // Un littéral chaîne : écrit verbatim.
+            TokenKind::Str {
+                value,
+                suffix: StrSuffix::None | StrSuffix::Name,
+            } => {
+                let s = value.clone();
+                ts.next();
+                items.push(PutItem::Literal(s));
+            }
+            // Un nom de variable : forme nommée (`name=`), formatée
+            // (`name 8.2`) ou liste (`name`). `_all_` est un cas spécial.
+            TokenKind::Ident(name) => {
+                let name = name.clone();
+                if name.eq_ignore_ascii_case("_all_") {
+                    ts.next();
+                    items.push(PutItem::All);
+                    continue;
+                }
+                validate_sas_name(&name, tok.span)?;
+                ts.next();
+                items.push(parse_put_var(ts, name)?);
             }
             _ => {
                 return Err(SasError::parse(
-                    "expected a variable, literal, or pointer in the PUT statement",
+                    "expected a variable, a literal, a column pointer or ';' in the PUT statement",
                     tok.span,
                 ));
             }
         }
     }
-    ts.expect_semi()?;
-    Ok(DsStmt::Put { items })
 }
 
-/// Une variable de PUT : `name`, `name=` (named output), `name format.`,
-/// `name $10.`, `_all_`.
-fn parse_put_var(ts: &mut StatementStream) -> Result<PutItem> {
-    let name_tok = ts.peek().clone();
-    let name = name_tok
-        .ident()
-        .expect("caller matched an Ident")
-        .to_string();
-
-    // `_all_` : named output de toutes les variables du PDV.
-    if name.eq_ignore_ascii_case("_all_") {
-        ts.next();
-        return Ok(PutItem::All);
-    }
-
-    super::validate_sas_name(&name, name_tok.span)?;
-    ts.next(); // nom
-
-    // Named output `name=`.
+/// Suffixe d'une variable PUT : `[= | format]`.
+/// - `name=` : forme nommée (`name=VALEUR`). On distingue du début d'une
+///   assignation : dans un PUT, `name=` n'est jamais suivi d'une expression
+///   significative — l'item suivant est un autre item PUT ou le `;`.
+/// - `name fmt.` : forme formatée (format adjacent comme dans FORMAT/INPUT).
+/// - sinon : forme liste (format d'affichage par défaut de la variable).
+fn parse_put_var(ts: &mut StatementStream, name: String) -> Result<PutItem> {
+    // Forme nommée `name=`.
     if ts.peek().kind == TokenKind::Eq {
-        ts.next();
+        ts.next(); // `=`
         return Ok(PutItem::NamedVar(name));
     }
-
-    // `$` (caractère) éventuel avant un format `$w.`.
-    let mut is_char = false;
-    if ts.peek().kind == TokenKind::Dollar {
-        ts.next();
-        is_char = true;
+    // Forme formatée : un format suit (token adjacent `$`, `8.2`, `date9.`).
+    if put_format_follows(ts) {
+        let token = super::expr::read_format_token(ts)?;
+        return Ok(PutItem::Var {
+            name,
+            format: Some(token),
+        });
     }
+    // Forme liste pure.
+    Ok(PutItem::Var { name, format: None })
+}
 
-    // Format d'écriture éventuel (`name 5.2`, `name $10.`, `name DATE9.`).
-    let mut format = try_parse_informat_token(ts)?;
-    if let Some(token) = &mut format {
-        if token.starts_with('$') {
-            // déjà un format caractère.
-        } else if is_char {
-            // `$` consommé AVANT le format (`name $10.`) : le préfixer.
-            token.insert(0, '$');
+/// Vrai si un format suit (forme formatée d'un item PUT). Identique à
+/// `input_informat_follows` : un `$`, un nombre fractionnaire (`5.2`) ou
+/// entier suivi d'un `.` adjacent (`8.`), ou un Ident adjacent à un morceau
+/// de format (`date9.`).
+fn put_format_follows(ts: &StatementStream) -> bool {
+    let cur = ts.peek();
+    match &cur.kind {
+        TokenKind::Dollar => true,
+        TokenKind::Num(n) => {
+            if n.fract() != 0.0 {
+                return true;
+            }
+            let next = ts.peek2();
+            next.span.start == cur.span.end && next.kind == TokenKind::Dot
         }
-    } else if is_char {
-        // `name $` sans largeur : format caractère par défaut.
-        format = Some("$".to_string());
+        TokenKind::Ident(_) => ident_begins_format(ts),
+        _ => false,
     }
+}
 
-    Ok(PutItem::Var { name, format })
+/// `datalines;` / `cards;` (M14). Le mot-clé a été lu par `parse_statement` ;
+/// ici on consomme le `;` puis le token `DataLines` (émis par le lexer juste
+/// après ce `;`). Les variantes `4` (`datalines4`/`cards4`) sont équivalentes
+/// au parsing près (le terminateur a déjà été géré par le lexer).
+fn parse_datalines(ts: &mut StatementStream) -> Result<DsStmt> {
+    ts.next(); // `datalines` / `cards` / `datalines4` / `cards4`
+    ts.expect_semi()?;
+    // Le token suivant DOIT être le bloc verbatim capturé par le lexer.
+    let tok = ts.peek().clone();
+    if let TokenKind::DataLines(lines) = &tok.kind {
+        let lines = lines.clone();
+        ts.next();
+        Ok(DsStmt::Datalines(lines))
+    } else {
+        // Aucun bloc (cas dégénéré) : datalines vide.
+        Ok(DsStmt::Datalines(Vec::new()))
+    }
 }
 
 /// `by [descending] v1 [descending] v2 ... ;` → `DsStmt::By` (M3). Le
@@ -1200,6 +1352,170 @@ fn parse_branch_statement(ts: &mut StatementStream) -> Result<DsStmt> {
     parse_statement(ts)
 }
 
+/// `select [(expr)]; when (...) stmt; ... [otherwise stmt;] end;` (M16.1).
+///
+/// Forme SÉLECTEUR : `select (expr);` — l'expression entre parenthèses est
+/// évaluée une fois, puis chaque `when (v1, v2, ...)` compare le sélecteur à
+/// la liste de valeurs (sémantique `=` de SAS). Forme BOOLÉENNE :
+/// `select;` — chaque `when (cond)` est une condition booléenne, la première
+/// vraie l'emporte. `otherwise` est optionnelle ; `end;` clôt le bloc.
+///
+/// Le corps d'un WHEN/OTHERWISE est UN statement (comme une branche THEN) :
+/// `do; ... end;` pour plusieurs statements. Un WHEN/OTHERWISE sans corps
+/// (immédiatement suivi de `;`) est licite (no-op) en SAS.
+fn parse_select(ts: &mut StatementStream) -> Result<DsStmt> {
+    let select_tok = ts.peek().clone();
+    ts.next(); // `select`
+
+    // Forme sélecteur : `(expr)` optionnel avant le `;`.
+    let selector = if ts.peek().kind == TokenKind::LParen {
+        ts.next(); // `(`
+        let expr = super::expr::parse_expr(ts)?;
+        if ts.peek().kind != TokenKind::RParen {
+            return Err(SasError::parse(
+                "expected ')' after the SELECT expression",
+                ts.peek().span,
+            ));
+        }
+        ts.next(); // `)`
+        Some(expr)
+    } else {
+        None
+    };
+    ts.expect_semi()?;
+
+    let mut whens: Vec<WhenClause> = Vec::new();
+    let mut otherwise: Option<Box<DsStmt>> = None;
+    let selector_form = selector.is_some();
+
+    loop {
+        let tok = ts.peek().clone();
+        match &tok.kind {
+            TokenKind::Eof => {
+                return Err(SasError::parse(
+                    "missing END for SELECT block.",
+                    select_tok.span,
+                ));
+            }
+            // `;` superflus entre clauses (et un éventuel commentaire `*` géré
+            // par le lexer en amont).
+            TokenKind::Semi => {
+                ts.next();
+            }
+            TokenKind::Ident(s) if s.eq_ignore_ascii_case("when") => {
+                if otherwise.is_some() {
+                    return Err(SasError::parse(
+                        "WHEN is not allowed after OTHERWISE in a SELECT block.",
+                        tok.span,
+                    ));
+                }
+                ts.next(); // `when`
+                let values = parse_when_values(ts, selector_form)?;
+                let body = Box::new(parse_select_branch(ts)?);
+                whens.push(WhenClause { values, body });
+            }
+            TokenKind::Ident(s) if s.eq_ignore_ascii_case("otherwise") => {
+                if otherwise.is_some() {
+                    return Err(SasError::parse(
+                        "Only one OTHERWISE clause is allowed in a SELECT block.",
+                        tok.span,
+                    ));
+                }
+                ts.next(); // `otherwise`
+                otherwise = Some(Box::new(parse_select_branch(ts)?));
+            }
+            TokenKind::Ident(s) if s.eq_ignore_ascii_case("end") => {
+                ts.next(); // `end`
+                ts.expect_semi()?;
+                return Ok(DsStmt::Select {
+                    selector,
+                    whens,
+                    otherwise,
+                });
+            }
+            TokenKind::Ident(s) => {
+                let lower = s.to_ascii_lowercase();
+                if lower == "run" || lower == "quit" || is_block_head_kw(&lower) {
+                    return Err(SasError::parse(
+                        "missing END for SELECT block.",
+                        tok.span,
+                    ));
+                }
+                return Err(SasError::parse(
+                    "expected WHEN, OTHERWISE or END inside the SELECT block",
+                    tok.span,
+                ));
+            }
+            _ => {
+                return Err(SasError::parse(
+                    "expected WHEN, OTHERWISE or END inside the SELECT block",
+                    tok.span,
+                ));
+            }
+        }
+    }
+}
+
+/// `( v1 [, v2 ...] )` après un WHEN. En forme booléenne (sans sélecteur),
+/// une seule expression (la condition) est autorisée. La liste vide `when ()`
+/// est rejetée.
+fn parse_when_values(ts: &mut StatementStream, selector_form: bool) -> Result<Vec<Expr>> {
+    let open = ts.peek().clone();
+    if open.kind != TokenKind::LParen {
+        return Err(SasError::parse(
+            "expected '(' after WHEN",
+            open.span,
+        ));
+    }
+    ts.next(); // `(`
+    if ts.peek().kind == TokenKind::RParen {
+        return Err(SasError::parse(
+            "expected at least one value in the WHEN list",
+            ts.peek().span,
+        ));
+    }
+    let mut values = vec![super::expr::parse_expr(ts)?];
+    while ts.peek().kind == TokenKind::Comma {
+        if !selector_form {
+            return Err(SasError::parse(
+                "a WHEN condition in a boolean SELECT (no selector) takes a single expression",
+                ts.peek().span,
+            ));
+        }
+        ts.next(); // `,`
+        values.push(super::expr::parse_expr(ts)?);
+    }
+    if ts.peek().kind != TokenKind::RParen {
+        return Err(SasError::parse(
+            "expected ',' or ')' in the WHEN list",
+            ts.peek().span,
+        ));
+    }
+    ts.next(); // `)`
+    Ok(values)
+}
+
+/// Corps d'un WHEN/OTHERWISE : UN statement, ou rien (`;` immédiat → no-op,
+/// rendu comme un bloc vide). `run`/`quit`/frontière de bloc ne peuvent pas
+/// servir de corps.
+fn parse_select_branch(ts: &mut StatementStream) -> Result<DsStmt> {
+    if ts.peek().kind == TokenKind::Semi {
+        ts.next(); // `;` — corps vide
+        return Ok(DsStmt::Block(Vec::new()));
+    }
+    let tok = ts.peek().clone();
+    if let Some(s) = tok.ident() {
+        let lower = s.to_ascii_lowercase();
+        if lower == "run" || lower == "quit" || lower == "end" || is_block_head_kw(&lower) {
+            return Err(SasError::parse(
+                "expected a statement after WHEN/OTHERWISE",
+                tok.span,
+            ));
+        }
+    }
+    parse_statement(ts)
+}
+
 /// `do ...; stmts end ;` — quatre formes :
 /// - `do;` : bloc non itératif → `DsStmt::Block` (chemin M1 conservé) ;
 /// - `do i = e1 [to e2] [by e3] [while(c)] [until(c)];` : itératif ;
@@ -1221,12 +1537,27 @@ fn parse_do(ts: &mut StatementStream) -> Result<DsStmt> {
         TokenKind::Ident(name) => {
             let name = name.clone();
             let lower = name.to_ascii_lowercase();
+            // `do over arr;` : boucle implicite sur un array. `over` n'est pas
+            // un mot réservé — on ne le reconnaît que s'il est suivi d'un
+            // identifiant d'array et d'un `;` (sinon `over` serait un index).
+            if lower == "over" {
+                if let TokenKind::Ident(arr) = &ts.peek_nth(1).kind {
+                    if ts.peek_nth(2).kind == TokenKind::Semi {
+                        let arr = arr.clone();
+                        ts.next(); // `over`
+                        ts.next(); // nom d'array
+                        ts.expect_semi()?;
+                        let body = parse_do_body(ts)?;
+                        return Ok(DsStmt::DoOver { array: arr, body });
+                    }
+                }
+            }
             ts.next(); // l'ident (index potentiel, ou while/until)
             if ts.peek().kind == TokenKind::Eq {
-                // `do i = ...` : itératif.
+                // `do i = ...` : itératif ou liste de valeurs.
                 validate_sas_name(&name, head.span)?;
                 ts.next(); // `=`
-                parse_iterative_do(ts, name, head.span)
+                parse_iterative_do(ts, name)
             } else if (lower == "while" || lower == "until")
                 && ts.peek().kind == TokenKind::LParen
             {
@@ -1261,22 +1592,20 @@ fn parse_do(ts: &mut StatementStream) -> Result<DsStmt> {
     }
 }
 
-/// Clauses d'un DO itératif après `do index =` : `from [to e] [by e]`
-/// (TO/BY acceptés dans les deux ordres, comme SAS) puis WHILE/UNTIL en
-/// ordre quelconque, UN seul de chaque. Termine sur le `;` puis parse le
-/// corps jusqu'à `end;`.
-fn parse_iterative_do(
-    ts: &mut StatementStream,
-    index_name: String,
-    index_span: Span,
-) -> Result<DsStmt> {
+/// Clauses d'un DO itératif après `do index =`. Deux formes possibles :
+///
+/// - Itératif classique : `from [to e] [by e] [while(c)] [until(c)]` (TO/BY
+///   dans les deux ordres, UN seul de chaque) → `DsStmt::DoLoop`.
+/// - Liste de valeurs (M16.3) : `v1, v2, v3` où chaque `vk` est une valeur
+///   explicite OU une sous-liste `from to e [by k]`, séparées par des
+///   virgules → `DsStmt::DoList`. Une valeur unique sans clause (`do i = 1;`)
+///   est aussi une liste (à un élément).
+///
+/// On parse d'abord le premier segment (`from` + clauses éventuelles). S'il
+/// n'y a NI virgule NI valeur unique nue, c'est le DO itératif classique
+/// (qui seul porte WHILE/UNTIL). Sinon c'est une liste de valeurs.
+fn parse_iterative_do(ts: &mut StatementStream, index_name: String) -> Result<DsStmt> {
     let from = super::expr::parse_expr(ts)?;
-    if ts.peek().kind == TokenKind::Comma {
-        return Err(SasError::parse(
-            "DO loops over a list of values are not yet implemented.",
-            ts.peek().span,
-        ));
-    }
     let mut to: Option<Expr> = None;
     let mut by: Option<Expr> = None;
     let mut while_: Option<Expr> = None;
@@ -1312,24 +1641,103 @@ fn parse_iterative_do(
             _ => break,
         }
     }
-    // Pas de clause du tout : `do i = 1;` est une liste de valeurs à un
-    // élément → même erreur "not yet implemented" que la forme à virgules.
-    if to.is_none() && by.is_none() && while_.is_none() && until.is_none() {
+
+    let has_comma = ts.peek().kind == TokenKind::Comma;
+
+    // Forme itérative classique : au moins UNE clause TO/BY/WHILE/UNTIL et
+    // PAS de virgule en suite. WHILE/UNTIL n'existent que dans cette forme.
+    if !has_comma && (to.is_some() || by.is_some() || while_.is_some() || until.is_some()) {
+        ts.expect_semi()?;
+        let body = parse_do_body(ts)?;
+        return Ok(DsStmt::DoLoop {
+            index: Some((index_name, from)),
+            to,
+            by,
+            while_,
+            until,
+            body,
+        });
+    }
+
+    // Forme liste de valeurs (M16.3). WHILE/UNTIL y sont illégaux.
+    if while_.is_some() || until.is_some() {
         return Err(SasError::parse(
-            "DO loops over a list of values are not yet implemented.",
-            index_span,
+            "WHILE/UNTIL are not allowed in a DO statement over a list of values.",
+            ts.peek().span,
         ));
+    }
+    let mut items: Vec<DoListItem> = Vec::new();
+    // Le premier segment est déjà parsé : valeur unique, ou sous-liste si TO
+    // (le BY ne peut apparaître que conjointement à TO).
+    items.push(make_do_list_item(from, to, by, ts.peek().span)?);
+    while ts.peek().kind == TokenKind::Comma {
+        ts.next(); // `,`
+        let v = super::expr::parse_expr(ts)?;
+        let (mut t, mut b): (Option<Expr>, Option<Expr>) = (None, None);
+        loop {
+            let tok = ts.peek().clone();
+            let Some(kw) = tok.ident().map(str::to_ascii_lowercase) else {
+                break;
+            };
+            match kw.as_str() {
+                "to" if t.is_none() => {
+                    ts.next();
+                    t = Some(super::expr::parse_expr(ts)?);
+                }
+                "by" if b.is_none() => {
+                    ts.next();
+                    b = Some(super::expr::parse_expr(ts)?);
+                }
+                "to" | "by" => {
+                    return Err(SasError::parse(
+                        format!("duplicate {} clause in the DO statement", kw.to_uppercase()),
+                        tok.span,
+                    ));
+                }
+                _ => break,
+            }
+        }
+        items.push(make_do_list_item(v, t, b, ts.peek().span)?);
+    }
+    // WHILE/UNTIL en fin de liste (`do i = 1, 3 while(x);`) sont illégaux.
+    if let Some(kw) = ts.peek().ident().map(str::to_ascii_lowercase) {
+        if kw == "while" || kw == "until" {
+            return Err(SasError::parse(
+                "WHILE/UNTIL are not allowed in a DO statement over a list of values.",
+                ts.peek().span,
+            ));
+        }
     }
     ts.expect_semi()?;
     let body = parse_do_body(ts)?;
-    Ok(DsStmt::DoLoop {
-        index: Some((index_name, from)),
-        to,
-        by,
-        while_,
-        until,
+    Ok(DsStmt::DoList {
+        index: index_name,
+        items,
         body,
     })
+}
+
+/// Construit un `DoListItem` à partir d'un segment de liste de valeurs :
+/// `from` seul → `Value` ; `from to to_ [by by_]` → `Range`. Un `BY` sans
+/// `TO` est une erreur de syntaxe.
+fn make_do_list_item(
+    from: Expr,
+    to: Option<Expr>,
+    by: Option<Expr>,
+    span: Span,
+) -> Result<DoListItem> {
+    match to {
+        Some(t) => Ok(DoListItem::Range { from, to: t, by }),
+        None => {
+            if by.is_some() {
+                return Err(SasError::parse(
+                    "BY without TO in a DO statement value list.",
+                    span,
+                ));
+            }
+            Ok(DoListItem::Value(from))
+        }
+    }
 }
 
 /// `( expr )` après WHILE/UNTIL.
@@ -1403,7 +1811,7 @@ fn parse_do_body(ts: &mut StatementStream) -> Result<Vec<DsStmt>> {
 fn parse_assign_indexed_tail(
     ts: &mut StatementStream,
     array: String,
-    index: Expr,
+    indices: Vec<Expr>,
 ) -> Result<DsStmt> {
     if ts.peek().kind != TokenKind::Eq {
         return Err(SasError::parse(
@@ -1417,7 +1825,11 @@ fn parse_assign_indexed_tail(
     ts.next(); // `=`
     let expr = super::expr::parse_expr(ts)?;
     ts.expect_semi()?;
-    Ok(DsStmt::AssignIndexed { array, index, expr })
+    Ok(DsStmt::AssignIndexed {
+        array,
+        indices,
+        expr,
+    })
 }
 
 /// `array arr{3} x y z;` — déclaration d'array 1-D (M2). Délimiteurs de
@@ -1425,9 +1837,9 @@ fn parse_assign_indexed_tail(
 /// Formes : `{n}` taille explicite, `{*}` taille déduite de la liste ;
 /// `$ [len]` array caractère (longueur défaut 8) ; liste de variables
 /// optionnelle (vide → éléments auto-nommés à la compilation), plages
-/// numérotées `x1-x3` expansées ICI. Hors périmètre M2 → erreurs propres :
-/// multi-dimensions, valeurs initiales `(...)`, `_temporary_` et listes
-/// spéciales `_numeric_`/`_character_`/`_all_`.
+/// numérotées `x1-x3` expansées ICI. M16.2 ajoute : dimensions multiples
+/// `{2,3}`, valeurs initiales `(1, 2, 3)` en ordre row-major, `_TEMPORARY_`
+/// et listes spéciales `_NUMERIC_`/`_CHARACTER_`/`_ALL_`.
 fn parse_array(ts: &mut StatementStream) -> Result<DsStmt> {
     ts.next(); // `array`
     let name_tok = ts.peek().clone();
@@ -1440,7 +1852,7 @@ fn parse_array(ts: &mut StatementStream) -> Result<DsStmt> {
     validate_sas_name(&name, name_tok.span)?;
     ts.next();
 
-    // ── Dimension : `{n}`, `[n]`, `(n)` ou `{*}`... ─────────────────────
+    // ── Dimensions : `{n}`, `{n, m, ...}`, `[n]`, `(n)` ou `{*}` ─────────
     let open = ts.peek().clone();
     let closer = match open.kind {
         TokenKind::LBrace => TokenKind::RBrace,
@@ -1454,34 +1866,50 @@ fn parse_array(ts: &mut StatementStream) -> Result<DsStmt> {
         }
     };
     ts.next(); // ouvrant
-    let dim_tok = ts.peek().clone();
-    let size = match dim_tok.kind {
-        TokenKind::Star => {
-            ts.next();
-            None
-        }
-        TokenKind::Num(n) => {
-            if n.fract() != 0.0 || n < 1.0 {
-                return Err(SasError::parse(
-                    "the array dimension must be a positive integer",
-                    dim_tok.span,
-                ));
+    // `dims = None` ⟺ une seule dimension `{*}` (taille déduite de la
+    // liste) ; sinon une ou plusieurs bornes supérieures explicites.
+    let mut dims: Option<Vec<usize>> = None;
+    {
+        let mut collected: Vec<usize> = Vec::new();
+        loop {
+            let dim_tok = ts.peek().clone();
+            match dim_tok.kind {
+                TokenKind::Star => {
+                    if !collected.is_empty() {
+                        return Err(SasError::parse(
+                            "'*' is only allowed as the sole array dimension",
+                            dim_tok.span,
+                        ));
+                    }
+                    ts.next();
+                    // `dims` reste None : taille déduite de la liste (1-D).
+                }
+                TokenKind::Num(n) => {
+                    if n.fract() != 0.0 || n < 1.0 {
+                        return Err(SasError::parse(
+                            "the array dimension must be a positive integer",
+                            dim_tok.span,
+                        ));
+                    }
+                    ts.next();
+                    collected.push(n as usize);
+                }
+                _ => {
+                    return Err(SasError::parse(
+                        "expected a dimension or '*' in the ARRAY statement",
+                        dim_tok.span,
+                    ));
+                }
             }
-            ts.next();
-            Some(n as usize)
+            if ts.peek().kind == TokenKind::Comma {
+                ts.next(); // `,`
+                continue;
+            }
+            break;
         }
-        _ => {
-            return Err(SasError::parse(
-                "expected a dimension or '*' in the ARRAY statement",
-                dim_tok.span,
-            ));
+        if !collected.is_empty() {
+            dims = Some(collected);
         }
-    };
-    if ts.peek().kind == TokenKind::Comma {
-        return Err(SasError::parse(
-            "Multi-dimensional arrays are not yet implemented.",
-            ts.peek().span,
-        ));
     }
     if ts.peek().kind != closer {
         return Err(SasError::parse(
@@ -1509,8 +1937,11 @@ fn parse_array(ts: &mut StatementStream) -> Result<DsStmt> {
         }
     }
 
-    // ── Liste de variables (plages x1-x3 expansées ici) ──────────────────
+    // ── Liste de variables / mots-clés spéciaux / valeurs initiales ──────
     let mut vars: Vec<String> = Vec::new();
+    let mut temporary = false;
+    let mut special: Option<crate::ast::ArraySpecial> = None;
+    let mut initial: Vec<Expr> = Vec::new();
     loop {
         let tok = ts.peek().clone();
         match &tok.kind {
@@ -1518,25 +1949,40 @@ fn parse_array(ts: &mut StatementStream) -> Result<DsStmt> {
                 ts.next();
                 return Ok(DsStmt::Array {
                     name,
-                    size,
+                    dims,
                     char_len,
                     vars,
+                    initial,
+                    temporary,
+                    special,
                 });
             }
             TokenKind::Ident(v) => {
                 let v = v.clone();
                 let lower = v.to_ascii_lowercase();
-                if matches!(
-                    lower.as_str(),
-                    "_temporary_" | "_numeric_" | "_character_" | "_all_"
-                ) {
-                    return Err(SasError::parse(
-                        format!(
-                            "{} in the ARRAY statement is not yet implemented.",
-                            v.to_uppercase()
-                        ),
-                        tok.span,
-                    ));
+                match lower.as_str() {
+                    "_temporary_" => {
+                        ts.next();
+                        temporary = true;
+                        continue;
+                    }
+                    "_numeric_" | "_character_" | "_all_" => {
+                        if special.is_some() || !vars.is_empty() {
+                            return Err(SasError::parse(
+                                "a special list (_NUMERIC_/_CHARACTER_/_ALL_) cannot be \
+                                 mixed with named array elements",
+                                tok.span,
+                            ));
+                        }
+                        ts.next();
+                        special = Some(match lower.as_str() {
+                            "_numeric_" => crate::ast::ArraySpecial::Numeric,
+                            "_character_" => crate::ast::ArraySpecial::Character,
+                            _ => crate::ast::ArraySpecial::All,
+                        });
+                        continue;
+                    }
+                    _ => {}
                 }
                 validate_sas_name(&v, tok.span)?;
                 ts.next();
@@ -1557,12 +2003,40 @@ fn parse_array(ts: &mut StatementStream) -> Result<DsStmt> {
                     vars.push(v);
                 }
             }
-            // `(1 2 3)` : valeurs initiales — hors périmètre M2.
+            // `(1, 2, 3)` : valeurs initiales (row-major). Parenthèses ; les
+            // valeurs peuvent être séparées par des virgules OU des espaces
+            // (SAS accepte les deux). On parse des expressions (littéraux
+            // numériques/chaînes, missings, négatifs).
             TokenKind::LParen => {
-                return Err(SasError::parse(
-                    "Array initial values are not yet implemented.",
-                    tok.span,
-                ));
+                if !initial.is_empty() {
+                    return Err(SasError::parse(
+                        "duplicate initial-value list in the ARRAY statement",
+                        tok.span,
+                    ));
+                }
+                ts.next(); // `(`
+                if ts.peek().kind == TokenKind::RParen {
+                    return Err(SasError::parse(
+                        "the array initial-value list cannot be empty",
+                        ts.peek().span,
+                    ));
+                }
+                loop {
+                    initial.push(super::expr::parse_expr(ts)?);
+                    if ts.peek().kind == TokenKind::Comma {
+                        ts.next(); // séparateur virgule optionnel
+                    }
+                    if ts.peek().kind == TokenKind::RParen {
+                        break;
+                    }
+                    if ts.peek().kind == TokenKind::Semi {
+                        return Err(SasError::parse(
+                            "expected ')' to close the array initial-value list",
+                            ts.peek().span,
+                        ));
+                    }
+                }
+                ts.next(); // `)`
             }
             _ => {
                 return Err(SasError::parse(
@@ -1666,8 +2140,23 @@ fn parse_retain_init(ts: &mut StatementStream) -> Result<Option<Expr>> {
     let tok = ts.peek().clone();
     match &tok.kind {
         TokenKind::Num(n) => {
+            let n = *n;
+            let num_end = tok.span.end;
             ts.next();
-            Ok(Some(Expr::Num(*n)))
+            // Forme `21710d` / `21710dt` / `43200t` : un littéral numérique
+            // immédiatement suivi (spans jointifs) d'un suffixe d/t/dt. La
+            // VALEUR est déjà le nombre SAS (date/datetime/time) ; le suffixe
+            // est un marqueur de type sans effet sur la constante. On le
+            // consomme s'il est présent et adjacent.
+            if let TokenKind::Ident(s) = &ts.peek().kind {
+                let lower = s.to_ascii_lowercase();
+                if ts.peek().span.start == num_end
+                    && matches!(lower.as_str(), "d" | "t" | "dt")
+                {
+                    ts.next(); // suffixe
+                }
+            }
+            Ok(Some(Expr::Num(n)))
         }
         TokenKind::Minus => {
             // `-5` : moins unaire sur littéral numérique, replié.
@@ -1683,19 +2172,14 @@ fn parse_retain_init(ts: &mut StatementStream) -> Result<Option<Expr>> {
             Ok(Some(Expr::Num(-n)))
         }
         TokenKind::Str { value, suffix } => {
-            // M2 : seuls les littéraux simples sont acceptés comme valeur
-            // initiale (pas de '...'d/'...'t — viendront avec les formats).
-            match suffix {
-                StrSuffix::None | StrSuffix::Name => {
-                    let s = value.clone();
-                    ts.next();
-                    Ok(Some(Expr::Str(s)))
-                }
-                _ => Err(SasError::parse(
-                    "date/time literals are not yet implemented as RETAIN initial values",
-                    tok.span,
-                )),
-            }
+            // Littéral simple (chaîne) OU littéral date/heure/datetime
+            // (`'01JAN2020'd`, `'14:30:00't`, `'01JAN2020 14:30:00'dt`),
+            // converti en sa valeur SAS numérique (M16.3).
+            let value = value.clone();
+            let suffix = *suffix;
+            let span = tok.span;
+            ts.next();
+            Ok(Some(super::expr::literal_from_string(&value, suffix, span)?))
         }
         TokenKind::Dot => {
             // `.` seul, ou missing spécial `.a`.. / `._` si l'ident d'UNE
@@ -2073,6 +2557,14 @@ mod tests {
         DatasetSpec::plain(dsref(name))
     }
 
+    /// `DsStmt::Set` sans options de niveau statement (M16.4).
+    fn set_stmt(specs: Vec<DatasetSpec>) -> DsStmt {
+        DsStmt::Set {
+            specs,
+            options: crate::ast::SetOptions::default(),
+        }
+    }
+
     fn var(s: &str) -> Expr {
         Expr::Var(s.to_string())
     }
@@ -2084,7 +2576,7 @@ mod tests {
         assert_eq!(
             ast.stmts,
             vec![
-                DsStmt::Set(vec![dspec("inp")]),
+                set_stmt(vec![dspec("inp")]),
                 DsStmt::Assign {
                     var: "x".to_string(),
                     expr: Expr::Num(1.0),
@@ -2214,7 +2706,7 @@ mod tests {
         assert_eq!(
             ast.stmts,
             vec![
-                DsStmt::Set(vec![dspec("i")]),
+                set_stmt(vec![dspec("i")]),
                 DsStmt::Output(vec![]),
                 DsStmt::Keep(vec!["a".to_string(), "b".to_string()]),
                 DsStmt::Drop(vec!["c".to_string()]),
@@ -2228,7 +2720,7 @@ mod tests {
         let ast = parse("data o; set a lib.b; run;").unwrap();
         assert_eq!(
             ast.stmts,
-            vec![DsStmt::Set(vec![
+            vec![set_stmt(vec![
                 dspec("a"),
                 DatasetSpec::plain(DatasetRef {
                     libref: Some("lib".to_string()),
@@ -2312,14 +2804,14 @@ mod tests {
 
     #[test]
     fn unimplemented_statement_errors_but_resyncs() {
-        // `update` n'est pas implémenté (M3 ajoute MERGE, pas UPDATE).
-        // L'étape doit échouer MAIS le stream doit être positionné après le
-        // `run;` pour le bloc suivant.
-        let file = SourceFile::new("data o; update x y; set i; run; data b; run;");
+        // `proklamation` n'est pas un statement connu (ni assignation, ni sum) :
+        // l'étape doit échouer MAIS le stream doit être positionné après le
+        // `run;` pour le bloc suivant (test de resynchronisation du parser).
+        let file =
+            SourceFile::new("data o; proklamation target; set i; run; data b; run;");
         let mut ts = StatementStream::new(&file).unwrap();
         assert!(ts.next().is_kw("data"));
         let err = parse_data_step(&mut ts).unwrap_err();
-        assert!(err.to_string().to_uppercase().contains("UPDATE"));
         assert!(err.to_string().contains("not yet implemented"));
         // Resynchronisation : on est sur le `data` de la deuxième étape.
         assert!(ts.peek().is_kw("data"));
@@ -2510,13 +3002,13 @@ mod tests {
         assert!(ts.next().is_kw("data"));
         let ast1 = parse_data_step(&mut ts).unwrap();
         assert_eq!(ast1.outputs, vec![dspec("a")]);
-        assert_eq!(ast1.stmts, vec![DsStmt::Set(vec![dspec("x")])]);
+        assert_eq!(ast1.stmts, vec![set_stmt(vec![dspec("x")])]);
         // Frontière implicite : `data` non consommé.
         assert!(ts.peek().is_kw("data"));
         ts.next();
         let ast2 = parse_data_step(&mut ts).unwrap();
         assert_eq!(ast2.outputs, vec![dspec("b")]);
-        assert_eq!(ast2.stmts, vec![DsStmt::Set(vec![dspec("y")])]);
+        assert_eq!(ast2.stmts, vec![set_stmt(vec![dspec("y")])]);
     }
 
     // ── DO itératif / conditionnel (M2) ──────────────────────────────────
@@ -2627,12 +3119,13 @@ mod tests {
     }
 
     #[test]
-    fn do_value_list_errors() {
-        let err = parse("data o; do i = 1, 5; end; run;").unwrap_err();
-        assert!(err.to_string().contains("not yet implemented"), "got: {err}");
-        // Une seule valeur sans clause = liste à un élément : même erreur.
-        let err = parse("data o; do i = 1; end; run;").unwrap_err();
-        assert!(err.to_string().contains("not yet implemented"), "got: {err}");
+    fn do_value_list_now_parses() {
+        // M16.3 : les listes de valeurs sont désormais supportées (DoList).
+        let ast = parse("data o; do i = 1, 5; end; run;").unwrap();
+        assert!(matches!(ast.stmts[0], DsStmt::DoList { .. }));
+        // Une seule valeur sans clause = liste à un élément.
+        let ast = parse("data o; do i = 1; end; run;").unwrap();
+        assert!(matches!(ast.stmts[0], DsStmt::DoList { .. }));
     }
 
     #[test]
@@ -2690,14 +3183,27 @@ mod tests {
 
     // ── ARRAY (M2, lot 3) ────────────────────────────────────────────────
 
+    /// Constructeur d'un `DsStmt::Array` simple pour les tests.
+    fn array_stmt(
+        name: &str,
+        dims: Option<Vec<usize>>,
+        char_len: Option<usize>,
+        vars: Vec<&str>,
+    ) -> DsStmt {
+        DsStmt::Array {
+            name: name.to_string(),
+            dims,
+            char_len,
+            vars: vars.into_iter().map(String::from).collect(),
+            initial: vec![],
+            temporary: false,
+            special: None,
+        }
+    }
+
     #[test]
     fn array_declaration_three_delimiter_forms() {
-        let expected = vec![DsStmt::Array {
-            name: "a".to_string(),
-            size: Some(3),
-            char_len: None,
-            vars: vec!["x".to_string(), "y".to_string(), "z".to_string()],
-        }];
+        let expected = vec![array_stmt("a", Some(vec![3]), None, vec!["x", "y", "z"])];
         for src in [
             "data o; array a{3} x y z; run;",
             "data o; array a[3] x y z; run;",
@@ -2713,12 +3219,7 @@ mod tests {
         let ast = parse("data o; array a{*} x y z; run;").unwrap();
         assert_eq!(
             ast.stmts,
-            vec![DsStmt::Array {
-                name: "a".to_string(),
-                size: None,
-                char_len: None,
-                vars: vec!["x".to_string(), "y".to_string(), "z".to_string()],
-            }]
+            vec![array_stmt("a", None, None, vec!["x", "y", "z"])]
         );
     }
 
@@ -2727,15 +3228,7 @@ mod tests {
         // `array a{3};` : la liste reste vide (auto-noms a1 a2 a3 à la
         // compilation).
         let ast = parse("data o; array a{3}; run;").unwrap();
-        assert_eq!(
-            ast.stmts,
-            vec![DsStmt::Array {
-                name: "a".to_string(),
-                size: Some(3),
-                char_len: None,
-                vars: vec![],
-            }]
-        );
+        assert_eq!(ast.stmts, vec![array_stmt("a", Some(vec![3]), None, vec![])]);
     }
 
     #[test]
@@ -2743,12 +3236,7 @@ mod tests {
         let ast = parse("data o; array c{3} $ 8 c1 c2 c3; run;").unwrap();
         assert_eq!(
             ast.stmts,
-            vec![DsStmt::Array {
-                name: "c".to_string(),
-                size: Some(3),
-                char_len: Some(8),
-                vars: vec!["c1".to_string(), "c2".to_string(), "c3".to_string()],
-            }]
+            vec![array_stmt("c", Some(vec![3]), Some(8), vec!["c1", "c2", "c3"])]
         );
         // `$` sans longueur : défaut 8.
         let ast = parse("data o; array c{2} $ u v; run;").unwrap();
@@ -2763,12 +3251,7 @@ mod tests {
         let ast = parse("data o; array a{3} x1-x3; run;").unwrap();
         assert_eq!(
             ast.stmts,
-            vec![DsStmt::Array {
-                name: "a".to_string(),
-                size: Some(3),
-                char_len: None,
-                vars: vec!["x1".to_string(), "x2".to_string(), "x3".to_string()],
-            }]
+            vec![array_stmt("a", Some(vec![3]), None, vec!["x1", "x2", "x3"])]
         );
         // Largeur de suffixe conservée et plage mêlée à d'autres noms.
         let ast = parse("data o; array a{*} w q01-q03 z; run;").unwrap();
@@ -2792,33 +3275,59 @@ mod tests {
     }
 
     #[test]
-    fn array_multi_dimension_errors() {
-        let err = parse("data o; array a{2,3} x1-x6; run;").unwrap_err();
-        assert!(
-            err.to_string().contains("Multi-dimensional arrays are not yet implemented."),
-            "got: {err}"
-        );
+    fn array_multi_dimension_parses() {
+        // M16.2 : `{2,3}` → dims [2, 3].
+        let ast = parse("data o; array a{2,3} x1-x6; run;").unwrap();
+        let DsStmt::Array { dims, vars, .. } = &ast.stmts[0] else {
+            panic!("expected an ARRAY statement");
+        };
+        assert_eq!(*dims, Some(vec![2, 3]));
+        assert_eq!(vars.len(), 6);
+        // 3-D.
+        let ast = parse("data o; array b{2,3,2} v1-v12; run;").unwrap();
+        let DsStmt::Array { dims, .. } = &ast.stmts[0] else {
+            panic!("expected an ARRAY statement");
+        };
+        assert_eq!(*dims, Some(vec![2, 3, 2]));
     }
 
     #[test]
-    fn array_initial_values_errors() {
-        let err = parse("data o; array a{3} x y z (1 2 3); run;").unwrap_err();
-        assert!(
-            err.to_string().contains("initial values are not yet implemented"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn array_special_lists_error() {
+    fn array_initial_values_parse() {
+        // M16.2 : valeurs initiales `(1, 2, 3)` (virgules) et `(1 2 3)`
+        // (espaces) acceptées.
         for src in [
-            "data o; array a{3} _temporary_; run;",
-            "data o; array a{*} _numeric_; run;",
-            "data o; array a{*} _character_; run;",
-            "data o; array a{*} _all_; run;",
+            "data o; array a{3} x y z (1, 2, 3); run;",
+            "data o; array a{3} x y z (1 2 3); run;",
         ] {
-            let err = parse(src).unwrap_err();
-            assert!(err.to_string().contains("not yet implemented"), "source: {src}, got: {err}");
+            let ast = parse(src).unwrap();
+            let DsStmt::Array { initial, .. } = &ast.stmts[0] else {
+                panic!("expected an ARRAY statement");
+            };
+            assert_eq!(
+                *initial,
+                vec![Expr::Num(1.0), Expr::Num(2.0), Expr::Num(3.0)]
+            );
+        }
+    }
+
+    #[test]
+    fn array_special_lists_parse() {
+        // M16.2 : _TEMPORARY_ et listes spéciales parsées.
+        let ast = parse("data o; array a{3} _temporary_; run;").unwrap();
+        let DsStmt::Array { temporary, .. } = &ast.stmts[0] else {
+            panic!("expected an ARRAY statement");
+        };
+        assert!(*temporary);
+        for (src, want) in [
+            ("data o; array a{*} _numeric_; run;", crate::ast::ArraySpecial::Numeric),
+            ("data o; array a{*} _character_; run;", crate::ast::ArraySpecial::Character),
+            ("data o; array a{*} _all_; run;", crate::ast::ArraySpecial::All),
+        ] {
+            let ast = parse(src).unwrap();
+            let DsStmt::Array { special, .. } = &ast.stmts[0] else {
+                panic!("expected an ARRAY statement");
+            };
+            assert_eq!(*special, Some(want), "source: {src}");
         }
     }
 
@@ -2831,11 +3340,26 @@ mod tests {
                 var: "x".to_string(),
                 expr: Expr::Index {
                     name: "a".to_string(),
-                    index: Box::new(Expr::Binary {
+                    indices: vec![Expr::Binary {
                         op: BinaryOp::Add,
                         left: Box::new(var("i")),
                         right: Box::new(Expr::Num(1.0)),
-                    }),
+                    }],
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn array_multi_index_rvalue_parses() {
+        let ast = parse("data o; x = a{i, j}; run;").unwrap();
+        assert_eq!(
+            ast.stmts,
+            vec![DsStmt::Assign {
+                var: "x".to_string(),
+                expr: Expr::Index {
+                    name: "a".to_string(),
+                    indices: vec![var("i"), var("j")],
                 },
             }]
         );
@@ -2845,13 +3369,26 @@ mod tests {
     fn array_indexed_lvalue_braces_and_brackets() {
         let expected = vec![DsStmt::AssignIndexed {
             array: "a".to_string(),
-            index: var("i"),
+            indices: vec![var("i")],
             expr: Expr::Num(0.0),
         }];
         let ast = parse("data o; a{i} = 0; run;").unwrap();
         assert_eq!(ast.stmts, expected);
         let ast = parse("data o; a[i] = 0; run;").unwrap();
         assert_eq!(ast.stmts, expected);
+    }
+
+    #[test]
+    fn array_multi_index_lvalue_parses() {
+        let ast = parse("data o; a{i, j} = 0; run;").unwrap();
+        assert_eq!(
+            ast.stmts,
+            vec![DsStmt::AssignIndexed {
+                array: "a".to_string(),
+                indices: vec![var("i"), var("j")],
+                expr: Expr::Num(0.0),
+            }]
+        );
     }
 
     #[test]
@@ -2863,7 +3400,7 @@ mod tests {
             ast.stmts,
             vec![DsStmt::AssignIndexed {
                 array: "a".to_string(),
-                index: var("i"),
+                indices: vec![var("i")],
                 expr: Expr::Binary {
                     op: BinaryOp::Mul,
                     left: Box::new(var("i")),
@@ -2879,7 +3416,7 @@ mod tests {
         assert_eq!(
             ast.stmts,
             vec![
-                DsStmt::Set(vec![dspec("i")]),
+                set_stmt(vec![dspec("i")]),
                 DsStmt::Assign {
                     var: "x".to_string(),
                     expr: Expr::Num(1.0),
@@ -2938,7 +3475,7 @@ mod tests {
             "data o; set inp(keep=name age where=(age > 13) rename=(age=years)); run;",
         )
         .unwrap();
-        let DsStmt::Set(specs) = &ast.stmts[0] else {
+        let DsStmt::Set { specs, .. } = &ast.stmts[0] else {
             panic!("expected a SET statement");
         };
         let spec = &specs[0];
@@ -2965,7 +3502,7 @@ mod tests {
         );
         // Plage numérotée, forme nue.
         let ast = parse("data o; set i(drop=v1-v3 keep=w); run;").unwrap();
-        let DsStmt::Set(specs) = &ast.stmts[0] else {
+        let DsStmt::Set { specs, .. } = &ast.stmts[0] else {
             panic!("expected a SET statement");
         };
         let spec = &specs[0];
@@ -3034,12 +3571,66 @@ mod tests {
     #[test]
     fn set_options_then_second_dataset_parses() {
         let ast = parse("data o; set a(keep=x) b; run;").unwrap();
-        let DsStmt::Set(specs) = &ast.stmts[0] else {
+        let DsStmt::Set { specs, .. } = &ast.stmts[0] else {
             panic!("expected a SET statement");
         };
         assert_eq!(specs.len(), 2);
         assert_eq!(specs[0].options.keep, Some(vec!["x".to_string()]));
         assert_eq!(specs[1], dspec("b"));
+    }
+
+    // ── SET options END= / NOBS= / POINT= (M16.4) ─────────────────────────
+
+    #[test]
+    fn set_end_nobs_point_options_parse() {
+        let ast = parse("data o; set a b end=eof nobs=n point=p; run;").unwrap();
+        let DsStmt::Set { specs, options } = &ast.stmts[0] else {
+            panic!("expected a SET statement");
+        };
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0], dspec("a"));
+        assert_eq!(specs[1], dspec("b"));
+        assert_eq!(options.end.as_deref(), Some("eof"));
+        assert_eq!(options.nobs.as_deref(), Some("n"));
+        assert_eq!(options.point.as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn set_options_order_independent() {
+        let ast = parse("data o; set a point=p end=eof; run;").unwrap();
+        let DsStmt::Set { options, .. } = &ast.stmts[0] else {
+            panic!("expected a SET statement");
+        };
+        assert_eq!(options.point.as_deref(), Some("p"));
+        assert_eq!(options.end.as_deref(), Some("eof"));
+        assert!(options.nobs.is_none());
+    }
+
+    #[test]
+    fn set_without_options_has_default() {
+        let ast = parse("data o; set a; run;").unwrap();
+        let DsStmt::Set { options, .. } = &ast.stmts[0] else {
+            panic!("expected a SET statement");
+        };
+        assert_eq!(*options, crate::ast::SetOptions::default());
+    }
+
+    #[test]
+    fn set_unknown_option_errors() {
+        let err = parse("data o; set a bogus=z; run;").unwrap_err();
+        assert!(
+            err.to_string().contains("unknown SET option"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn set_duplicate_option_errors() {
+        let err = parse("data o; set a end=e1 end=e2; run;").unwrap_err();
+        assert!(
+            err.to_string().contains("more than once"),
+            "got: {err}"
+        );
     }
 
     // ── FORMAT / LABEL / ATTRIB (M4) ──────────────────────────────────────
@@ -3109,6 +3700,304 @@ mod tests {
         );
     }
 
+    // ── INFILE / INPUT / DATALINES (M14) ─────────────────────────────────
+
+    fn var_item(name: &str, is_char: bool) -> InputItem {
+        InputItem::Var {
+            name: name.to_string(),
+            is_char,
+            cols: None,
+            informat: None,
+            list_modifier: false,
+        }
+    }
+
+    #[test]
+    fn input_list_mode_dollar() {
+        let ast = parse("data o; input name $ age height; datalines;\nx 1 2\n;\nrun;").unwrap();
+        let DsStmt::Input(items) = &ast.stmts[0] else {
+            panic!("expected an INPUT statement, got {:?}", ast.stmts[0]);
+        };
+        assert_eq!(
+            items,
+            &vec![
+                var_item("name", true),
+                var_item("age", false),
+                var_item("height", false),
+            ]
+        );
+        // Le bloc datalines est capturé.
+        assert_eq!(
+            ast.stmts[1],
+            DsStmt::Datalines(vec!["x 1 2".to_string()])
+        );
+    }
+
+    #[test]
+    fn input_column_mode() {
+        let ast = parse("data o; input name $ 1-10 age 11-13; datalines;\n;\nrun;").unwrap();
+        let DsStmt::Input(items) = &ast.stmts[0] else {
+            panic!("expected an INPUT statement");
+        };
+        assert_eq!(
+            items,
+            &vec![
+                InputItem::Var {
+                    name: "name".to_string(),
+                    is_char: true,
+                    cols: Some((1, 10)),
+                    informat: None,
+                    list_modifier: false,
+                },
+                InputItem::Var {
+                    name: "age".to_string(),
+                    is_char: false,
+                    cols: Some((11, 13)),
+                    informat: None,
+                    list_modifier: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn input_formatted_mode() {
+        let ast =
+            parse("data o; input name $char10. d date9. x 8.2; datalines;\n;\nrun;").unwrap();
+        let DsStmt::Input(items) = &ast.stmts[0] else {
+            panic!("expected an INPUT statement");
+        };
+        assert_eq!(
+            items,
+            &vec![
+                InputItem::Var {
+                    name: "name".to_string(),
+                    is_char: false,
+                    cols: None,
+                    informat: Some("$char10.".to_string()),
+                    list_modifier: false,
+                },
+                InputItem::Var {
+                    name: "d".to_string(),
+                    is_char: false,
+                    cols: None,
+                    informat: Some("date9.".to_string()),
+                    list_modifier: false,
+                },
+                InputItem::Var {
+                    name: "x".to_string(),
+                    is_char: false,
+                    cols: None,
+                    informat: Some("8.2".to_string()),
+                    list_modifier: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn input_list_modifier_colon() {
+        let ast = parse("data o; input x :date9.; datalines;\n;\nrun;").unwrap();
+        let DsStmt::Input(items) = &ast.stmts[0] else {
+            panic!("expected an INPUT statement");
+        };
+        assert_eq!(
+            items,
+            &vec![InputItem::Var {
+                name: "x".to_string(),
+                is_char: false,
+                cols: None,
+                informat: Some("date9.".to_string()),
+                list_modifier: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn input_pointers_and_holds() {
+        let ast = parse("data o; input @5 x 8. +2 y / z @@; datalines;\n;\nrun;").unwrap();
+        let DsStmt::Input(items) = &ast.stmts[0] else {
+            panic!("expected an INPUT statement");
+        };
+        assert_eq!(items[0], InputItem::ColumnPointer(5));
+        assert_eq!(
+            items[1],
+            InputItem::Var {
+                name: "x".to_string(),
+                is_char: false,
+                cols: None,
+                informat: Some("8.".to_string()),
+                list_modifier: false,
+            }
+        );
+        assert_eq!(items[2], InputItem::SkipColumns(2));
+        assert_eq!(items[3], var_item("y", false));
+        assert_eq!(items[4], InputItem::NextLine);
+        assert_eq!(items[5], var_item("z", false));
+        assert_eq!(items[6], InputItem::HoldLineDouble);
+    }
+
+    #[test]
+    fn input_trailing_hold_single() {
+        let ast = parse("data o; input x @; run;").unwrap();
+        let DsStmt::Input(items) = &ast.stmts[0] else {
+            panic!("expected an INPUT statement");
+        };
+        assert_eq!(items[0], var_item("x", false));
+        assert_eq!(items[1], InputItem::HoldLine);
+    }
+
+    #[test]
+    fn infile_datalines_with_options() {
+        let ast =
+            parse("data o; infile datalines dlm=',' dsd missover; input a b; datalines;\n;\nrun;")
+                .unwrap();
+        let DsStmt::Infile { source, options } = &ast.stmts[0] else {
+            panic!("expected an INFILE statement, got {:?}", ast.stmts[0]);
+        };
+        assert_eq!(*source, InfileSource::Datalines);
+        assert_eq!(options.delimiter.as_deref(), Some(","));
+        assert!(options.dsd);
+        assert!(options.missover);
+    }
+
+    #[test]
+    fn infile_path_with_numeric_options() {
+        let ast =
+            parse("data o; infile 'data.txt' firstobs=2 obs=10 lrecl=256 truncover; input x; run;")
+                .unwrap();
+        let DsStmt::Infile { source, options } = &ast.stmts[0] else {
+            panic!("expected an INFILE statement");
+        };
+        assert_eq!(*source, InfileSource::Path("data.txt".to_string()));
+        assert_eq!(options.firstobs, Some(2));
+        assert_eq!(options.obs, Some(10));
+        assert_eq!(options.lrecl, Some(256));
+        assert!(options.truncover);
+    }
+
+    #[test]
+    fn infile_unknown_option_errors() {
+        let err = parse("data o; infile datalines frobnicate; input x; run;").unwrap_err();
+        assert!(
+            err.to_string().contains("INFILE option FROBNICATE is not supported."),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn datalines_without_infile_parses() {
+        // `datalines;` peut alimenter `input` sans `infile datalines;`.
+        let ast = parse("data o; input x y; datalines;\n1 2\n3 4\n;\nrun;").unwrap();
+        assert!(matches!(ast.stmts[0], DsStmt::Input(_)));
+        assert_eq!(
+            ast.stmts[1],
+            DsStmt::Datalines(vec!["1 2".to_string(), "3 4".to_string()])
+        );
+    }
+
+    #[test]
+    fn cards4_terminator_variant() {
+        let ast = parse("data o; input x; cards4;\n1;2\n;;;;\nrun;").unwrap();
+        assert_eq!(
+            ast.stmts[1],
+            DsStmt::Datalines(vec!["1;2".to_string()])
+        );
+    }
+
+    // ── FILE / PUT (M14.2) ───────────────────────────────────────────────
+
+    #[test]
+    fn file_destinations() {
+        let ast = parse("data _null_; file print; file log; file 'out.txt'; run;").unwrap();
+        assert_eq!(ast.stmts[0], DsStmt::File { dest: PutDest::Print });
+        assert_eq!(ast.stmts[1], DsStmt::File { dest: PutDest::Log });
+        assert_eq!(
+            ast.stmts[2],
+            DsStmt::File {
+                dest: PutDest::Path("out.txt".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn file_bad_destination_errors() {
+        let err = parse("data _null_; file frobnicate; run;").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("expected a quoted file path, LOG or PRINT after FILE"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn put_list_named_literal() {
+        let ast = parse("data _null_; put 'hi' name age=; run;").unwrap();
+        let DsStmt::Put(items) = &ast.stmts[0] else {
+            panic!("expected a PUT statement, got {:?}", ast.stmts[0]);
+        };
+        assert_eq!(
+            items,
+            &vec![
+                PutItem::Literal("hi".to_string()),
+                PutItem::Var {
+                    name: "name".to_string(),
+                    format: None,
+                },
+                PutItem::NamedVar("age".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn put_formatted_and_pointers() {
+        let ast = parse("data _null_; put @5 x 8.2 +2 d date9. / y @@; run;").unwrap();
+        let DsStmt::Put(items) = &ast.stmts[0] else {
+            panic!("expected a PUT statement");
+        };
+        assert_eq!(items[0], PutItem::ColumnPointer(5));
+        assert_eq!(
+            items[1],
+            PutItem::Var {
+                name: "x".to_string(),
+                format: Some("8.2".to_string()),
+            }
+        );
+        assert_eq!(items[2], PutItem::SkipColumns(2));
+        assert_eq!(
+            items[3],
+            PutItem::Var {
+                name: "d".to_string(),
+                format: Some("date9.".to_string()),
+            }
+        );
+        assert_eq!(items[4], PutItem::NextLine);
+        assert_eq!(
+            items[5],
+            PutItem::Var {
+                name: "y".to_string(),
+                format: None,
+            }
+        );
+        assert_eq!(items[6], PutItem::HoldLineDouble);
+    }
+
+    #[test]
+    fn put_all_and_single_hold() {
+        let ast = parse("data _null_; put _all_ @; run;").unwrap();
+        let DsStmt::Put(items) = &ast.stmts[0] else {
+            panic!("expected a PUT statement");
+        };
+        assert_eq!(items[0], PutItem::All);
+        assert_eq!(items[1], PutItem::HoldLine);
+    }
+
+    #[test]
+    fn put_empty_is_blank_line() {
+        let ast = parse("data _null_; put; run;").unwrap();
+        assert_eq!(ast.stmts[0], DsStmt::Put(Vec::new()));
+    }
+
     #[test]
     fn attrib_multiple_items() {
         let ast = parse(
@@ -3134,316 +4023,224 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------------
-    // M14.1 — INFILE / INPUT / DATALINES
-    // ---------------------------------------------------------------------
-
-    fn input_items(ast: &DataStepAst) -> &[InputItem] {
-        ast.stmts
-            .iter()
-            .find_map(|s| match s {
-                DsStmt::Input { items } => Some(items.as_slice()),
-                _ => None,
-            })
-            .expect("expected an INPUT statement")
-    }
+    // ── SELECT / WHEN / OTHERWISE (M16.1) ────────────────────────────────
 
     #[test]
-    fn datalines_statement_captures_lines() {
-        let ast = parse("data a; input x; datalines;\n10\n20\n;\nrun;").unwrap();
-        let dl = ast.stmts.iter().find_map(|s| match s {
-            DsStmt::Datalines { lines } => Some(lines.clone()),
-            _ => None,
-        });
-        assert_eq!(dl, Some(vec!["10".to_string(), "20".to_string()]));
-    }
-
-    #[test]
-    fn list_input_with_char_and_modifier() {
-        let ast = parse("data a; input name $ age height; datalines;\nx 1 2\n;\nrun;").unwrap();
-        let items = input_items(&ast);
-        assert_eq!(
-            items,
-            &[
-                InputItem::Var {
-                    name: "name".into(),
-                    is_char: true,
-                    col_range: None,
-                    informat: None
-                },
-                InputItem::Var {
-                    name: "age".into(),
-                    is_char: false,
-                    col_range: None,
-                    informat: None
-                },
-                InputItem::Var {
-                    name: "height".into(),
-                    is_char: false,
-                    col_range: None,
-                    informat: None
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn list_input_colon_informat() {
-        let ast = parse("data a; input x :comma8.; datalines;\n1\n;\nrun;").unwrap();
-        let items = input_items(&ast);
-        assert_eq!(
-            items,
-            &[InputItem::Var {
-                name: "x".into(),
-                is_char: false,
-                col_range: None,
-                informat: Some("comma8.".into()),
-            }]
-        );
-    }
-
-    #[test]
-    fn column_input_ranges() {
-        let ast = parse("data a; input name $ 1-10 age 11-13; datalines;\nx\n;\nrun;").unwrap();
-        let items = input_items(&ast);
-        assert_eq!(
-            items,
-            &[
-                InputItem::Var {
-                    name: "name".into(),
-                    is_char: true,
-                    col_range: Some((1, 10)),
-                    informat: None,
-                },
-                InputItem::Var {
-                    name: "age".into(),
-                    is_char: false,
-                    col_range: Some((11, 13)),
-                    informat: None,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn formatted_input_pointer_and_informats() {
-        let ast = parse("data a; input @1 name $10. age 5.2; datalines;\nx\n;\nrun;").unwrap();
-        let items = input_items(&ast);
-        assert_eq!(
-            items,
-            &[
-                InputItem::PointerCol(1),
-                InputItem::Var {
-                    name: "name".into(),
-                    is_char: true,
-                    col_range: None,
-                    informat: Some("$10.".into()),
-                },
-                InputItem::Var {
-                    name: "age".into(),
-                    is_char: false,
-                    col_range: None,
-                    informat: Some("5.2".into()),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn input_pointer_skip_and_next_line() {
-        let ast = parse("data a; input a +3 b / c; datalines;\nx\n;\nrun;").unwrap();
-        let items = input_items(&ast);
-        assert_eq!(items[1], InputItem::PointerSkip(3));
-        assert_eq!(items[3], InputItem::NextLine);
-    }
-
-    #[test]
-    fn infile_datalines_with_options() {
+    fn select_selector_form_parses() {
         let ast = parse(
-            "data a; infile datalines dsd dlm=',' firstobs=2 obs=10 missover; input x; datalines;\n1\n;\nrun;",
+            "data o; select (x); when (1, 2) y = 1; when (3) y = 2; otherwise y = 0; end; run;",
         )
         .unwrap();
-        let opts = ast.stmts.iter().find_map(|s| match s {
-            DsStmt::Infile { source, options } => Some((source.clone(), options.clone())),
-            _ => None,
-        });
-        let (source, options) = opts.expect("expected an INFILE statement");
-        assert_eq!(source, InfileSource::Datalines);
-        assert!(options.dsd);
-        assert_eq!(options.delimiter.as_deref(), Some(","));
-        assert_eq!(options.firstobs, Some(2));
-        assert_eq!(options.obs, Some(10));
-        assert!(options.missover);
-    }
-
-    #[test]
-    fn infile_path_and_lrecl_truncover() {
-        let ast =
-            parse("data a; infile '/tmp/data.txt' lrecl=200 truncover; input x; run;").unwrap();
-        let opts = ast.stmts.iter().find_map(|s| match s {
-            DsStmt::Infile { source, options } => Some((source.clone(), options.clone())),
-            _ => None,
-        });
-        let (source, options) = opts.unwrap();
-        assert_eq!(source, InfileSource::Path("/tmp/data.txt".into()));
-        assert_eq!(options.lrecl, Some(200));
-        assert!(options.truncover);
-    }
-
-    #[test]
-    fn unknown_infile_option_errors() {
-        let err = parse("data a; infile datalines frobnicate; input x; run;").unwrap_err();
-        assert!(err.to_string().contains("not yet implemented"), "got: {err}");
-    }
-
-    #[test]
-    fn double_at_hold_is_not_implemented() {
-        let err = parse("data a; input x @@; datalines;\n1\n;\nrun;").unwrap_err();
-        assert!(err.to_string().contains("not yet implemented"), "got: {err}");
-    }
-
-    #[test]
-    fn empty_input_statement_errors() {
-        let err = parse("data a; input ; datalines;\n;\nrun;").unwrap_err();
-        assert!(err.to_string().contains("at least one variable"), "got: {err}");
-    }
-
-    // ---------------------------------------------------------------------
-    // M14.2 — FILE / PUT
-    // ---------------------------------------------------------------------
-
-    fn put_items(src: &str) -> Vec<PutItem> {
-        let ast = parse(src).unwrap();
-        ast.stmts
-            .iter()
-            .find_map(|s| match s {
-                DsStmt::Put { items } => Some(items.clone()),
-                _ => None,
-            })
-            .expect("expected a PUT statement")
-    }
-
-    fn file_stmt(src: &str) -> (PutDest, Option<String>, bool) {
-        let ast = parse(src).unwrap();
-        ast.stmts
-            .iter()
-            .find_map(|s| match s {
-                DsStmt::File {
-                    dest,
-                    delimiter,
-                    dsd,
-                } => Some((dest.clone(), delimiter.clone(), *dsd)),
-                _ => None,
-            })
-            .expect("expected a FILE statement")
-    }
-
-    #[test]
-    fn file_log_print_path_destinations() {
-        let (d, _, _) = file_stmt("data _null_; file log; put x; run;");
-        assert_eq!(d, PutDest::Log);
-        let (d, _, _) = file_stmt("data _null_; file print; put x; run;");
-        assert_eq!(d, PutDest::Print);
-        let (d, _, _) =
-            file_stmt("data _null_; file '/tmp/o.txt'; put x; run;");
-        assert_eq!(d, PutDest::Path("/tmp/o.txt".into()));
-    }
-
-    #[test]
-    fn file_options_dlm_dsd_lrecl() {
-        let (dest, dlm, dsd) = file_stmt("data _null_; file print dlm='|' dsd lrecl=200; put x; run;");
-        assert_eq!(dest, PutDest::Print);
-        assert_eq!(dlm.as_deref(), Some("|"));
-        assert!(dsd);
-    }
-
-    #[test]
-    fn file_bare_fileref_not_implemented() {
-        let err = parse("data _null_; file myref; put x; run;").unwrap_err();
-        assert!(err.to_string().contains("not yet implemented"), "got: {err}");
-    }
-
-    #[test]
-    fn file_unknown_option_not_implemented() {
-        let err = parse("data _null_; file print frobnicate; put x; run;").unwrap_err();
-        assert!(err.to_string().contains("not yet implemented"), "got: {err}");
-    }
-
-    #[test]
-    fn put_list_output_items() {
-        let items = put_items("data _null_; put name age; run;");
+        let DsStmt::Select {
+            selector,
+            whens,
+            otherwise,
+        } = &ast.stmts[0]
+        else {
+            panic!("expected a SELECT statement");
+        };
+        assert_eq!(*selector, Some(var("x")));
+        assert_eq!(whens.len(), 2);
+        // Première clause : deux valeurs.
+        assert_eq!(whens[0].values, vec![Expr::Num(1.0), Expr::Num(2.0)]);
         assert_eq!(
-            items.as_slice(),
-            &[
-                PutItem::Var {
-                    name: "name".into(),
-                    format: None
+            *whens[0].body,
+            DsStmt::Assign {
+                var: "y".to_string(),
+                expr: Expr::Num(1.0),
+            }
+        );
+        assert_eq!(whens[1].values, vec![Expr::Num(3.0)]);
+        assert!(otherwise.is_some());
+    }
+
+    #[test]
+    fn select_boolean_form_parses() {
+        let ast = parse(
+            "data o; select; when (x < 1) y = 1; otherwise y = 0; end; run;",
+        )
+        .unwrap();
+        let DsStmt::Select {
+            selector, whens, ..
+        } = &ast.stmts[0]
+        else {
+            panic!("expected a SELECT statement");
+        };
+        assert_eq!(*selector, None);
+        // Forme booléenne : une seule expression (la condition) par WHEN.
+        assert_eq!(whens[0].values.len(), 1);
+        assert_eq!(
+            whens[0].values[0],
+            Expr::Binary {
+                op: BinaryOp::Lt,
+                left: Box::new(var("x")),
+                right: Box::new(Expr::Num(1.0)),
+            }
+        );
+    }
+
+    #[test]
+    fn select_do_block_body_parses() {
+        let ast = parse(
+            "data o; select (x); when (1) do; a = 1; b = 2; end; end; run;",
+        )
+        .unwrap();
+        let DsStmt::Select { whens, .. } = &ast.stmts[0] else {
+            panic!("expected a SELECT statement");
+        };
+        let DsStmt::Block(stmts) = &*whens[0].body else {
+            panic!("expected a DO block body");
+        };
+        assert_eq!(stmts.len(), 2);
+    }
+
+    #[test]
+    fn select_boolean_when_rejects_value_list() {
+        // En forme booléenne, une liste de valeurs `when (a, b)` est illégale.
+        let err = parse("data o; select; when (1, 2) y = 1; end; run;").unwrap_err();
+        assert!(
+            err.to_string().contains("single expression"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn select_missing_end_is_error() {
+        let err = parse("data o; select (x); when (1) y = 1; run;").unwrap_err();
+        assert!(err.to_string().contains("missing END"), "got: {err}");
+    }
+
+    #[test]
+    fn select_empty_when_list_is_error() {
+        let err = parse("data o; select (x); when () y = 1; end; run;").unwrap_err();
+        assert!(
+            err.to_string().contains("at least one value"),
+            "got: {err}"
+        );
+    }
+
+    // ── M16.3 : DO liste de valeurs, DO OVER, RETAIN littéraux date ───────
+
+    #[test]
+    fn parse_do_list_numeric() {
+        let ast = parse("data o; do i = 1, 3, 5; end; run;").unwrap();
+        let DsStmt::DoList { index, items, body } = &ast.stmts[0] else {
+            panic!("expected DoList, got {:?}", ast.stmts[0]);
+        };
+        assert_eq!(index, "i");
+        assert_eq!(
+            *items,
+            vec![
+                DoListItem::Value(Expr::Num(1.0)),
+                DoListItem::Value(Expr::Num(3.0)),
+                DoListItem::Value(Expr::Num(5.0)),
+            ]
+        );
+        assert!(body.is_empty());
+    }
+
+    #[test]
+    fn parse_do_list_single_value() {
+        // Une valeur unique sans clause TO/BY est une liste à un élément.
+        let ast = parse("data o; do i = 42; end; run;").unwrap();
+        let DsStmt::DoList { items, .. } = &ast.stmts[0] else {
+            panic!("expected DoList");
+        };
+        assert_eq!(*items, vec![DoListItem::Value(Expr::Num(42.0))]);
+    }
+
+    #[test]
+    fn parse_do_list_character() {
+        let ast = parse("data o; do c = 'red', 'blue'; end; run;").unwrap();
+        let DsStmt::DoList { items, .. } = &ast.stmts[0] else {
+            panic!("expected DoList");
+        };
+        assert_eq!(
+            *items,
+            vec![
+                DoListItem::Value(Expr::Str("red".to_string())),
+                DoListItem::Value(Expr::Str("blue".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_do_list_mixed_range_and_values() {
+        let ast = parse("data o; do i = 1 to 5 by 2, 10, 20 to 30; end; run;").unwrap();
+        let DsStmt::DoList { items, .. } = &ast.stmts[0] else {
+            panic!("expected DoList");
+        };
+        assert_eq!(
+            *items,
+            vec![
+                DoListItem::Range {
+                    from: Expr::Num(1.0),
+                    to: Expr::Num(5.0),
+                    by: Some(Expr::Num(2.0)),
                 },
-                PutItem::Var {
-                    name: "age".into(),
-                    format: None
+                DoListItem::Value(Expr::Num(10.0)),
+                DoListItem::Range {
+                    from: Expr::Num(20.0),
+                    to: Expr::Num(30.0),
+                    by: None,
                 },
             ]
         );
     }
 
     #[test]
-    fn put_formatted_items() {
-        let items = put_items("data _null_; put name $10. age 5.2; run;");
-        assert_eq!(
-            items.as_slice(),
-            &[
-                PutItem::Var {
-                    name: "name".into(),
-                    format: Some("$10.".into())
-                },
-                PutItem::Var {
-                    name: "age".into(),
-                    format: Some("5.2".into())
-                },
-            ]
+    fn parse_classic_do_still_doloop() {
+        // `do i = 1 to 10 by 2;` SANS virgule reste un DoLoop classique.
+        let ast = parse("data o; do i = 1 to 10 by 2; end; run;").unwrap();
+        assert!(matches!(ast.stmts[0], DsStmt::DoLoop { .. }));
+    }
+
+    #[test]
+    fn parse_do_over() {
+        let ast = parse("data o; array a{3} x y z; do over a; a = a + 1; end; run;").unwrap();
+        let DsStmt::DoOver { array, body } = &ast.stmts[1] else {
+            panic!("expected DoOver, got {:?}", ast.stmts[1]);
+        };
+        assert_eq!(array, "a");
+        assert_eq!(body.len(), 1);
+    }
+
+    #[test]
+    fn parse_do_list_rejects_while() {
+        let err = parse("data o; do i = 1, 3 while(x); end; run;").unwrap_err();
+        assert!(
+            err.to_string().contains("WHILE/UNTIL are not allowed"),
+            "got: {err}"
         );
     }
 
     #[test]
-    fn put_literal_and_named() {
-        let items = put_items("data _null_; put 'Total:' x name=; run;");
+    fn parse_retain_date_literal_bare() {
+        // `21710d` (numérique + suffixe d) → valeur SAS date 21710.
+        let ast = parse("data o; retain d 21710d; run;").unwrap();
         assert_eq!(
-            items.as_slice(),
-            &[
-                PutItem::Literal("Total:".into()),
-                PutItem::Var {
-                    name: "x".into(),
-                    format: None
-                },
-                PutItem::NamedVar("name".into()),
-            ]
+            ast.stmts,
+            vec![DsStmt::Retain(vec![("d".to_string(), Some(Expr::Num(21710.0)))])]
         );
     }
 
     #[test]
-    fn put_all_and_slash() {
-        let items = put_items("data _null_; put _all_ / x; run;");
-        assert_eq!(items[0], PutItem::All);
-        assert_eq!(items[1], PutItem::NextLine);
+    fn parse_retain_date_literal_quoted() {
+        // `'02JAN1960'd` = 1.
+        let ast = parse("data o; retain d '02JAN1960'd; run;").unwrap();
+        assert_eq!(
+            ast.stmts,
+            vec![DsStmt::Retain(vec![("d".to_string(), Some(Expr::Num(1.0)))])]
+        );
     }
 
     #[test]
-    fn put_pointers() {
-        let items = put_items("data _null_; put @5 x +3 y; run;");
-        assert_eq!(items[0], PutItem::PointerCol(5));
-        assert_eq!(items[2], PutItem::PointerSkip(3));
-    }
-
-    #[test]
-    fn put_at_line_hold() {
-        let items = put_items("data _null_; put x @; run;");
-        assert_eq!(items.last(), Some(&PutItem::HoldLine));
-    }
-
-    #[test]
-    fn put_double_at_line_hold() {
-        let items = put_items("data _null_; put x @@; run;");
-        assert_eq!(items.last(), Some(&PutItem::HoldLineAcross));
+    fn parse_retain_datetime_literal() {
+        // `'01JAN1960 00:01:00'dt` = 60 secondes.
+        let ast = parse("data o; retain dt '01JAN1960 00:01:00'dt; run;").unwrap();
+        assert_eq!(
+            ast.stmts,
+            vec![DsStmt::Retain(vec![("dt".to_string(), Some(Expr::Num(60.0)))])]
+        );
     }
 }
