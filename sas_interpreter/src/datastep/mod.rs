@@ -259,6 +259,105 @@ impl ArrayDef {
     }
 }
 
+/// Objet hash de l'étape DATA (M17.1). Créé par `DECLARE HASH h(...)`, défini
+/// par `defineKey`/`defineData`/`defineDone`, puis manipulé par find/add/etc.
+/// (M17.2). Stocké dans `EvalCtx.hashes` (nom UPPERCASE → objet).
+///
+/// `rows` indexe les données par clé encodée (sémantique d'égalité SAS via
+/// `hash_key` : `. == .`, char insensible aux blancs finaux). Chaque entrée est
+/// une LISTE de jeux de données : sans `multidata`, une seule entrée par clé
+/// (l'ajout remplace ou est rejeté selon `duplicate`) ; avec `multidata:'yes'`,
+/// plusieurs jeux de données peuvent partager une clé.
+#[derive(Debug, Clone, Default)]
+pub struct HashObject {
+    /// Option `ordered:` (`'yes'`/`'ascending'`/`'descending'`/`'no'`),
+    /// normalisée en minuscules. `None` = non spécifiée (= `'no'`).
+    pub ordered: Option<String>,
+    /// Option `duplicate:` (`'replace'`/`'error'`/`'no'`), en minuscules.
+    /// `None` = défaut (comportement SAS : la première valeur est conservée,
+    /// l'ajout d'une clé existante est ignoré sans erreur).
+    pub duplicate: Option<String>,
+    /// Option `multidata:'yes'` : plusieurs jeux de données par clé.
+    pub multidata: bool,
+    /// Option `dataset:'lib.table'` : table à charger au `defineDone` (le
+    /// chargement effectif est différé à M17.2 ; le nom est conservé ici).
+    pub dataset: Option<String>,
+    /// Colonnes clé (noms UPPERCASE, dans l'ordre de `defineKey`).
+    pub keys: Vec<String>,
+    /// Colonnes données (noms UPPERCASE, dans l'ordre de `defineData`).
+    pub data_vars: Vec<String>,
+    /// Données : clé encodée → liste de jeux de valeurs de données (un seul
+    /// élément sans `multidata`). Parallèle à `data_vars`.
+    pub rows: std::collections::HashMap<String, Vec<Vec<Value>>>,
+    /// `defineDone()` a été appelé : l'objet est finalisé (idempotent).
+    pub defined: bool,
+    /// Ordre d'INSERTION des clés encodées (premier ajout). Préserve l'ordre
+    /// de visite par défaut (sans `ordered:`) pour l'itérateur HITER et
+    /// `output`. Une clé supprimée puis ré-ajoutée reprend une nouvelle place.
+    pub insertion_order: Vec<String>,
+    /// Colonnes du dataset chargé via `dataset:` au `defineDone` (M17.2),
+    /// pré-lues à la compilation (`&mut Session` disponible) : nom de colonne
+    /// UPPERCASE → valeurs décodées. `None` = pas d'option `dataset:`. Le
+    /// chargement effectif (mapping keys/data_vars → rows) a lieu au
+    /// `defineDone`, quand les clés/données sont connues.
+    pub dataset_cols: Option<std::collections::HashMap<String, Vec<Value>>>,
+    /// Nombre de lignes du dataset pré-lu (parallèle à `dataset_cols`).
+    pub dataset_nrows: usize,
+    /// Valeurs de clé DÉCODÉES par clé encodée (M17.2) : la clé encodée perd le
+    /// type/la valeur exacte (collation) ; on conserve donc les `Value`
+    /// d'origine pour `output` (reconstitution des colonnes clé) et le tri
+    /// `ordered:` (via `sas_cmp`).
+    pub key_values: std::collections::HashMap<String, Vec<Value>>,
+    /// Curseur multidata courant (M17.2) : `(clé encodée, index dans la liste
+    /// d'entrées)`, posé par `find`, avancé par `find_next`/`find_prev`.
+    pub find_cursor: Option<(String, usize)>,
+}
+
+impl HashObject {
+    /// Positionne le curseur multidata (find/find_next).
+    pub fn set_find_cursor(&mut self, key: &str, idx: usize) {
+        self.find_cursor = Some((key.to_string(), idx));
+    }
+}
+
+/// Itérateur d'objet hash (M17.2), déclaré par `DECLARE HITER hi('h');`.
+/// Lié à l'objet hash `hash` (nom UPPERCASE). `pos` est l'index courant dans
+/// l'ordre de visite (calculé à la volée : `ordered:` → tri par clés via
+/// `sas_cmp`, sinon ordre d'insertion). `None` = itérateur non positionné.
+#[derive(Debug, Clone, Default)]
+pub struct HashIter {
+    /// Nom UPPERCASE de l'objet hash parcouru.
+    pub hash: String,
+    /// Position courante (index dans la séquence de visite aplatie). `None`
+    /// avant tout `first`/`last` (ou après un `next`/`prev` hors limites).
+    pub pos: Option<usize>,
+}
+
+/// Clé d'appariement canonique d'une liste de `Value` pour un objet hash
+/// (M17.1). Encode la sémantique d'égalité SAS (`. == .`, char insensible aux
+/// blancs finaux) — identique à la clé UPDATE/MODIFY. Sert de clé de `HashMap`.
+pub fn hash_key(values: &[Value]) -> String {
+    let mut s = String::new();
+    for v in values {
+        match v {
+            Value::Num(n) => {
+                s.push('N');
+                s.push_str(&format!("{n:?}"));
+            }
+            Value::Missing(k) => {
+                s.push('M');
+                s.push_str(&k.display());
+            }
+            Value::Char(c) => {
+                s.push('C');
+                s.push_str(c.trim_end());
+            }
+        }
+        s.push('\u{1}');
+    }
+    s
+}
+
 /// Données d'entrée compilées d'un statement UPDATE (M16.5). Le maître et la
 /// transaction sont matérialisés en colonnes décodées (comme `InputDataset`),
 /// avec le slot PDV de chaque colonne. Les variables clé (`key_slots`) servent
@@ -338,6 +437,14 @@ pub struct StepProgram {
     /// (niveau supérieur de l'étape). Cibles des GOTO/LINK, résolues à la
     /// compilation. L'exécuteur pilote un compteur de programme sur `stmts`.
     pub flow_labels: HashMap<String, usize>,
+    /// Objets hash déclarés (M17.1) : nom UPPERCASE → objet initial (options
+    /// résolues, sans clés/données ni lignes). L'exécuteur les copie dans
+    /// `EvalCtx.hashes` au début de l'étape ; defineKey/defineData/defineDone
+    /// les remplissent à l'exécution.
+    pub hash_objects: HashMap<String, HashObject>,
+    /// Itérateurs de hash déclarés (M17.2) : nom UPPERCASE → itérateur
+    /// (objet lié + position). L'exécuteur les copie dans `EvalCtx.hash_iters`.
+    pub hash_iters: HashMap<String, HashIter>,
 }
 
 pub fn compile(ast: &DataStepAst, session: &mut Session) -> Result<StepProgram> {
@@ -371,6 +478,8 @@ pub fn compile(ast: &DataStepAst, session: &mut Session) -> Result<StepProgram> 
         modify: None,
         labels_defined: HashSet::new(),
         goto_link_refs: Vec::new(),
+        hash_objects: HashMap::new(),
+        hash_iters: HashMap::new(),
     };
     for stmt in &ast.stmts {
         c.walk_stmt(stmt)?;
@@ -488,6 +597,8 @@ pub fn compile(ast: &DataStepAst, session: &mut Session) -> Result<StepProgram> 
         arrays: c.arrays,
         labels: c.labels,
         flow_labels,
+        hash_objects: c.hash_objects,
+        hash_iters: c.hash_iters,
     })
 }
 
@@ -614,6 +725,12 @@ struct Compiler<'a> {
     /// Références d'étiquette des GOTO/LINK (M16.6), en MAJUSCULES. Validées en
     /// fin de compilation contre `labels_defined` (étiquette inconnue → erreur).
     goto_link_refs: Vec<String>,
+    /// Objets hash déclarés (M17.1) : nom UPPERCASE → objet initial (options
+    /// résolues). Un DECLARE HASH y enregistre l'objet ; un appel de méthode
+    /// le référence (objet inconnu → erreur de compilation).
+    hash_objects: HashMap<String, HashObject>,
+    /// Itérateurs de hash déclarés (M17.2) : nom UPPERCASE → itérateur.
+    hash_iters: HashMap<String, HashIter>,
 }
 
 /// État intermédiaire d'un UPDATE pendant la compilation : les datasets sont
@@ -1246,7 +1363,179 @@ impl Compiler<'_> {
             // RETURN (M16.6) : aucune validation compile-time (un RETURN sans
             // LINK actif est licite — termine l'itération courante).
             DsStmt::Return => Ok(()),
+            // DECLARE HASH (M17.1) : enregistre l'objet hash avec ses options
+            // résolues. Un objet redéclaré écrase le précédent (SAS permet de
+            // re-DECLARE ; le dernier gagne). Les options inconnues → erreur.
+            DsStmt::DeclareHash { name, options } => {
+                let mut obj = HashObject::default();
+                for (key, value) in options {
+                    match key.as_str() {
+                        "ordered" => obj.ordered = Some(value.trim().to_ascii_lowercase()),
+                        "duplicate" => obj.duplicate = Some(value.trim().to_ascii_lowercase()),
+                        "multidata" => {
+                            obj.multidata = matches!(
+                                value.trim().to_ascii_lowercase().as_str(),
+                                "yes" | "y" | "1"
+                            );
+                        }
+                        "dataset" | "data" => obj.dataset = Some(value.clone()),
+                        "hashexp" | "suminc" | "initialgrouptype" => {
+                            // Options de réglage/perf : acceptées et ignorées.
+                        }
+                        // Option inconnue → erreur claire.
+                        other => {
+                            return Err(SasError::runtime(format!(
+                                "Hash object option {} is not supported.",
+                                other.to_uppercase()
+                            )));
+                        }
+                    }
+                }
+                // dataset: (M17.2) — pré-lit les colonnes à la compilation
+                // (`&mut Session` disponible) et entre chaque colonne au PDV
+                // (SAS exige que les variables clé/données existent au PDV ;
+                // les charger ici les crée comme un SET implicite).
+                if let Some(dsname) = obj.dataset.clone() {
+                    let (cols, nrows) = self.preload_hash_dataset(&dsname)?;
+                    obj.dataset_cols = Some(cols);
+                    obj.dataset_nrows = nrows;
+                }
+                self.hash_objects.insert(name.to_uppercase(), obj);
+                Ok(())
+            }
+            // DECLARE HITER (M17.2) : l'objet hash lié doit être déclaré.
+            DsStmt::DeclareHiter { name, hash_name } => {
+                let hupper = hash_name.to_uppercase();
+                if !self.hash_objects.contains_key(&hupper) {
+                    return Err(SasError::runtime(format!(
+                        "Hash object {hupper} bound to iterator {} has not been declared.",
+                        name.to_uppercase()
+                    )));
+                }
+                self.hash_iters.insert(
+                    name.to_uppercase(),
+                    HashIter {
+                        hash: hupper,
+                        pos: None,
+                    },
+                );
+                Ok(())
+            }
+            // Appel de méthode d'objet hash (M17.1/M17.2) : l'objet doit être
+            // déclaré. Pour defineKey/defineData, les arguments positionnels
+            // sont des littéraux chaîne nommant des variables du PDV (validées).
+            // Les autres méthodes valident leurs arguments d'expression.
+            DsStmt::HashMethod(call) => {
+                self.validate_hash_method(&call.object, &call.method, &call.args)
+            }
         }
+    }
+
+    /// Validation compile-time d'un appel de méthode hash (forme statement OU
+    /// expression). Partagée par `DsStmt::HashMethod` et `Expr::HashMethod`.
+    fn validate_hash_method(
+        &mut self,
+        object: &str,
+        method: &str,
+        args: &[crate::ast::HashArg],
+    ) -> Result<()> {
+        use crate::ast::HashArg;
+        let upper = object.to_uppercase();
+        // Itérateur de hash (DECLARE HITER) : first/next/last/prev sans arg.
+        if self.hash_iters.contains_key(&upper) {
+            for a in args {
+                match a {
+                    HashArg::Positional(e) | HashArg::Named(_, e) => self.walk_expr(e)?,
+                }
+            }
+            return Ok(());
+        }
+        if !self.hash_objects.contains_key(&upper) {
+            return Err(SasError::runtime(format!(
+                "Hash object {upper} has not been declared."
+            )));
+        }
+        let m = method.to_ascii_lowercase();
+        if m == "definekey" || m == "definedata" {
+            for a in args {
+                let HashArg::Positional(Expr::Str(varname)) = a else {
+                    return Err(SasError::runtime(format!(
+                        "Argument of {upper}.{method} must be a quoted variable name."
+                    )));
+                };
+                // La variable clé/donnée doit être au PDV. Si elle n'y est pas
+                // encore (déclarée avant son 1er usage textuel), on la crée —
+                // fidèle à SAS, qui définit ces variables dans le PDV.
+                if self.pdv.slot(varname).is_none() {
+                    self.add_var(varname, VarType::Num, 8);
+                }
+            }
+        } else {
+            for a in args {
+                match a {
+                    HashArg::Positional(e) | HashArg::Named(_, e) => self.walk_expr(e)?,
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Pré-lit le dataset `lib.table` d'une option `dataset:` (M17.2) :
+    /// décode chaque colonne en `Value` et entre la colonne au PDV (slot créé
+    /// comme un SET). Renvoie `(colonnes UPPERCASE → valeurs, n_rows)`.
+    fn preload_hash_dataset(
+        &mut self,
+        dsname: &str,
+    ) -> Result<(HashMap<String, Vec<Value>>, usize)> {
+        let (libref, table) = match dsname.split_once('.') {
+            Some((l, t)) => (l.to_uppercase(), t.to_string()),
+            None => ("WORK".to_string(), dsname.to_string()),
+        };
+        let provider = self.session.libs.get(&libref)?;
+        if !provider.exists(&table) {
+            return Err(SasError::runtime(format!(
+                "File {libref}.{} does not exist.",
+                table.to_uppercase()
+            )));
+        }
+        let (ds, notes) = provider.read(&table)?;
+        for note in &notes {
+            self.session.log.forward(note);
+        }
+        let mut cols: HashMap<String, Vec<Value>> = HashMap::new();
+        for (col, meta) in ds.df.get_columns().iter().zip(&ds.vars) {
+            // Entrée au PDV (crée le slot si absent ; type cohérent vérifié).
+            if let Some(slot) = self.pdv.slot(&meta.name) {
+                if self.pdv.vars()[slot].ty != meta.ty {
+                    return Err(SasError::runtime(format!(
+                        "Variable {} has been defined as both character and numeric.",
+                        meta.name
+                    )));
+                }
+            } else {
+                let slot = self.pdv.add_var(PdvVar {
+                    name: meta.name.clone(),
+                    ty: meta.ty,
+                    length: meta.length,
+                    retained: false,
+                    from_input: true,
+                    format: meta.format.clone(),
+                    temporary: false,
+                });
+                self.pdv.mark_from_input(slot);
+            }
+            let s = col.as_materialized_series();
+            let values: Vec<Value> = match meta.ty {
+                VarType::Num => s.f64()?.iter().map(num_to_value).collect(),
+                VarType::Char => s
+                    .str()?
+                    .iter()
+                    .map(|o| Value::Char(o.unwrap_or("").to_string()))
+                    .collect(),
+            };
+            cols.insert(meta.name.to_uppercase(), values);
+        }
+        Ok((cols, ds.n_obs()))
     }
 
     /// Crée les variables simplement référencées (Num par défaut), en ordre
@@ -1356,6 +1645,11 @@ impl Compiler<'_> {
                     self.walk_expr(a)?;
                 }
                 Ok(())
+            }
+            // Méthode d'objet hash en expression (M17.2) : même validation que
+            // la forme statement.
+            Expr::HashMethod(call) => {
+                self.validate_hash_method(&call.object, &call.method, &call.args)
             }
         }
     }
@@ -2136,6 +2430,10 @@ impl Compiler<'_> {
                 }
                 Ok(())
             }
+            // Une méthode hash dans un WHERE= de SET n'a pas de sens : rejet.
+            Expr::HashMethod(_) => Err(SasError::runtime(format!(
+                "Hash method calls are not allowed in a WHERE= clause on file {file}."
+            ))),
         }
     }
 
@@ -2182,6 +2480,9 @@ impl Compiler<'_> {
                     _ => (VarType::Num, 8),
                 }
             }
+            // Méthode hash en expression (M17.2) : renvoie un code retour
+            // numérique (8 octets).
+            Expr::HashMethod(_) => (VarType::Num, 8),
         }
     }
 

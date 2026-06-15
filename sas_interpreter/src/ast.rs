@@ -148,6 +148,36 @@ pub enum Expr {
         name: String,
         indices: Vec<Expr>,
     },
+    /// Appel de méthode d'objet hash en POSITION D'EXPRESSION (M17.2) :
+    /// `rc = h.find();`. Renvoie le code retour numérique de la méthode (0 =
+    /// succès, ≠0 = échec). Évalué par `exec::eval_checked` (qui a `&mut self`)
+    /// car les méthodes hash mutent le PDV (copie des données sur `find`) et
+    /// les objets hash — l'évaluateur immuable `eval()` ne peut pas les servir
+    /// et renvoie un missing de garde. La forme statement (`h.find();`) reste
+    /// `DsStmt::HashMethod` (le code retour est ignoré).
+    /// Boxé pour garder `Expr` compact (l'appel de méthode hash est rare).
+    HashMethod(Box<HashMethodCall>),
+}
+
+/// Données d'un appel de méthode d'objet hash (M17.2), partagées par
+/// `Expr::HashMethod` (forme expression) et `DsStmt::HashMethod` (statement).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HashMethodCall {
+    pub object: String,
+    pub method: String,
+    pub args: Vec<HashArg>,
+}
+
+/// Un argument d'appel de méthode d'objet hash (M17.2). Soit positionnel
+/// (`defineKey('k')`, `find()`), soit nommé (`add(key:1, data:'x')`,
+/// `output(dataset:'lib.tab')`). Le nom est normalisé en minuscules.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HashArg {
+    /// Argument positionnel : une expression (souvent un littéral chaîne
+    /// nommant une variable, pour defineKey/defineData).
+    Positional(Expr),
+    /// Argument nommé `name: expr` (`key:`, `data:`, `dataset:`).
+    Named(String, Expr),
 }
 
 /// Liste spéciale d'éléments d'un statement ARRAY (M16.2). À la
@@ -552,6 +582,33 @@ pub enum DsStmt {
     /// l'adresse de retour). Sans `LINK` actif, RETURN termine l'itération
     /// courante (output implicite puis itération suivante), comme en SAS.
     Return,
+    /// `declare hash h(opt:val, ...);` / `dcl hash h();` (M17.1) — crée un
+    /// objet hash nommé `name`. Les options sont des paires `clé:valeur`
+    /// (`ordered:'yes'`, `duplicate:'replace'`, `multidata:'yes'`,
+    /// `dataset:'lib.table'`), séparées par des virgules ; chaque valeur est
+    /// un littéral chaîne ou numérique normalisé en `String`. L'objet est
+    /// défini ensuite par les méthodes `defineKey`/`defineData`/`defineDone`
+    /// (M17.1) puis manipulé par find/add/etc. (M17.2).
+    DeclareHash {
+        name: String,
+        options: Vec<(String, String)>,
+    },
+    /// `h.method(args);` (M17.1/M17.2) — appel d'une méthode d'un objet hash
+    /// en FORME STATEMENT (code retour ignoré). `object` est le nom de l'objet
+    /// hash (résolu en MAJUSCULES) ; `method` le nom de la méthode (résolue
+    /// insensible à la casse) ; `args` ses arguments (positionnels ou nommés).
+    /// La forme expression (`rc = h.find();`) passe par `Expr::HashMethod`.
+    /// Boxé (partage `HashMethodCall` avec la forme expression).
+    HashMethod(Box<HashMethodCall>),
+    /// `declare hiter hi('h');` / `dcl hiter hi('h');` (M17.2) — déclare un
+    /// itérateur lié à l'objet hash nommé dans la chaîne `hash_name`. Les
+    /// méthodes `first`/`next`/`last`/`prev` parcourent l'objet (ordre `ordered:`
+    /// ou ordre d'insertion) et copient la clé+les données de l'entrée courante
+    /// dans le PDV.
+    DeclareHiter {
+        name: String,
+        hash_name: String,
+    },
 }
 
 /// Une clause `when (v1, v2, ...) stmt;` d'un SELECT (M16.1). `values` porte
