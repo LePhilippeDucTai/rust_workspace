@@ -934,36 +934,49 @@ impl MacroEngine {
         while matches!(chars.get(j), Some(c) if c.is_whitespace()) {
             j += 1;
         }
-        // Chemin entre guillemets simples ou doubles.
-        let quote = match chars.get(j) {
-            Some(&q @ ('\'' | '"')) => q,
-            _ => {
-                // Forme non supportée (fileref nu, `*` stdin) : consommer jusqu'au
-                // `;` et émettre une note plutôt que de laisser un résidu.
-                let mut k = j;
-                while k < chars.len() && chars[k] != ';' {
-                    k += 1;
-                }
-                if chars.get(k) != Some(&';') {
-                    return None;
-                }
-                out.push_str(
-                    "/* %include: only quoted file paths are supported (fileref/stdin deferred) */",
-                );
-                return Some(Self::skip_trailing_newline(chars, k + 1, out));
+        // Collecte de tous les chemins entre guillemets consécutifs : SAS admet
+        // `%include 'a.sas' 'b.sas' 'c.sas';` (plusieurs fichiers en un seul
+        // statement, inclus dans l'ordre). On boucle tant que le prochain
+        // caractère non-blanc est un guillemet.
+        let mut paths: Vec<String> = Vec::new();
+        loop {
+            let quote = match chars.get(j) {
+                Some(&q @ ('\'' | '"')) => q,
+                _ => break,
+            };
+            j += 1; // après le guillemet ouvrant
+            let path_start = j;
+            while j < chars.len() && chars[j] != quote {
+                j += 1;
             }
-        };
-        j += 1; // après le guillemet ouvrant
-        let path_start = j;
-        while j < chars.len() && chars[j] != quote {
-            j += 1;
+            if chars.get(j) != Some(&quote) {
+                return None; // guillemet non fermé
+            }
+            paths.push(chars[path_start..j].iter().collect());
+            j += 1; // après le guillemet fermant
+            while matches!(chars.get(j), Some(c) if c.is_whitespace()) {
+                j += 1;
+            }
         }
-        if chars.get(j) != Some(&quote) {
-            return None; // guillemet non fermé
+
+        if paths.is_empty() {
+            // Forme non supportée (fileref nu, `*` stdin) : consommer jusqu'au
+            // `;` et émettre une note plutôt que de laisser un résidu.
+            let mut k = j;
+            while k < chars.len() && chars[k] != ';' {
+                k += 1;
+            }
+            if chars.get(k) != Some(&';') {
+                return None;
+            }
+            out.push_str(
+                "/* %include: only quoted file paths are supported (fileref/stdin deferred) */",
+            );
+            return Some(Self::skip_trailing_newline(chars, k + 1, out));
         }
-        let path: String = chars[path_start..j].iter().collect();
-        j += 1; // après le guillemet fermant
-                // Consommer le reste jusqu'au `;` terminal (options éventuelles ignorées).
+
+        // Consommer le reste jusqu'au `;` terminal (clause d'options `/ ...`
+        // éventuelle ignorée).
         while j < chars.len() && chars[j] != ';' {
             j += 1;
         }
@@ -972,41 +985,41 @@ impl MacroEngine {
         }
         let resume = Self::skip_trailing_newline(chars, j + 1, out);
 
-        // Garde contre les inclusions cycliques (profondeur max).
-        if self.include_depth >= Self::MAX_INCLUDE_DEPTH {
-            out.push_str(&format!(
-                "/* %include nesting limit ({}) reached for '{}' */",
-                Self::MAX_INCLUDE_DEPTH,
-                path
-            ));
-            return Some(resume);
-        }
-
-        // Résolution du chemin : absolu → tel quel ; relatif → joint à la base.
-        let resolved = {
-            let p = std::path::PathBuf::from(&path);
-            if p.is_absolute() {
-                p
-            } else {
-                self.include_base_dir.join(p)
-            }
-        };
-        let contents = match std::fs::read_to_string(&resolved) {
-            Ok(text) => text,
-            Err(e) => {
+        // Inclure chaque fichier dans l'ordre, avec l'état VIVANT de l'engine.
+        for path in &paths {
+            // Garde contre les inclusions cycliques (profondeur max).
+            if self.include_depth >= Self::MAX_INCLUDE_DEPTH {
                 out.push_str(&format!(
-                    "/* %include: cannot read '{}': {} */",
-                    path, e
+                    "/* %include nesting limit ({}) reached for '{}' */",
+                    Self::MAX_INCLUDE_DEPTH,
+                    path
                 ));
-                return Some(resume);
+                continue;
             }
-        };
 
-        // Expansion récursive du fichier inclus avec l'état VIVANT de l'engine.
-        self.include_depth += 1;
-        let expanded = self.process_impl(&contents);
-        self.include_depth -= 1;
-        out.push_str(&expanded);
+            // Résolution du chemin : absolu → tel quel ; relatif → joint à la base.
+            let resolved = {
+                let p = std::path::PathBuf::from(path);
+                if p.is_absolute() {
+                    p
+                } else {
+                    self.include_base_dir.join(p)
+                }
+            };
+            let contents = match std::fs::read_to_string(&resolved) {
+                Ok(text) => text,
+                Err(e) => {
+                    out.push_str(&format!("/* %include: cannot read '{}': {} */", path, e));
+                    continue;
+                }
+            };
+
+            // Expansion récursive du fichier inclus.
+            self.include_depth += 1;
+            let expanded = self.process_impl(&contents);
+            self.include_depth -= 1;
+            out.push_str(&expanded);
+        }
         Some(resume)
     }
 
@@ -4566,6 +4579,71 @@ mod macro_tests {
         let out = e.expand_open_code("%include myref; tail");
         assert!(out.contains("only quoted file paths"), "got: {out}");
         assert!(out.contains("tail"), "got: {out}");
+    }
+
+    #[test]
+    fn include_multiple_paths_one_statement() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "a.sas", "%let x = 1;");
+        write_file(dir.path(), "b.sas", "%let y = 2;");
+        let mut e = engine_in(dir.path());
+        // Les deux fichiers sont inclus ; &x (de a) et &y (de b) résolvent.
+        let out = e.expand_open_code("%include 'a.sas' 'b.sas'; &x &y");
+        assert_eq!(out.trim(), "1 2");
+    }
+
+    #[test]
+    fn include_multiple_paths_order() {
+        let dir = tempfile::tempdir().unwrap();
+        // Les deux posent la MÊME variable : le dernier inclus (b) gagne.
+        write_file(dir.path(), "a.sas", "%let v = first;");
+        write_file(dir.path(), "b.sas", "%let v = second;");
+        let mut e = engine_in(dir.path());
+        let out = e.expand_open_code("%include 'a.sas' 'b.sas'; &v");
+        assert_eq!(out.trim(), "second");
+    }
+
+    #[test]
+    fn include_multiple_paths_macro_then_invoke() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "a.sas", "%macro f; A %mend;");
+        write_file(dir.path(), "b.sas", "%macro g; B %mend;");
+        let mut e = engine_in(dir.path());
+        // Les deux macros sont définies par l'include multi-chemins, puis invoquées.
+        let out = e.expand_open_code("%include 'a.sas' 'b.sas'; %f %g");
+        assert_eq!(out.split_whitespace().collect::<Vec<_>>(), vec!["A", "B"]);
+    }
+
+    #[test]
+    fn include_multiple_one_missing_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        // Le 1er fichier manque (note émise) ; le 2e est bien pris en compte.
+        write_file(dir.path(), "present.sas", "%let z = ok;");
+        let mut e = engine_in(dir.path());
+        let out = e.expand_open_code("%include 'missing.sas' 'present.sas'; &z");
+        assert!(out.contains("cannot read"), "got: {out}");
+        assert!(out.contains("ok"), "got: {out}");
+    }
+
+    #[test]
+    fn include_single_path_unchanged() {
+        // Garde-fou de non-régression : le cas mono-chemin reste identique.
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "inc.sas", "%let x = 42;");
+        let mut e = engine_in(dir.path());
+        let out = e.expand_open_code("%include 'inc.sas'; &x");
+        assert_eq!(out.trim(), "42");
+    }
+
+    #[test]
+    fn include_multiple_paths_options_clause_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "a.sas", "%let x = 1;");
+        write_file(dir.path(), "b.sas", "%let y = 2;");
+        let mut e = engine_in(dir.path());
+        // La clause d'options `/ nosource2` après les chemins est ignorée.
+        let out = e.expand_open_code("%include 'a.sas' 'b.sas' / nosource2; &x &y");
+        assert_eq!(out.trim(), "1 2");
     }
 
     #[test]
