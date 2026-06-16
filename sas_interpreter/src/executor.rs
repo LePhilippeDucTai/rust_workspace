@@ -30,7 +30,7 @@
 //! lexer. Le code retour est dérivé des compteurs du LogWriter par
 //! lib.rs (0 propre / 1 warnings / 2 erreurs).
 
-use crate::ast::GlobalStmt;
+use crate::ast::{GlobalStmt, OdsAction};
 use crate::datastep;
 use crate::error::Result;
 use crate::log::StepTimer;
@@ -79,6 +79,16 @@ pub fn run_program(src: &SourceFile, session: &mut Session) -> Result<()> {
         let raw = &orig.text[start..end];
         // Expansion avec l'état vivant (visibilité des symput antérieurs).
         let expanded = session.macro_engine.expand_open_code(raw);
+        // M19.3 — relayer au log les lignes produites par l'expansion (écho
+        // MPRINT/MLOGIC/SYMBOLGEN et sortie de `%put`), AVANT d'exécuter le
+        // segment expansé (elles précèdent le code dans le log SAS).
+        for line in session.macro_engine.take_pending_log_lines() {
+            session.log.put_line(&line);
+        }
+        // M19.3 — `%call execute(...)` côté macro : mettre en file pour exécution
+        // après le segment courant (même file que le CALL EXECUTE des étapes).
+        let macro_ce = session.macro_engine.take_pending_call_execute();
+        session.call_execute_queue.extend(macro_ce);
         let seg_src = SourceFile::new(expanded);
         let mut stream = match StatementStream::new(&seg_src) {
             Ok(s) => s,
@@ -93,6 +103,11 @@ pub fn run_program(src: &SourceFile, session: &mut Session) -> Result<()> {
             session.log.echo_source(&line_texts);
             run_one_block(block, session);
         }
+        // M19.3 — un `%call execute(...)` en code ouvert (hors étape DATA) doit
+        // tout de même être rejoué après le segment qui l'a produit. Les DATA
+        // steps drainent déjà la file à leur RUN ; ce drain couvre le code
+        // ouvert pur (segment sans étape DATA).
+        run_call_execute_queue(session);
     }
     Ok(())
 }
@@ -203,7 +218,7 @@ fn exec_global(stmt: &GlobalStmt, session: &mut Session) {
             // M1 : seul TITLE1 est rendu par le listing ; les autres niveaux
             // sont acceptés sans effet.
             if *n == 1 {
-                session.listing.title = text.clone();
+                session.listing.set_title(text.clone());
             }
         }
         GlobalStmt::Options(opts) => {
@@ -212,7 +227,7 @@ fn exec_global(stmt: &GlobalStmt, session: &mut Session) {
                     match value.as_deref().and_then(|v| v.parse::<usize>().ok()) {
                         Some(v) if (40..=256).contains(&v) => {
                             session.options.ls = v;
-                            session.listing.ls = v;
+                            session.listing.set_ls(v);
                         }
                         _ => session.log.error(&format!(
                             "The value {} is not a valid LINESIZE value (40..256).",
@@ -245,6 +260,48 @@ fn exec_global(stmt: &GlobalStmt, session: &mut Session) {
                         },
                         None => {}
                     }
+                } else if name.eq_ignore_ascii_case("sasautos") {
+                    // M19.2 — SASAUTOS= fixe le(s) répertoire(s) de bibliothèques
+                    // autocall. On accepte une valeur simple (un répertoire) :
+                    //   OPTIONS SASAUTOS='dir';  ou  OPTIONS SASAUTOS=dir;
+                    // Les guillemets éventuels sont retirés par le parser
+                    // global ; le chemin relatif est résolu contre `base_dir`
+                    // (même base que %include/LIBNAME). La forme liste
+                    // `(d1 d2)` n'est pas gérée ici (différée).
+                    match value.as_deref() {
+                        Some(v) if !v.is_empty() => {
+                            let dir = session.resolve_path(v);
+                            session.macro_engine.set_sasautos_path(vec![dir]);
+                        }
+                        _ => session
+                            .log
+                            .error("The value for the SASAUTOS option is missing."),
+                    }
+                } else if value.is_none() && session.set_ods_option(name) {
+                    // M22.2 — options globales ODS booléennes (CENTER/NOCENTER,
+                    // DATE/NODATE, NUMBER/NONUMBER) posées sur `session.ods_options`.
+                    // Stockées seulement (application au rendu différée M22.3+) :
+                    // pas d'effet visible sur le listing texte par défaut.
+                } else if let Some(flag) = parse_macro_trace_flag(name) {
+                    // M19.3 — options de trace booléennes : MPRINT/MLOGIC/
+                    // SYMBOLGEN (et leurs formes NO...). Appliquées à la session
+                    // ET propagées au processeur macro (qui décide de l'écho).
+                    let (which, on) = flag;
+                    match which {
+                        "mprint" => {
+                            session.options.mprint = on;
+                            session.macro_engine.set_mprint(on);
+                        }
+                        "mlogic" => {
+                            session.options.mlogic = on;
+                            session.macro_engine.set_mlogic(on);
+                        }
+                        "symbolgen" => {
+                            session.options.symbolgen = on;
+                            session.macro_engine.set_symbolgen(on);
+                        }
+                        _ => {}
+                    }
                 } else {
                     session.log.warning(&format!(
                         "Option {} is not yet supported.",
@@ -253,7 +310,128 @@ fn exec_global(stmt: &GlobalStmt, session: &mut Session) {
                 }
             }
         }
+        GlobalStmt::Ods { destination, action, file, style } => {
+            exec_ods(session, destination, *action, file.as_deref(), style.as_deref());
+        }
+        GlobalStmt::OdsOptions { nocenter, date, number } => {
+            session.ods_options.nocenter = *nocenter;
+            session.ods_options.date = *date;
+            session.ods_options.number = *number;
+        }
+        GlobalStmt::OdsOutput { mappings, close } => {
+            if *close {
+                session.clear_ods_output();
+            } else {
+                session.set_ods_output(mappings);
+            }
+        }
     }
+}
+
+/// M22.2/M22.4 — exécute un statement `ODS` : ouvre/ferme la destination demandée.
+///
+/// Invariant : la destination courante reste `session.listing`. `ODS LISTING`
+/// réinstalle le listing texte par défaut ; `ODS HTML` ouvre la destination
+/// HTML (M22.4 : avec fichier si FILE= est fourni) ; RTF/PDF/EXCEL sont des
+/// stubs (note « différé M23 »). `CLOSE` ferme la destination nommée (M22.4 :
+/// déclenche l'écriture du fichier HTML si applicable).
+fn exec_ods(
+    session: &mut Session,
+    destination: &str,
+    action: OdsAction,
+    file: Option<&str>,
+    _style: Option<&str>,
+) {
+    use crate::output::{HtmlDestination, RtfDestination, PdfDestination, ExcelDestination, TextListing};
+
+    let dest = destination.to_ascii_lowercase();
+    let ls = session.options.ls;
+
+    match action {
+        OdsAction::Close => {
+            session.close_destination(&dest);
+        }
+        OdsAction::Open => match dest.as_str() {
+            "listing" => {
+                session.open_destination("listing", Box::new(TextListing::new(ls)));
+            }
+            "html" => {
+                // M22.4 : si FILE= est fourni, ouvrir avec un fichier cible ;
+                // sinon émettre une NOTE informant que la sortie n'est pas
+                // matérialisée (aucun fichier).
+                if let Some(f) = file {
+                    let path = session.resolve_path(f);
+                    session.open_destination(
+                        "html",
+                        Box::new(HtmlDestination::with_file(ls, path)),
+                    );
+                } else {
+                    session.open_destination("html", Box::new(HtmlDestination::new(ls)));
+                    session.log.note(
+                        "ODS HTML sans FILE= : la sortie HTML n\u{2019}est pas mat\u{e9}rialis\u{e9}e (v1).",
+                    );
+                }
+            }
+            "rtf" => {
+                if let Some(f) = file {
+                    let path = session.resolve_path(f);
+                    session.open_destination("rtf", Box::new(RtfDestination::with_file(ls, path)));
+                } else {
+                    session.open_destination("rtf", Box::new(RtfDestination::new(ls)));
+                    session.log.note("ODS RTF sans FILE= : la sortie RTF n'est pas materialisee (v1).");
+                }
+            }
+            "pdf" => {
+                if let Some(f) = file {
+                    let path = session.resolve_path(f);
+                    session.open_destination("pdf", Box::new(PdfDestination::with_file(ls, path)));
+                } else {
+                    session.open_destination("pdf", Box::new(PdfDestination::new(ls)));
+                    session.log.note("ODS PDF sans FILE= : la sortie PDF n'est pas materialisee (v1).");
+                }
+            }
+            "excel" => {
+                if let Some(f) = file {
+                    let path = session.resolve_path(f);
+                    session.open_destination("excel", Box::new(ExcelDestination::with_file(ls, path)));
+                } else {
+                    session.open_destination("excel", Box::new(ExcelDestination::new(ls)));
+                    session.log.note("ODS EXCEL sans FILE= : la sortie Excel n'est pas materialisee (v1).");
+                }
+            }
+            other => {
+                session.log.warning(&format!(
+                    "ODS destination {} is not supported in this build.",
+                    other.to_uppercase()
+                ));
+            }
+        },
+        OdsAction::Select | OdsAction::Exclude => {
+            // Différé M22.3 ; le parser rejette déjà ces formes, donc inatteignable.
+            session
+                .log
+                .note("ODS SELECT/EXCLUDE is deferred to M22.3.");
+        }
+    }
+}
+
+/// M19.3 — reconnaît une option de trace macro booléenne. Rend
+/// `Some((canon, on))` où `canon` est `"mprint"`/`"mlogic"`/`"symbolgen"` et
+/// `on` est `false` pour la forme préfixée `NO` (ex. `NOMPRINT`). `None` si
+/// l'option n'est pas une option de trace.
+fn parse_macro_trace_flag(name: &str) -> Option<(&'static str, bool)> {
+    let lower = name.to_ascii_lowercase();
+    let (body, on) = match lower.strip_prefix("no") {
+        Some(rest) if matches!(rest, "mprint" | "mlogic" | "symbolgen") => (rest.to_string(), false),
+        _ => (lower, true),
+    };
+    let canon = match body.as_str() {
+        "mprint" => "mprint",
+        "mlogic" => "mlogic",
+        "symbolgen" => "symbolgen",
+        _ => return None,
+    };
+    Some((canon, on))
 }
 
 fn exec_data_step(ast: &crate::ast::DataStepAst, session: &mut Session) {
@@ -347,6 +525,46 @@ mod tests {
     }
 
     #[test]
+    fn execute_ods_opens_listing_and_html() {
+        // ODS LISTING / ODS HTML / ODS CLOSE parsent et s'exécutent sans erreur,
+        // et le listing texte reste fonctionnel après bascule.
+        let out = run_det(
+            "ods listing;\n\
+             ods html file='out.html';\n\
+             ods html close;\n\
+             data a; x = 1; run;\n\
+             proc print data=a; run;\n",
+        );
+        assert_eq!(out.exit_code, 0, "log was:\n{}", out.log);
+        // Le listing texte par défaut fonctionne toujours après la bascule ODS.
+        assert!(out.listing.contains("Obs"), "{}", out.listing);
+    }
+
+    #[test]
+    fn execute_ods_rtf_without_file_emits_note() {
+        let out = run_det("ods rtf;\n");
+        assert_eq!(out.exit_code, 0, "log was:\n{}", out.log);
+        assert!(
+            out.log.contains("ODS RTF sans FILE="),
+            "{}",
+            out.log
+        );
+    }
+
+    #[test]
+    fn execute_global_ods_options_no_warning() {
+        // NOCENTER/NODATE/NONUMBER sont reconnues comme options ODS et ne
+        // déclenchent pas de WARNING "not yet supported".
+        let out = run_det("options nocenter nodate nonumber;\n");
+        assert_eq!(out.exit_code, 0, "log was:\n{}", out.log);
+        assert!(
+            !out.log.contains("is not yet supported"),
+            "unexpected warning in log:\n{}",
+            out.log
+        );
+    }
+
+    #[test]
     fn error_recovery_continues_session() {
         let out = run_det(
             "frobnicate;\n\
@@ -387,9 +605,11 @@ mod tests {
 
     #[test]
     fn options_ls_applied_and_unknown_option_warns() {
-        let out = run_det("options ls=120 nocenter;");
+        // M22.2 — CENTER/NOCENTER/DATE/NODATE/NUMBER/NONUMBER are now handled
+        // as ODS options, so no warning. Test with an actually unknown option.
+        let out = run_det("options ls=120 unknownopt;");
         assert_eq!(out.exit_code, 1, "{}", out.log);
-        assert!(out.log.contains("WARNING: Option NOCENTER is not yet supported."));
+        assert!(out.log.contains("WARNING: Option UNKNOWNOPT is not yet supported."));
     }
 
     #[test]
@@ -435,6 +655,39 @@ mod tests {
             .contains("Libref MYLIB was successfully assigned as follows:"));
         assert!(out.log.contains("Physical Name:"));
         assert!(out.log.contains("Libref MYLIB has been deassigned."));
+    }
+
+    #[test]
+    fn options_sasautos_enables_autocall() {
+        // M19.2 — `OPTIONS SASAUTOS='dir';` (chemin relatif résolu contre
+        // base_dir) doit câbler la recherche autocall : une macro non définie
+        // dans le code est cherchée comme `nom.sas` dans ce répertoire et
+        // compilée paresseusement à l'invocation.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("auto")).unwrap();
+        std::fs::write(
+            dir.path().join("auto").join("greet.sas"),
+            "%macro greet(who); %put HELLO &who from autocall; %mend;\n",
+        )
+        .unwrap();
+        // L'option doit être posée AVANT l'expansion du segment qui invoque la
+        // macro autocall : on place une frontière de segment (`run;`) entre les
+        // deux (l'expansion est interfoliée par segment).
+        let out = run(
+            "options sasautos='auto';\ndata _null_; run;\n%greet(WORLD);\n",
+            RunOptions {
+                work_dir: None,
+                base_dir: Some(dir.path().to_path_buf()),
+                deterministic: true,
+                vectorize: false,
+            },
+        );
+        assert_eq!(out.exit_code, 0, "{}", out.log);
+        assert!(
+            out.log.contains("HELLO WORLD from autocall"),
+            "autocall macro did not run; log was:\n{}",
+            out.log
+        );
     }
 
     #[test]

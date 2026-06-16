@@ -148,6 +148,36 @@ pub enum Expr {
         name: String,
         indices: Vec<Expr>,
     },
+    /// Appel de méthode d'objet hash en POSITION D'EXPRESSION (M17.2) :
+    /// `rc = h.find();`. Renvoie le code retour numérique de la méthode (0 =
+    /// succès, ≠0 = échec). Évalué par `exec::eval_checked` (qui a `&mut self`)
+    /// car les méthodes hash mutent le PDV (copie des données sur `find`) et
+    /// les objets hash — l'évaluateur immuable `eval()` ne peut pas les servir
+    /// et renvoie un missing de garde. La forme statement (`h.find();`) reste
+    /// `DsStmt::HashMethod` (le code retour est ignoré).
+    /// Boxé pour garder `Expr` compact (l'appel de méthode hash est rare).
+    HashMethod(Box<HashMethodCall>),
+}
+
+/// Données d'un appel de méthode d'objet hash (M17.2), partagées par
+/// `Expr::HashMethod` (forme expression) et `DsStmt::HashMethod` (statement).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HashMethodCall {
+    pub object: String,
+    pub method: String,
+    pub args: Vec<HashArg>,
+}
+
+/// Un argument d'appel de méthode d'objet hash (M17.2). Soit positionnel
+/// (`defineKey('k')`, `find()`), soit nommé (`add(key:1, data:'x')`,
+/// `output(dataset:'lib.tab')`). Le nom est normalisé en minuscules.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HashArg {
+    /// Argument positionnel : une expression (souvent un littéral chaîne
+    /// nommant une variable, pour defineKey/defineData).
+    Positional(Expr),
+    /// Argument nommé `name: expr` (`key:`, `data:`, `dataset:`).
+    Named(String, Expr),
 }
 
 /// Liste spéciale d'éléments d'un statement ARRAY (M16.2). À la
@@ -552,6 +582,33 @@ pub enum DsStmt {
     /// l'adresse de retour). Sans `LINK` actif, RETURN termine l'itération
     /// courante (output implicite puis itération suivante), comme en SAS.
     Return,
+    /// `declare hash h(opt:val, ...);` / `dcl hash h();` (M17.1) — crée un
+    /// objet hash nommé `name`. Les options sont des paires `clé:valeur`
+    /// (`ordered:'yes'`, `duplicate:'replace'`, `multidata:'yes'`,
+    /// `dataset:'lib.table'`), séparées par des virgules ; chaque valeur est
+    /// un littéral chaîne ou numérique normalisé en `String`. L'objet est
+    /// défini ensuite par les méthodes `defineKey`/`defineData`/`defineDone`
+    /// (M17.1) puis manipulé par find/add/etc. (M17.2).
+    DeclareHash {
+        name: String,
+        options: Vec<(String, String)>,
+    },
+    /// `h.method(args);` (M17.1/M17.2) — appel d'une méthode d'un objet hash
+    /// en FORME STATEMENT (code retour ignoré). `object` est le nom de l'objet
+    /// hash (résolu en MAJUSCULES) ; `method` le nom de la méthode (résolue
+    /// insensible à la casse) ; `args` ses arguments (positionnels ou nommés).
+    /// La forme expression (`rc = h.find();`) passe par `Expr::HashMethod`.
+    /// Boxé (partage `HashMethodCall` avec la forme expression).
+    HashMethod(Box<HashMethodCall>),
+    /// `declare hiter hi('h');` / `dcl hiter hi('h');` (M17.2) — déclare un
+    /// itérateur lié à l'objet hash nommé dans la chaîne `hash_name`. Les
+    /// méthodes `first`/`next`/`last`/`prev` parcourent l'objet (ordre `ordered:`
+    /// ou ordre d'insertion) et copient la clé+les données de l'entrée courante
+    /// dans le PDV.
+    DeclareHiter {
+        name: String,
+        hash_name: String,
+    },
 }
 
 /// Une clause `when (v1, v2, ...) stmt;` d'un SELECT (M16.1). `values` porte
@@ -586,4 +643,61 @@ pub enum GlobalStmt {
     },
     /// Parsed OPTIONS name=value / flag list; unknown options warn.
     Options(Vec<(String, Option<String>)>),
+    /// M22.2 — statement `ODS` : ouvre/ferme une destination de sortie.
+    ///
+    /// Schéma large v1 :
+    /// - `ODS LISTING ;`  → ouvre le listing texte (défaut)
+    /// - `ODS HTML ;`     → ouvre la destination HTML
+    /// - `ODS RTF|PDF|EXCEL ;` → stubs (parse no-op, rendu différé M23)
+    /// - `ODS CLOSE <dest> ;` / `ODS <dest> CLOSE ;` → ferme la destination
+    ///
+    /// `file`/`style` (FILE=/STYLE=) sont parsés mais seulement stockés ici ;
+    /// leur usage réel arrive en M22.4+ (écriture fichier / styles).
+    Ods {
+        /// Nom de destination en minuscules ("listing", "html", "rtf", …).
+        destination: String,
+        action: OdsAction,
+        /// Option FILE= (chemin de sortie). Différé M22.4+.
+        file: Option<String>,
+        /// Option STYLE= (nom de style). Différé M22.4+.
+        style: Option<String>,
+    },
+    /// M22.2 — options globales ODS portées par `OPTIONS` SAS classiques
+    /// (CENTER/NOCENTER, DATE/NODATE, NUMBER/NONUMBER). Stockées sur la session
+    /// et exposées aux destinations.
+    OdsOptions {
+        /// `false` = centré (défaut SAS), `true` = NOCENTER.
+        nocenter: bool,
+        /// `true` = afficher la date (défaut), `false` = NODATE.
+        date: bool,
+        /// `true` = numéro de page (défaut), `false` = NONUMBER.
+        number: bool,
+    },
+    /// M22.3 — statement `ODS OUTPUT` : capture la sortie tabulaire d'un PROC
+    /// sous forme de dataset SAS au lieu (ou en plus) du listing.
+    ///
+    /// Formes reconnues :
+    /// - `ODS OUTPUT table=ds [table2=ds2 ...] ;` → enregistre des mappings
+    ///   (nom de table ODS → cible dataset). Le nom de table ODS est
+    ///   insensible à la casse (stocké UPPERCASE côté session).
+    /// - `ODS OUTPUT CLOSE ;` → vide tous les mappings (désactive la capture).
+    OdsOutput {
+        /// Paires (nom-de-table-ODS, cible dataset). Vide si `close == true`.
+        mappings: Vec<(String, DatasetRef)>,
+        /// `true` pour `ODS OUTPUT CLOSE ;` (purge des mappings).
+        close: bool,
+    },
+}
+
+/// M22.2 — action d'un statement `ODS` sur une destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OdsAction {
+    /// Ouvre la destination (forme par défaut : `ODS HTML ;`).
+    Open,
+    /// Ferme la destination (`ODS HTML CLOSE ;` / `ODS CLOSE ...`).
+    Close,
+    /// `ODS <dest> SELECT ...` — différé M22.3.
+    Select,
+    /// `ODS <dest> EXCLUDE ...` — différé M22.3.
+    Exclude,
 }

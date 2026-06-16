@@ -53,11 +53,14 @@
 //! jointure / agrégation / comparaison, les missings spéciaux sont null.
 //!
 //! ## Couverture des set-ops
-//! UNION [ALL] : `concat` vertical (+ `.unique` sauf ALL). EXCEPT [ALL] et
-//! INTERSECT [ALL] : anti-/semi-join sur TOUTES les colonnes (avec
-//! `join_nulls(true)`), `.unique` sauf ALL. (ALL ne duplique pas
-//! fidèlement la multiplicité pour EXCEPT/INTERSECT — approximation
-//! documentée ; UNION ALL est exact.)
+//! UNION [ALL] : `concat` vertical (+ `.unique` sauf ALL). EXCEPT et
+//! INTERSECT (DISTINCT) : anti-/semi-join sur TOUTES les colonnes (avec
+//! `join_nulls(true)`) + `.unique`. Les variantes ALL honorent EXACTEMENT la
+//! multiplicité SAS : EXCEPT ALL conserve `max(0, n_gauche - n_droite)` copies
+//! de chaque ligne, INTERSECT ALL en conserve `min(n_gauche, n_droite)`. On y
+//! parvient sans itérer ligne à ligne en numérotant l'occurrence de chaque
+//! ligne identique (rang cumulatif via une fenêtre `over` sur toutes les
+//! colonnes) puis en faisant la jointure sur (colonnes + rang).
 
 #![allow(unused_variables, dead_code)]
 
@@ -90,6 +93,13 @@ pub(crate) fn translate_predicate(pred: &SqlExpr) -> Result<Expr> {
     sql_expr_to_polars(pred, &Ctx::empty())
 }
 
+/// Traduit une expression SQL scalaire nue (sans CALCULATED ni agrégats) en
+/// expression Polars, contexte vide. Utilisé par `UPDATE ... SET` (cf.
+/// sql/mod.rs) pour évaluer chaque assignation contre la frame scannée.
+pub(crate) fn translate_expr(e: &SqlExpr) -> Result<Expr> {
+    sql_expr_to_polars(e, &Ctx::empty())
+}
+
 /// Réplique l'effet eager de `missing::nullify_specials` sur une LazyFrame :
 /// pour chaque colonne Float64, NaN-payload (missings spéciaux) → null, afin
 /// que les comparaisons Polars d'un `WHERE` voient bien les missings.
@@ -112,6 +122,12 @@ pub(crate) fn normalize_specials(mut lf: LazyFrame) -> Result<LazyFrame> {
 }
 
 pub fn lower_select(query: &SelectStmt, session: &mut Session) -> Result<LazyFrame> {
+    // 0. Sous-requêtes (M20.2) : résolution préalable des sous-requêtes
+    // non-corrélées (scalaire / IN / EXISTS) en littéraux. Les sous-requêtes
+    // corrélées sont détectées et signalées par une erreur documentée.
+    let resolved = resolve_subqueries(query, session)?;
+    let query = &resolved;
+
     // 1. FROM + joins.
     let mut lf = build_from(query, session)?;
 
@@ -189,10 +205,328 @@ pub fn lower_select(query: &SelectStmt, session: &mut Session) -> Result<LazyFra
 }
 
 // ----------------------------------------------------------------------------
+// 0. Sous-requêtes (M20.2)
+// ----------------------------------------------------------------------------
+//
+// Stratégie : pré-passe qui réécrit le `SelectStmt` en remplaçant chaque
+// sous-requête NON-CORRÉLÉE par un littéral :
+//   - scalaire `(SELECT ...)`      → la valeur unique (Num/Str/Missing) ;
+//   - `x IN (SELECT ...)`          → `x IN (v1, v2, ...)` (liste matérialisée) ;
+//   - `[NOT] EXISTS (SELECT ...)`  → booléen constant (1=true / 0=false).
+// Les sous-requêtes corrélées (qui référencent une colonne d'une table de la
+// requête EXTÉRIEURE) ne sont pas matérialisables ainsi : on lève une erreur
+// documentée.
+
+/// Réécrit récursivement `query` en résolvant ses sous-requêtes non-corrélées.
+fn resolve_subqueries(query: &SelectStmt, session: &mut Session) -> Result<SelectStmt> {
+    let outer = visible_names(query);
+    let mut out = query.clone();
+
+    if let Some(w) = &out.where_ {
+        let mut w = w.clone();
+        rewrite_sql_expr(&mut w, &outer, session)?;
+        out.where_ = Some(w);
+    }
+    for it in &mut out.items {
+        rewrite_sql_expr(&mut it.expr, &outer, session)?;
+    }
+    if let Some(h) = &out.having {
+        let mut h = h.clone();
+        rewrite_sql_expr(&mut h, &outer, session)?;
+        out.having = Some(h);
+    }
+    for j in &mut out.joins {
+        if let Some(on) = &j.on {
+            let mut on = on.clone();
+            rewrite_sql_expr(&mut on, &outer, session)?;
+            j.on = Some(on);
+        }
+    }
+    // Sous-requêtes en FROM (M20.4) : résolues récursivement avant
+    // l'abaissement (elles peuvent elles-mêmes contenir des sous-requêtes).
+    for fi in &mut out.from {
+        if let Some(sub) = &fi.subquery {
+            let resolved = resolve_subqueries(sub, session)?;
+            fi.subquery = Some(Box::new(resolved));
+        }
+    }
+    for j in &mut out.joins {
+        if let Some(sub) = &j.table.subquery {
+            let resolved = resolve_subqueries(sub, session)?;
+            j.table.subquery = Some(Box::new(resolved));
+        }
+    }
+    if let Some((op, all, rhs)) = &out.set_op {
+        let rhs2 = resolve_subqueries(rhs, session)?;
+        out.set_op = Some((op.clone(), *all, Box::new(rhs2)));
+    }
+    Ok(out)
+}
+
+/// Ensemble (minuscule) des alias et noms de tables d'une requête, pour la
+/// détection de corrélation.
+fn visible_names(query: &SelectStmt) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut add = |fi: &super::ast::FromItem| {
+        if let Some(a) = &fi.alias {
+            names.push(a.to_ascii_lowercase());
+        }
+        names.push(fi.table.name.to_ascii_lowercase());
+    };
+    for fi in &query.from {
+        add(fi);
+    }
+    for j in &query.joins {
+        add(&j.table);
+    }
+    names
+}
+
+/// Réécrit en place les sous-requêtes d'une expression. `outer` = noms visibles
+/// dans la requête englobante (pour détecter la corrélation).
+fn rewrite_sql_expr(e: &mut SqlExpr, outer: &[String], session: &mut Session) -> Result<()> {
+    match e {
+        SqlExpr::Subquery(q) => {
+            ensure_not_correlated(q, outer)?;
+            let lit = eval_scalar_subquery(q, session)?;
+            *e = lit;
+        }
+        SqlExpr::InSubquery {
+            expr,
+            query,
+            negated,
+        } => {
+            rewrite_sql_expr(expr, outer, session)?;
+            ensure_not_correlated(query, outer)?;
+            let list = eval_column_subquery(query, session)?;
+            // On émet une chaîne d'égalités `expr = v1 OR expr = v2 OR ...`
+            // (membre droit matérialisé) plutôt que `Expr::In` : cela évite les
+            // problèmes de diffusion (`is_in` sur une liste d'une seule ligne ne
+            // se diffuse pas sur N lignes) et respecte la sémantique missing
+            // (un `expr = .` se traduit en is_null via le traducteur). Une liste
+            // vide → faux partout (`1 = 0`).
+            let mut pred: Option<SqlExpr> = None;
+            for v in list {
+                let eq = SqlExpr::Binary {
+                    op: BinaryOp::Eq,
+                    left: expr.clone(),
+                    right: Box::new(SqlExpr::Base(v)),
+                };
+                pred = Some(match pred {
+                    None => eq,
+                    Some(acc) => SqlExpr::Binary {
+                        op: BinaryOp::Or,
+                        left: Box::new(acc),
+                        right: Box::new(eq),
+                    },
+                });
+            }
+            let mut built = pred.unwrap_or(SqlExpr::Binary {
+                op: BinaryOp::Eq,
+                left: Box::new(SqlExpr::Base(SasExpr::Num(1.0))),
+                right: Box::new(SqlExpr::Base(SasExpr::Num(0.0))),
+            });
+            if *negated {
+                built = SqlExpr::Unary {
+                    op: UnaryOp::Not,
+                    expr: Box::new(built),
+                };
+            }
+            *e = built;
+        }
+        SqlExpr::Exists { query, negated } => {
+            ensure_not_correlated(query, outer)?;
+            let any = subquery_has_rows(query, session)?;
+            let truth = any ^ *negated;
+            // Booléen constant pour un prédicat WHERE : `1 = 1` (vrai, conserve
+            // toutes les lignes) / `1 = 0` (faux, les élimine). On NE peut PAS
+            // utiliser un littéral numérique nu — un filtre Polars exige une
+            // expression BOOLÉENNE, pas un float.
+            let rhs = if truth { 1.0 } else { 0.0 };
+            *e = SqlExpr::Binary {
+                op: BinaryOp::Eq,
+                left: Box::new(SqlExpr::Base(SasExpr::Num(1.0))),
+                right: Box::new(SqlExpr::Base(SasExpr::Num(rhs))),
+            };
+        }
+        SqlExpr::Binary { left, right, .. } => {
+            rewrite_sql_expr(left, outer, session)?;
+            rewrite_sql_expr(right, outer, session)?;
+        }
+        SqlExpr::Unary { expr, .. } => rewrite_sql_expr(expr, outer, session)?,
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            rewrite_sql_expr(expr, outer, session)?;
+            rewrite_sql_expr(low, outer, session)?;
+            rewrite_sql_expr(high, outer, session)?;
+        }
+        SqlExpr::IsNull { expr, .. } => rewrite_sql_expr(expr, outer, session)?,
+        SqlExpr::Like { expr, .. } => rewrite_sql_expr(expr, outer, session)?,
+        SqlExpr::Aggregate { arg: Some(a), .. } => rewrite_sql_expr(a, outer, session)?,
+        SqlExpr::Aggregate { .. }
+        | SqlExpr::Base(_)
+        | SqlExpr::Star
+        | SqlExpr::QualifiedStar(_)
+        | SqlExpr::Qualified { .. }
+        | SqlExpr::Calculated(_) => {}
+    }
+    Ok(())
+}
+
+/// Lève une erreur documentée si la sous-requête est corrélée, c.-à-d. si elle
+/// référence un alias/table de la requête EXTÉRIEURE qu'elle ne redéfinit pas
+/// localement.
+fn ensure_not_correlated(query: &SelectStmt, outer: &[String]) -> Result<()> {
+    let local = visible_names(query);
+    let mut refs = Vec::new();
+    collect_qualified_tables(query, &mut refs);
+    for r in refs {
+        let r = r.to_ascii_lowercase();
+        if outer.contains(&r) && !local.contains(&r) {
+            return Err(SasError::runtime(
+                "PROC SQL: correlated subqueries are not supported yet \
+                 (the subquery references a column from an outer query).",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Collecte les préfixes de table des références qualifiées `table.col` d'une
+/// requête, récursivement dans les sous-requêtes imbriquées.
+fn collect_qualified_tables(query: &SelectStmt, out: &mut Vec<String>) {
+    fn walk(e: &SqlExpr, out: &mut Vec<String>) {
+        match e {
+            SqlExpr::Qualified { table, .. } => out.push(table.clone()),
+            SqlExpr::Binary { left, right, .. } => {
+                walk(left, out);
+                walk(right, out);
+            }
+            SqlExpr::Unary { expr, .. } => walk(expr, out),
+            SqlExpr::Between {
+                expr, low, high, ..
+            } => {
+                walk(expr, out);
+                walk(low, out);
+                walk(high, out);
+            }
+            SqlExpr::IsNull { expr, .. } | SqlExpr::Like { expr, .. } => walk(expr, out),
+            SqlExpr::Aggregate { arg: Some(a), .. } => walk(a, out),
+            SqlExpr::Subquery(q) => collect_qualified_tables(q, out),
+            SqlExpr::InSubquery { expr, query, .. } => {
+                walk(expr, out);
+                collect_qualified_tables(query, out);
+            }
+            SqlExpr::Exists { query, .. } => collect_qualified_tables(query, out),
+            _ => {}
+        }
+    }
+    for it in &query.items {
+        walk(&it.expr, out);
+    }
+    if let Some(w) = &query.where_ {
+        walk(w, out);
+    }
+    if let Some(h) = &query.having {
+        walk(h, out);
+    }
+    for j in &query.joins {
+        if let Some(on) = &j.on {
+            walk(on, out);
+        }
+    }
+}
+
+/// Évalue une sous-requête scalaire : une seule colonne ; on prend la valeur de
+/// la PREMIÈRE ligne (absence de ligne → missing).
+fn eval_scalar_subquery(query: &SelectStmt, session: &mut Session) -> Result<SqlExpr> {
+    let df = lower_select(query, session)?.collect()?;
+    if df.width() != 1 {
+        return Err(SasError::runtime(
+            "PROC SQL: a scalar subquery must select exactly one column.",
+        ));
+    }
+    let col = df.get_columns()[0].as_materialized_series();
+    if col.is_empty() {
+        return Ok(SqlExpr::Base(SasExpr::Missing(MissingKind::Dot)));
+    }
+    any_value_to_base(col, 0)
+}
+
+/// Évalue une sous-requête de colonne (membre droit d'un IN) en une liste de
+/// littéraux `Expr`. Les nulls sont ignorés.
+fn eval_column_subquery(query: &SelectStmt, session: &mut Session) -> Result<Vec<SasExpr>> {
+    let df = lower_select(query, session)?.collect()?;
+    if df.width() != 1 {
+        return Err(SasError::runtime(
+            "PROC SQL: a subquery used with IN must select exactly one column.",
+        ));
+    }
+    let col = df.get_columns()[0].as_materialized_series();
+    let mut list = Vec::with_capacity(col.len());
+    for i in 0..col.len() {
+        // Les missings ne sont pas inclus dans la liste IN.
+        match any_value_to_base(col, i)? {
+            SqlExpr::Base(SasExpr::Missing(_)) => {}
+            SqlExpr::Base(b) => list.push(b),
+            _ => {}
+        }
+    }
+    Ok(list)
+}
+
+/// Vrai si la sous-requête renvoie au moins une ligne (pour EXISTS).
+fn subquery_has_rows(query: &SelectStmt, session: &mut Session) -> Result<bool> {
+    let df = lower_select(query, session)?.limit(1).collect()?;
+    Ok(df.height() > 0)
+}
+
+/// Convertit la valeur (ligne `idx`) d'une série en littéral `SqlExpr::Base`.
+fn any_value_to_base(series: &Series, idx: usize) -> Result<SqlExpr> {
+    use polars::prelude::AnyValue;
+    let av = series
+        .get(idx)
+        .map_err(|e| SasError::runtime(format!("PROC SQL: failed to read subquery value: {e}")))?;
+    let base = match av {
+        AnyValue::Null => SasExpr::Missing(MissingKind::Dot),
+        AnyValue::Float64(f) => {
+            if f.is_nan() {
+                SasExpr::Missing(MissingKind::Dot)
+            } else {
+                SasExpr::Num(f)
+            }
+        }
+        AnyValue::Float32(f) => SasExpr::Num(f as f64),
+        AnyValue::Int64(n) => SasExpr::Num(n as f64),
+        AnyValue::Int32(n) => SasExpr::Num(n as f64),
+        AnyValue::UInt32(n) => SasExpr::Num(n as f64),
+        AnyValue::UInt64(n) => SasExpr::Num(n as f64),
+        AnyValue::Boolean(b) => SasExpr::Num(if b { 1.0 } else { 0.0 }),
+        AnyValue::String(s) => SasExpr::Str(s.to_string()),
+        AnyValue::StringOwned(s) => SasExpr::Str(s.to_string()),
+        other => {
+            return Err(SasError::runtime(format!(
+                "PROC SQL: subquery produced an unsupported value type ({other:?})."
+            )));
+        }
+    };
+    Ok(SqlExpr::Base(base))
+}
+
+// ----------------------------------------------------------------------------
 // 1. FROM + joins
 // ----------------------------------------------------------------------------
 
 fn scan_normalized(session: &Session, lib: &str, table: &str) -> Result<LazyFrame> {
+    // Dictionary tables (M20.3) : `DICTIONARY.TABLES/COLUMNS/MACROS` et leurs
+    // vues `sashelp.v*` sont matérialisées à la volée depuis l'état de session,
+    // puis injectées dans le pipeline standard (WHERE/SELECT/ORDER BY normaux).
+    // Leurs colonnes numériques sont déjà des Float64 sans NaN-payload, donc on
+    // saute `normalize_specials` (no-op) et on rend la frame telle quelle.
+    if let Some(kind) = super::dictionary::dictionary_kind(lib, table) {
+        return super::dictionary::build_dictionary(session, kind);
+    }
     let provider = session.libs.get(lib)?;
     let lf = provider.scan(table)?;
     // Normalisation des missings spéciaux (NaN-payload → null) sur chaque
@@ -201,25 +535,42 @@ fn scan_normalized(session: &Session, lib: &str, table: &str) -> Result<LazyFram
     normalize_specials(lf)
 }
 
+/// Scanne une source de `FROM`/JOIN : soit une VUE SQL stockée en session
+/// (M20.4), soit une table physique via `scan_normalized`. Une vue est
+/// reconnue dans l'espace WORK (libref absent ou `WORK`) par son nom
+/// UPPERCASE présent dans `Session.views` ; sa requête stockée est abaissée
+/// récursivement (vues imbriquées admises). La frame résultat est déjà
+/// coercée/normalisée par `lower_select`, on n'y rejoue pas `normalize_specials`.
+/// Scanne une source de `FROM`/JOIN : sous-requête en FROM (M20.4), vue SQL
+/// stockée, ou table physique. Une sous-requête (`FROM (SELECT ...) alias`)
+/// est abaissée récursivement. Une vue est reconnue dans l'espace WORK
+/// (libref absent / `WORK`) par son nom UPPERCASE présent dans
+/// `Session.views`. Sinon → `scan_normalized` (table physique / dictionnaire).
+fn scan_source(session: &mut Session, item: &super::ast::FromItem) -> Result<LazyFrame> {
+    if let Some(sub) = &item.subquery {
+        return lower_select(sub, session);
+    }
+    let lib = item.table.libref_or_work();
+    let name = item.table.name.to_uppercase();
+    if lib == "WORK" {
+        if let Some(view_query) = session.views.get(&name).cloned() {
+            return lower_select(&view_query, session);
+        }
+    }
+    scan_normalized(session, &lib, &name)
+}
+
 fn build_from(query: &SelectStmt, session: &mut Session) -> Result<LazyFrame> {
     let Some(first) = query.from.first() else {
         return Err(SasError::runtime(
             "PROC SQL: a SELECT must have a FROM clause.",
         ));
     };
-    let mut lf = scan_normalized(
-        session,
-        &first.table.libref_or_work(),
-        &first.table.name.to_uppercase(),
-    )?;
+    let mut lf = scan_source(session, first)?;
 
     // Tables FROM additionnelles (séparées par des virgules) = cross join.
     for extra in query.from.iter().skip(1) {
-        let rhs = scan_normalized(
-            session,
-            &extra.table.libref_or_work(),
-            &extra.table.name.to_uppercase(),
-        )?;
+        let rhs = scan_source(session, extra)?;
         lf = lf.join(
             rhs,
             [] as [Expr; 0],
@@ -230,11 +581,7 @@ fn build_from(query: &SelectStmt, session: &mut Session) -> Result<LazyFrame> {
 
     // Joins explicites.
     for join in &query.joins {
-        let rhs = scan_normalized(
-            session,
-            &join.table.table.libref_or_work(),
-            &join.table.table.name.to_uppercase(),
-        )?;
+        let rhs = scan_source(session, &join.table)?;
         lf = apply_join(lf, rhs, join)?;
     }
 
@@ -367,7 +714,14 @@ fn apply_group_by_project(query: &SelectStmt, lf: LazyFrame, ctx: &Ctx) -> Resul
         }
     }
 
-    let mut out = lf.group_by(keys).agg(agg_exprs);
+    // Sans clé de GROUP BY (agrégation sur toute la table → une seule ligne),
+    // `group_by([])` est invalide pour Polars : on projette directement les
+    // agrégats. C'est le cas d'une sous-requête scalaire `(select avg(x) ...)`.
+    let mut out = if keys.is_empty() {
+        lf.select(agg_exprs)
+    } else {
+        lf.group_by(keys).agg(agg_exprs)
+    };
 
     // HAVING : référence les agrégats par leur colonne.
     if let Some(h) = &query.having {
@@ -673,31 +1027,94 @@ fn apply_set_op(lhs: LazyFrame, rhs: LazyFrame, op: &SetOp, all: bool) -> Result
             }
         }
         SetOp::Except => {
-            // Anti-join sur toutes les colonnes du lhs.
             let on = lhs_columns(&lhs)?;
-            let mut args = JoinArgs::new(JoinType::Anti);
-            args.join_nulls = true;
-            let on_l: Vec<Expr> = on.iter().map(|c| col(c.clone())).collect();
-            let out = lhs.join(rhs, &on_l, &on_l, args);
             if all {
-                Ok(out)
+                // EXCEPT ALL : conserver max(0, n_gauche - n_droite) copies de
+                // chaque ligne. On numérote l'occurrence de chaque ligne
+                // identique (rang 1, 2, ...) des deux côtés, puis on
+                // anti-jointe sur (colonnes + rang). Une ligne de gauche de
+                // rang k survit ssi la droite n'a PAS de ligne identique de
+                // rang k, c.-à-d. n_droite < k.
+                set_op_all(lhs, rhs, &on, JoinType::Anti)
             } else {
+                let mut args = JoinArgs::new(JoinType::Anti);
+                args.join_nulls = true;
+                let on_l: Vec<Expr> = on.iter().map(|c| col(c.clone())).collect();
+                let out = lhs.join(rhs, &on_l, &on_l, args);
                 Ok(out.unique(None, UniqueKeepStrategy::Any))
             }
         }
         SetOp::Intersect => {
             let on = lhs_columns(&lhs)?;
-            let mut args = JoinArgs::new(JoinType::Semi);
-            args.join_nulls = true;
-            let on_l: Vec<Expr> = on.iter().map(|c| col(c.clone())).collect();
-            let out = lhs.join(rhs, &on_l, &on_l, args);
             if all {
-                Ok(out)
+                // INTERSECT ALL : conserver min(n_gauche, n_droite) copies. Une
+                // ligne de gauche de rang k survit ssi la droite a une ligne
+                // identique de rang k (n_droite >= k) → semi-join sur
+                // (colonnes + rang).
+                set_op_all(lhs, rhs, &on, JoinType::Semi)
             } else {
+                let mut args = JoinArgs::new(JoinType::Semi);
+                args.join_nulls = true;
+                let on_l: Vec<Expr> = on.iter().map(|c| col(c.clone())).collect();
+                let out = lhs.join(rhs, &on_l, &on_l, args);
                 Ok(out.unique(None, UniqueKeepStrategy::Any))
             }
         }
     }
+}
+
+/// Nom de la colonne interne portant le rang d'occurrence. Préfixe improbable
+/// pour ne pas entrer en collision avec une vraie variable SAS (max 32 car.,
+/// jamais d'espace ni de `#`).
+const OCC_RANK_COL: &str = "# sasrs occ rank #";
+
+/// Implémente EXCEPT ALL / INTERSECT ALL en respectant la multiplicité exacte.
+///
+/// Idée : pour chaque ligne, on calcule son rang d'occurrence parmi les lignes
+/// identiques (1 pour la première copie, 2 pour la deuxième, ...) via une
+/// fenêtre `cum_sum().over(toutes les colonnes)`. On joint alors gauche et
+/// droite sur (toutes les colonnes + rang) :
+///   - `Anti` (EXCEPT ALL)  → gardent les (ligne, rang) absents à droite,
+///     soit `max(0, n_gauche - n_droite)` copies ;
+///   - `Semi` (INTERSECT ALL) → gardent les (ligne, rang) présents à droite,
+///     soit `min(n_gauche, n_droite)` copies.
+/// La colonne de rang est retirée du résultat. `join_nulls(true)` assure que
+/// `. = .` matche (sémantique SAS).
+fn set_op_all(
+    lhs: LazyFrame,
+    rhs: LazyFrame,
+    on: &[String],
+    how: JoinType,
+) -> Result<LazyFrame> {
+    let partition: Vec<Expr> = on.iter().map(|c| col(c.clone())).collect();
+    // Rang d'occurrence = somme cumulée, partitionnée par toutes les colonnes,
+    // d'une constante 1 MATÉRIALISÉE en colonne. (Un `lit(1)` scalaire ne se
+    // diffuse pas correctement dans `over` : Polars exige une expression de la
+    // longueur du groupe ; on passe donc par une vraie colonne `col(ONE)`.)
+    // `cum_sum` sur des entiers non-nuls donne 1, 2, 3... pour les lignes
+    // identiques.
+    const ONE_COL: &str = "# sasrs one #";
+    let rank_expr = col(ONE_COL)
+        .cum_sum(false)
+        .over(partition.clone())
+        .alias(OCC_RANK_COL);
+    let lhs_r = lhs
+        .with_column(lit(1i32).alias(ONE_COL))
+        .with_column(rank_expr.clone())
+        .drop([col(ONE_COL)]);
+    let rhs_r = rhs
+        .with_column(lit(1i32).alias(ONE_COL))
+        .with_column(rank_expr)
+        .drop([col(ONE_COL)]);
+
+    let mut on_cols: Vec<Expr> = partition;
+    on_cols.push(col(OCC_RANK_COL));
+
+    let mut args = JoinArgs::new(how);
+    args.join_nulls = true;
+    let out = lhs_r.join(rhs_r, &on_cols, &on_cols, args);
+    // La colonne de rang ne doit pas apparaître dans le résultat.
+    Ok(out.drop([col(OCC_RANK_COL)]))
 }
 
 fn lhs_columns(lf: &LazyFrame) -> Result<Vec<String>> {
@@ -727,6 +1144,8 @@ fn item_has_aggregate(e: &SqlExpr) -> bool {
         | SqlExpr::Star
         | SqlExpr::QualifiedStar(_)
         | SqlExpr::Qualified { .. } => false,
+        // Résolues en littéraux avant l'abaissement.
+        SqlExpr::Subquery(_) | SqlExpr::InSubquery { .. } | SqlExpr::Exists { .. } => false,
     }
 }
 
@@ -776,6 +1195,8 @@ fn references_bare_column(e: &SqlExpr) -> bool {
         SqlExpr::Like { expr, .. } => references_bare_column(expr),
         SqlExpr::Calculated(_) => false,
         SqlExpr::Star | SqlExpr::QualifiedStar(_) => false,
+        // Résolues en littéraux avant l'abaissement.
+        SqlExpr::Subquery(_) | SqlExpr::InSubquery { .. } | SqlExpr::Exists { .. } => false,
     }
 }
 
@@ -848,6 +1269,12 @@ fn sql_expr_to_polars(e: &SqlExpr, ctx: &Ctx) -> Result<Expr> {
                 UnaryOp::Not => a.not(),
             })
         }
+        // Les sous-requêtes sont résolues en littéraux par `resolve_subqueries`
+        // AVANT l'abaissement. Si l'une survit ici, c'est un chemin non couvert
+        // (ex. `translate_predicate` du DELETE, qui n'effectue pas la passe).
+        SqlExpr::Subquery(_) | SqlExpr::InSubquery { .. } | SqlExpr::Exists { .. } => Err(
+            SasError::runtime("PROC SQL: subqueries are not supported in this context."),
+        ),
     }
 }
 
@@ -887,6 +1314,10 @@ fn base_expr_to_polars(e: &SasExpr, ctx: &Ctx) -> Result<Expr> {
         SasExpr::Index { name, .. } => Err(SasError::runtime(format!(
             "PROC SQL: array reference {} is not supported in SQL.",
             name.to_uppercase()
+        ))),
+        SasExpr::HashMethod(call) => Err(SasError::runtime(format!(
+            "PROC SQL: hash method call on {} is not supported in SQL.",
+            call.object.to_uppercase()
         ))),
     }
 }
@@ -1010,44 +1441,102 @@ fn aggregate_to_polars(
     }
 }
 
-/// Traduit un prédicat SQL `expr LIKE pattern` en expression Polars SANS
-/// dépendre de la feature `regex` de Polars (non activée dans ce crate). On
-/// couvre les formes courantes via `starts_with` / `ends_with` /
-/// `contains_literal` / égalité :
-///   - `abc`      → eq (aucun joker)
-///   - `abc%`     → starts_with("abc")
-///   - `%abc`     → ends_with("abc")
-///   - `%`        → is_not_null (tout non-missing)
-/// Le joker `_` (un caractère), les motifs `%` multiples au milieu ET la
-/// forme `%abc%` (substring) nécessiteraient la feature `regex` de Polars
-/// (non activée) : on lève alors une ERROR propre (documenté).
+/// Traduit un prédicat SQL `expr LIKE pattern` en expression Polars.
+///
+/// Sémantique SAS du LIKE (cf. SAS SQL) :
+///   - `%`  : correspond à zéro caractère ou plus,
+///   - `_`  : correspond à exactement un caractère,
+///   - tout autre caractère se compare littéralement,
+///   - la comparaison est **sensible à la casse** (contrairement à `=` SAS
+///     qui l'est aussi sur les char ; SAS ne fait PAS de upcase ici),
+///   - une valeur missing (null) ne matche jamais → résultat null/false.
+///
+/// On n'utilise PAS la feature `regex` de Polars (non activée). Pour couvrir
+/// l'intégralité des motifs (y compris `_`, les `%` internes et la forme
+/// substring `%abc%`), on optimise les cas courants en primitives Polars
+/// (`eq` / `starts_with` / `ends_with` / `contains_literal`) et on retombe sur
+/// un matcher SAS maison appliqué via `Expr::map` pour les cas généraux.
 fn like_to_match(a: Expr, pattern: &str) -> Result<Expr> {
-    if pattern.contains('_') {
-        return Err(SasError::runtime(
-            "PROC SQL: the '_' wildcard in LIKE is not supported yet.",
-        ));
+    // Cas spéciaux purement composés de jokers `%` → tout non-missing matche.
+    // (`%`, `%%`, ... = "zéro ou plus" répété = "n'importe quoi".)
+    if !pattern.is_empty() && pattern.chars().all(|c| c == '%') {
+        return Ok(a.clone().is_not_null());
     }
-    if pattern == "%" {
-        return Ok(a.is_not_null());
-    }
-    let leading = pattern.starts_with('%');
-    let trailing = pattern.ends_with('%');
-    let core = pattern.trim_matches('%');
-    if core.contains('%') {
-        return Err(SasError::runtime(
-            "PROC SQL: this LIKE pattern is not supported yet (internal '%').",
-        ));
-    }
-    Ok(match (leading, trailing) {
-        (false, false) => a.eq(lit(core.to_string())),
-        (false, true) => a.str().starts_with(lit(core.to_string())),
-        (true, false) => a.str().ends_with(lit(core.to_string())),
-        (true, true) => {
-            return Err(SasError::runtime(
-                "PROC SQL: the '%...%' (substring) LIKE pattern is not supported yet.",
-            ));
+
+    // Optimisations : motifs sans `_` et sans plusieurs `%` internes.
+    // On les traduit en primitives Polars natives (plus rapides, vectorisées).
+    // Pour la forme `%abc%`, on retombe sur le matcher maison pour éviter
+    // les dépendances regex.
+    if !pattern.contains('_') {
+        let leading = pattern.starts_with('%');
+        let trailing = pattern.ends_with('%');
+        let core = pattern.trim_matches('%');
+        if !core.contains('%') && (leading, trailing) != (true, true) {
+            let core = core.to_string();
+            return Ok(match (leading, trailing) {
+                // Pas de joker du tout → égalité exacte.
+                (false, false) => a.eq(lit(core)),
+                // `abc%` → commence par "abc".
+                (false, true) => a.str().starts_with(lit(core)),
+                // `%abc` → finit par "abc".
+                (true, false) => a.str().ends_with(lit(core)),
+                // `%abc%` → gérée par le matcher maison ci-dessous.
+                (true, true) => unreachable!(),
+            });
         }
-    })
+    }
+
+    // Cas général (joker `_`, ou plusieurs `%` internes) : matcher SAS maison
+    // appliqué élément par élément via une UDF Polars renvoyant un booléen.
+    let pat = pattern.to_string();
+    Ok(a.map(
+        move |col: Column| {
+            let s = col.str()?;
+            let out: BooleanChunked = s
+                .iter()
+                .map(|opt| opt.map(|v| sas_like_match(v, &pat)))
+                .collect();
+            Ok(Some(out.into_column()))
+        },
+        GetOutput::from_type(DataType::Boolean),
+    ))
+}
+
+/// Matcher SAS `LIKE` pour une seule valeur (sensible à la casse) :
+/// `%` = 0+ caractères, `_` = exactement 1 caractère, le reste littéral.
+/// Implémentation par backtracking glob classique (sur les `char`, pour gérer
+/// l'UTF-8 correctement).
+fn sas_like_match(text: &str, pattern: &str) -> bool {
+    let t: Vec<char> = text.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    // i : index dans le texte, j : index dans le motif.
+    let (mut i, mut j) = (0usize, 0usize);
+    // Dernier `%` rencontré et position du texte au moment de ce `%` : permet
+    // le backtracking (avancer d'un caractère dans le texte si la suite échoue).
+    let mut star_j: Option<usize> = None;
+    let mut star_i = 0usize;
+    while i < t.len() {
+        if j < p.len() && (p[j] == t[i] || p[j] == '_') {
+            i += 1;
+            j += 1;
+        } else if j < p.len() && p[j] == '%' {
+            star_j = Some(j);
+            star_i = i;
+            j += 1;
+        } else if let Some(sj) = star_j {
+            // Échec : le dernier `%` absorbe un caractère de plus.
+            j = sj + 1;
+            star_i += 1;
+            i = star_i;
+        } else {
+            return false;
+        }
+    }
+    // Texte épuisé : le reste du motif doit être uniquement des `%`.
+    while j < p.len() && p[j] == '%' {
+        j += 1;
+    }
+    j == p.len()
 }
 
 #[cfg(test)]
@@ -1373,5 +1862,565 @@ mod tests {
         write_people(&mut s);
         let out = run("select name from t where age between 11 and 13;", &mut s);
         assert_eq!(out.height(), 2);
+    }
+
+    // ---- M20.1 : LIKE complet (regex maison SAS) -------------------------
+
+    /// Récupère les valeurs d'une colonne char (triées) pour comparaison.
+    fn sorted_strs(df: &DataFrame, col: &str) -> Vec<String> {
+        let mut v: Vec<String> = df
+            .column(col)
+            .unwrap()
+            .str()
+            .unwrap()
+            .iter()
+            .map(|o| o.unwrap().to_string())
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn write_words(session: &mut Session) {
+        let df = df![
+            "w" => ["abc", "abx", "xbc", "axc", "abcd", "ABC", "a_c"],
+        ]
+        .unwrap();
+        write_table(session, "W", df, vec![chr("w", 8)]);
+    }
+
+    #[test]
+    fn like_prefix_percent() {
+        let mut s = make_session();
+        write_words(&mut s);
+        let out = run("select w from w where w like 'ab%';", &mut s);
+        // ab* : abc, abx, abcd (pas ABC — sensible à la casse).
+        assert_eq!(sorted_strs(&out, "w"), vec!["abc", "abcd", "abx"]);
+    }
+
+    #[test]
+    fn like_suffix_percent() {
+        let mut s = make_session();
+        write_words(&mut s);
+        let out = run("select w from w where w like '%bc';", &mut s);
+        // *bc : abc, xbc (a_c ne finit pas par bc).
+        assert_eq!(sorted_strs(&out, "w"), vec!["abc", "xbc"]);
+    }
+
+    #[test]
+    fn like_contains_percent() {
+        let mut s = make_session();
+        write_words(&mut s);
+        let out = run("select w from w where w like '%b%';", &mut s);
+        // contient b : abc, abx, xbc, abcd (pas axc, ABC, a_c).
+        assert_eq!(sorted_strs(&out, "w"), vec!["abc", "abcd", "abx", "xbc"]);
+    }
+
+    #[test]
+    fn like_underscore_single_char() {
+        let mut s = make_session();
+        write_words(&mut s);
+        // 'a_c' : a, un caractère QUELCONQUE, c → abc, axc, a_c (3 lettres).
+        // Pas abcd (4 lettres), pas xbc, pas ABC.
+        let out = run("select w from w where w like 'a_c';", &mut s);
+        assert_eq!(sorted_strs(&out, "w"), vec!["a_c", "abc", "axc"]);
+    }
+
+    #[test]
+    fn like_underscore_is_literal_one_char() {
+        // Vérifie que `_` matche un seul caractère, pas zéro ni plusieurs.
+        let mut s = make_session();
+        let df = df!["w" => ["ac", "abc", "abbc"]].unwrap();
+        write_table(&mut s, "W", df, vec![chr("w", 8)]);
+        let out = run("select w from w where w like 'a_c';", &mut s);
+        // Seul "abc" (a + 1 char + c).
+        assert_eq!(sorted_strs(&out, "w"), vec!["abc"]);
+    }
+
+    #[test]
+    fn like_exact_no_wildcard() {
+        let mut s = make_session();
+        write_words(&mut s);
+        let out = run("select w from w where w like 'abc';", &mut s);
+        assert_eq!(sorted_strs(&out, "w"), vec!["abc"]);
+    }
+
+    #[test]
+    fn like_internal_percent_and_underscore() {
+        // Motif mixte : 'a%c_' avec un `%` interne et un `_` final.
+        let mut s = make_session();
+        let df = df!["w" => ["abcd", "ac1", "abxcZ", "abc", "axxxcc"]].unwrap();
+        write_table(&mut s, "W", df, vec![chr("w", 8)]);
+        let out = run("select w from w where w like 'a%c_';", &mut s);
+        // a, n'importe quoi, c, puis exactement 1 char :
+        //   abcd (a|b|c|d ✓), ac1 (a||c|1 ✓), abxcZ (a|bx|c|Z ✓),
+        //   axxxcc (a|xxx|c|c ✓). Pas abc (rien après c).
+        assert_eq!(
+            sorted_strs(&out, "w"),
+            vec!["abcd", "abxcZ", "ac1", "axxxcc"]
+        );
+    }
+
+    #[test]
+    fn like_case_sensitive() {
+        // SAS LIKE est sensible à la casse (pas d'upcase implicite).
+        let mut s = make_session();
+        write_words(&mut s);
+        let out = run("select w from w where w like 'ABC';", &mut s);
+        assert_eq!(sorted_strs(&out, "w"), vec!["ABC"]);
+    }
+
+    #[test]
+    fn like_missing_never_matches() {
+        let mut s = make_session();
+        let df = df!["w" => [Some("abc"), None, Some("axc")]].unwrap();
+        write_table(&mut s, "W", df, vec![chr("w", 8)]);
+        // 'a%c' matche abc et axc ; le null ne matche jamais.
+        let out = run("select w from w where w like 'a%c';", &mut s);
+        assert_eq!(out.height(), 2);
+        // Même un motif "tout" (%) exclut les missing.
+        let out2 = run("select w from w where w like '%';", &mut s);
+        assert_eq!(out2.height(), 2);
+    }
+
+    #[test]
+    fn like_compared_with_equals() {
+        // LIKE 'abc' (sans joker) ≡ = 'abc'.
+        let mut s = make_session();
+        write_words(&mut s);
+        let like = run("select w from w where w like 'abc';", &mut s);
+        let eq = run("select w from w where w = 'abc';", &mut s);
+        assert_eq!(sorted_strs(&like, "w"), sorted_strs(&eq, "w"));
+    }
+
+    // ---- M20.1 : EXCEPT / INTERSECT ALL (multiplicité exacte) ------------
+
+    /// Tables avec dupliqués pour tester la multiplicité.
+    fn write_multi(session: &mut Session) {
+        // A : 1 apparaît 3×, 2 apparaît 1×, 3 apparaît 2×.
+        let a = df!["x" => [1.0_f64, 1.0, 1.0, 2.0, 3.0, 3.0]].unwrap();
+        // B : 1 apparaît 1×, 3 apparaît 1×, 4 apparaît 1×.
+        let b = df!["x" => [1.0_f64, 3.0, 4.0]].unwrap();
+        write_table(session, "A", a, vec![num("x")]);
+        write_table(session, "B", b, vec![num("x")]);
+    }
+
+    fn nums(df: &DataFrame, col: &str) -> Vec<f64> {
+        let mut v: Vec<f64> = df
+            .column(col)
+            .unwrap()
+            .f64()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v
+    }
+
+    #[test]
+    fn except_distinct() {
+        let mut s = make_session();
+        write_multi(&mut s);
+        // EXCEPT (DISTINCT) : valeurs de A absentes de B, dédupliquées → {2}.
+        let out = run("select x from a except select x from b;", &mut s);
+        assert_eq!(nums(&out, "x"), vec![2.0]);
+    }
+
+    #[test]
+    fn except_all_keeps_multiplicity() {
+        let mut s = make_session();
+        write_multi(&mut s);
+        // EXCEPT ALL : max(0, nA - nB) copies.
+        //   1 : 3-1 = 2 copies ; 2 : 1-0 = 1 ; 3 : 2-1 = 1 ; 4 : absent de A.
+        let out = run("select x from a except all select x from b;", &mut s);
+        assert_eq!(nums(&out, "x"), vec![1.0, 1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn intersect_distinct() {
+        let mut s = make_session();
+        write_multi(&mut s);
+        // INTERSECT (DISTINCT) : valeurs communes dédupliquées → {1, 3}.
+        let out = run("select x from a intersect select x from b;", &mut s);
+        assert_eq!(nums(&out, "x"), vec![1.0, 3.0]);
+    }
+
+    #[test]
+    fn intersect_all_keeps_multiplicity() {
+        let mut s = make_session();
+        write_multi(&mut s);
+        // INTERSECT ALL : min(nA, nB) copies.
+        //   1 : min(3,1) = 1 ; 3 : min(2,1) = 1 ; 2 et 4 : absents d'un côté.
+        let out = run("select x from a intersect all select x from b;", &mut s);
+        assert_eq!(nums(&out, "x"), vec![1.0, 3.0]);
+    }
+
+    #[test]
+    fn intersect_all_both_sides_duplicated() {
+        // Cas où les deux côtés ont plusieurs copies : min(2,3)=2.
+        let mut s = make_session();
+        let a = df!["x" => [5.0_f64, 5.0, 6.0]].unwrap();
+        let b = df!["x" => [5.0_f64, 5.0, 5.0, 6.0, 6.0]].unwrap();
+        write_table(&mut s, "A", a, vec![num("x")]);
+        write_table(&mut s, "B", b, vec![num("x")]);
+        let out = run("select x from a intersect all select x from b;", &mut s);
+        // 5 : min(2,3)=2 ; 6 : min(1,2)=1.
+        assert_eq!(nums(&out, "x"), vec![5.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn except_all_missing_values() {
+        // Les missing (null) participent comme une valeur ordinaire (`. = .`).
+        let mut s = make_session();
+        let a = df!["x" => [Some(1.0_f64), None, None, Some(2.0)]].unwrap();
+        let b = df!["x" => [None, Some(2.0)]].unwrap();
+        write_table(&mut s, "A", a, vec![num("x")]);
+        write_table(&mut s, "B", b, vec![num("x")]);
+        // EXCEPT ALL : null 2-1=1 copie ; 1 : 1-0=1 ; 2 : 1-1=0.
+        let out = run("select x from a except all select x from b;", &mut s);
+        let col = out.column("x").unwrap().f64().unwrap();
+        assert_eq!(out.height(), 2);
+        let n_null = col.iter().filter(|o| o.is_none()).count();
+        let vals: Vec<f64> = col.iter().flatten().collect();
+        assert_eq!(n_null, 1);
+        assert_eq!(vals, vec![1.0]);
+    }
+
+    #[test]
+    fn intersect_all_missing_values() {
+        let mut s = make_session();
+        let a = df!["x" => [None, None, Some(7.0_f64)]].unwrap();
+        let b = df!["x" => [None, Some(7.0_f64), Some(7.0)]].unwrap();
+        write_table(&mut s, "A", a, vec![num("x")]);
+        write_table(&mut s, "B", b, vec![num("x")]);
+        // INTERSECT ALL : null min(2,1)=1 ; 7 min(1,2)=1.
+        let out = run("select x from a intersect all select x from b;", &mut s);
+        assert_eq!(out.height(), 2);
+        let col = out.column("x").unwrap().f64().unwrap();
+        assert_eq!(col.iter().filter(|o| o.is_none()).count(), 1);
+        assert_eq!(col.iter().flatten().collect::<Vec<f64>>(), vec![7.0]);
+    }
+
+    // ---- M20.2 : sous-requêtes (non-corrélées + corrélées) ---------------
+
+    /// Erreur d'abaissement (collect inclus) d'une requête SQL.
+    fn run_err(src: &str, session: &mut Session) -> String {
+        let sel = first_select(src);
+        match lower_select(&sel, session).and_then(|lf| Ok(lf.collect()?)) {
+            Ok(_) => panic!("expected an error for {src:?}"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn scalar_subquery_in_select_list() {
+        // `(select count(*) from t)` est constant pour chaque ligne.
+        let mut s = make_session();
+        write_people(&mut s);
+        let out = run("select name, (select count(*) from t) as n from t;", &mut s);
+        assert_eq!(out.height(), 4);
+        let ns: Vec<f64> = out
+            .column("n")
+            .unwrap()
+            .cast(&DataType::Float64)
+            .unwrap()
+            .f64()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        assert!(ns.iter().all(|v| (*v - 4.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn scalar_subquery_in_where() {
+        // age > avg(age) : moyenne = (10+14+13+11)/4 = 12 → garde 14 et 13.
+        let mut s = make_session();
+        write_people(&mut s);
+        let out = run(
+            "select name, age from t where age > (select avg(age) from t);",
+            &mut s,
+        );
+        let ages: Vec<f64> = out
+            .column("age")
+            .unwrap()
+            .f64()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        assert_eq!(ages, vec![14.0, 13.0]);
+    }
+
+    #[test]
+    fn in_subquery_filters() {
+        // x IN (select k from keys) : matérialise {1,3}.
+        let mut s = make_session();
+        let t = df!["x" => [1.0_f64, 2.0, 3.0, 4.0]].unwrap();
+        let keys = df!["k" => [1.0_f64, 3.0]].unwrap();
+        write_table(&mut s, "T", t, vec![num("x")]);
+        write_table(&mut s, "KEYS", keys, vec![num("k")]);
+        let out = run("select x from t where x in (select k from keys);", &mut s);
+        let xs = nums(&out, "x");
+        assert_eq!(xs, vec![1.0, 3.0]);
+    }
+
+    #[test]
+    fn not_in_subquery_filters() {
+        let mut s = make_session();
+        let t = df!["x" => [1.0_f64, 2.0, 3.0, 4.0]].unwrap();
+        let keys = df!["k" => [1.0_f64, 3.0]].unwrap();
+        write_table(&mut s, "T", t, vec![num("x")]);
+        write_table(&mut s, "KEYS", keys, vec![num("k")]);
+        let out = run(
+            "select x from t where x not in (select k from keys);",
+            &mut s,
+        );
+        assert_eq!(nums(&out, "x"), vec![2.0, 4.0]);
+    }
+
+    #[test]
+    fn exists_subquery_true_keeps_all() {
+        // EXISTS non-corrélé : la sous-requête a des lignes → conserve tout.
+        let mut s = make_session();
+        let t = df!["x" => [1.0_f64, 2.0, 3.0]].unwrap();
+        let other = df!["y" => [9.0_f64]].unwrap();
+        write_table(&mut s, "T", t, vec![num("x")]);
+        write_table(&mut s, "OTHER", other, vec![num("y")]);
+        let out = run("select x from t where exists (select y from other);", &mut s);
+        assert_eq!(out.height(), 3);
+    }
+
+    #[test]
+    fn exists_subquery_false_drops_all() {
+        // EXISTS non-corrélé faux (sous-requête vide après WHERE) → 0 ligne.
+        let mut s = make_session();
+        let t = df!["x" => [1.0_f64, 2.0, 3.0]].unwrap();
+        let other = df!["y" => [9.0_f64]].unwrap();
+        write_table(&mut s, "T", t, vec![num("x")]);
+        write_table(&mut s, "OTHER", other, vec![num("y")]);
+        let out = run(
+            "select x from t where exists (select y from other where y > 100);",
+            &mut s,
+        );
+        assert_eq!(out.height(), 0);
+    }
+
+    #[test]
+    fn not_exists_subquery_inverts() {
+        // NOT EXISTS d'une sous-requête vide → vrai → conserve tout.
+        let mut s = make_session();
+        let t = df!["x" => [1.0_f64, 2.0]].unwrap();
+        let other = df!["y" => [9.0_f64]].unwrap();
+        write_table(&mut s, "T", t, vec![num("x")]);
+        write_table(&mut s, "OTHER", other, vec![num("y")]);
+        let out = run(
+            "select x from t where not exists (select y from other where y > 100);",
+            &mut s,
+        );
+        assert_eq!(out.height(), 2);
+    }
+
+    #[test]
+    fn scalar_subquery_empty_is_missing() {
+        // Une sous-requête scalaire sans ligne → missing ; `age > .` est faux
+        // partout → 0 ligne.
+        let mut s = make_session();
+        write_people(&mut s);
+        let out = run(
+            "select name from t where age > (select age from t where age > 100);",
+            &mut s,
+        );
+        assert_eq!(out.height(), 0);
+    }
+
+    #[test]
+    fn in_subquery_string_values() {
+        // IN sur des valeurs char.
+        let mut s = make_session();
+        write_people(&mut s);
+        let keep = df!["s" => ["F"]].unwrap();
+        write_table(&mut s, "KEEP", keep, vec![chr("s", 1)]);
+        let out = run("select name from t where sex in (select s from keep);", &mut s);
+        // Seules Cy et Di sont F.
+        assert_eq!(out.height(), 2);
+        assert_eq!(sorted_strs(&out, "name"), vec!["Cy", "Di"]);
+    }
+
+    #[test]
+    fn correlated_subquery_errors() {
+        // Sous-requête corrélée (référence `t.age` de la requête externe) :
+        // erreur documentée.
+        let mut s = make_session();
+        write_people(&mut s);
+        let err = run_err(
+            "select name from t where age > \
+             (select avg(age) from u where u.sex = t.sex);",
+            &mut s,
+        );
+        assert!(
+            err.contains("correlated subqueries are not supported"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn nested_non_correlated_subquery() {
+        // Sous-requête à deux niveaux, toutes non-corrélées.
+        let mut s = make_session();
+        let t = df!["x" => [1.0_f64, 2.0, 3.0, 4.0]].unwrap();
+        let a = df!["k" => [2.0_f64, 3.0, 4.0]].unwrap();
+        let b = df!["m" => [2.0_f64, 3.0]].unwrap();
+        write_table(&mut s, "T", t, vec![num("x")]);
+        write_table(&mut s, "A", a, vec![num("k")]);
+        write_table(&mut s, "B", b, vec![num("m")]);
+        // x IN (k IN (m)) → A∩B sur la valeur = {2,3} → filtre T à {2,3}.
+        let out = run(
+            "select x from t where x in \
+             (select k from a where k in (select m from b));",
+            &mut s,
+        );
+        assert_eq!(nums(&out, "x"), vec![2.0, 3.0]);
+    }
+
+    // ------------------------------------------------------------------------
+    // M20.3 — dictionary tables (DICTIONARY.TABLES/COLUMNS/MACROS, sashelp.v*)
+    // ------------------------------------------------------------------------
+
+    /// Valeurs string d'une colonne (dans l'ordre des lignes), nulls → "".
+    fn strs(df: &DataFrame, col: &str) -> Vec<String> {
+        df.column(col)
+            .unwrap()
+            .str()
+            .unwrap()
+            .into_iter()
+            .map(|o| o.unwrap_or("").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn dictionary_tables_lists_datasets() {
+        let mut s = make_session();
+        write_people(&mut s); // WORK.T
+        write_table(
+            &mut s,
+            "U",
+            df!["a" => [1.0_f64, 2.0]].unwrap(),
+            vec![num("a")],
+        );
+        let out = run(
+            "select libname, memname, nobs, nvar from dictionary.tables \
+             order by memname;",
+            &mut s,
+        );
+        assert_eq!(strs(&out, "memname"), vec!["T", "U"]);
+        assert_eq!(strs(&out, "libname"), vec!["WORK", "WORK"]);
+        // T : 4 lignes / 4 variables ; U : 2 lignes / 1 variable.
+        let nobs: Vec<f64> = out.column("nobs").unwrap().f64().unwrap().into_no_null_iter().collect();
+        let nvar: Vec<f64> = out.column("nvar").unwrap().f64().unwrap().into_no_null_iter().collect();
+        assert_eq!(nobs, vec![4.0, 2.0]);
+        assert_eq!(nvar, vec![4.0, 1.0]);
+    }
+
+    #[test]
+    fn dictionary_columns_lists_variables() {
+        let mut s = make_session();
+        write_people(&mut s); // name char(8), sex char(1), age num, height num
+        let out = run(
+            "select name, type, length, varnum from dictionary.columns \
+             where memname = 'T' order by varnum;",
+            &mut s,
+        );
+        assert_eq!(strs(&out, "name"), vec!["name", "sex", "age", "height"]);
+        assert_eq!(strs(&out, "type"), vec!["char", "char", "num", "num"]);
+        let length: Vec<f64> = out.column("length").unwrap().f64().unwrap().into_no_null_iter().collect();
+        assert_eq!(length, vec![8.0, 1.0, 8.0, 8.0]);
+        let varnum: Vec<f64> = out.column("varnum").unwrap().f64().unwrap().into_no_null_iter().collect();
+        assert_eq!(varnum, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn dictionary_macros_lists_globals() {
+        let mut s = make_session();
+        s.macro_engine.set_symbol_global("MYVAR", "hello".to_string());
+        let out = run(
+            "select scope, name, value from dictionary.macros \
+             where name = 'MYVAR';",
+            &mut s,
+        );
+        assert_eq!(out.height(), 1);
+        assert_eq!(strs(&out, "scope"), vec!["GLOBAL"]);
+        assert_eq!(strs(&out, "name"), vec!["MYVAR"]);
+        assert_eq!(strs(&out, "value"), vec!["hello"]);
+    }
+
+    #[test]
+    fn dictionary_macros_automatic_scope() {
+        let mut s = make_session();
+        // Variables automatiques amorcées (SYSVER, etc.) → scope AUTOMATIC.
+        let out = run(
+            "select scope, name from dictionary.macros where name = 'SYSVER';",
+            &mut s,
+        );
+        assert_eq!(out.height(), 1);
+        assert_eq!(strs(&out, "scope"), vec!["AUTOMATIC"]);
+    }
+
+    #[test]
+    fn dictionary_where_filter() {
+        let mut s = make_session();
+        write_people(&mut s); // T : age 10..14
+        let out = run(
+            "select name, type from dictionary.columns \
+             where memname = 'T' and type = 'num' order by name;",
+            &mut s,
+        );
+        // Seules age et height sont numériques.
+        assert_eq!(strs(&out, "name"), vec!["age", "height"]);
+    }
+
+    #[test]
+    fn sashelp_vcolumn_alias() {
+        let mut s = make_session();
+        write_people(&mut s);
+        // sashelp.vcolumn doit produire exactement les mêmes données que
+        // DICTIONARY.COLUMNS.
+        let a = run(
+            "select name, type from sashelp.vcolumn where memname = 'T' \
+             order by varnum;",
+            &mut s,
+        );
+        let b = run(
+            "select name, type from dictionary.columns where memname = 'T' \
+             order by varnum;",
+            &mut s,
+        );
+        assert_eq!(strs(&a, "name"), strs(&b, "name"));
+        assert_eq!(strs(&a, "type"), strs(&b, "type"));
+        assert_eq!(strs(&a, "name"), vec!["name", "sex", "age", "height"]);
+    }
+
+    #[test]
+    fn dictionary_columns_column_order() {
+        let mut s = make_session();
+        write_people(&mut s);
+        // SELECT * doit respecter l'ordre canonique des colonnes dictionary.
+        let out = run("select * from dictionary.columns;", &mut s);
+        let names: Vec<&str> = out.get_column_names().iter().map(|n| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "libname", "memname", "name", "type", "length", "npos",
+                "varnum", "label", "format", "informat",
+            ]
+        );
+    }
+
+    #[test]
+    fn sashelp_vtable_alias() {
+        let mut s = make_session();
+        write_people(&mut s);
+        let out = run(
+            "select memname from sashelp.vtable order by memname;",
+            &mut s,
+        );
+        assert_eq!(strs(&out, "memname"), vec!["T"]);
     }
 }

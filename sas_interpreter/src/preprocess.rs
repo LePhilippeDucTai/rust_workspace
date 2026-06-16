@@ -83,6 +83,48 @@ pub struct MacroEngine {
     scopes: Vec<std::collections::HashMap<String, String>>,
     /// Profondeur d'invocation courante (garde anti-récursion infinie).
     depth: usize,
+    /// M19.2 — répertoire de base pour résoudre les chemins relatifs de
+    /// `%include 'fichier';` (calé sur `Session::base_dir`). Vide par défaut
+    /// (chemins relatifs résolus au CWD).
+    include_base_dir: std::path::PathBuf,
+    /// M19.2 — chemins de bibliothèques autocall (`SASAUTOS`). Pour
+    /// `%nomMacro(...)` non défini, on cherche `nommacro.sas` dans ces
+    /// répertoires (premier trouvé gagne), on le compile (= `process_impl` du
+    /// fichier qui enregistre la `%macro`) puis on invoque. Vide par défaut.
+    sasautos_path: Vec<std::path::PathBuf>,
+    /// M19.2 — profondeur d'imbrication courante des `%include` (garde contre
+    /// les inclusions cycliques). Plafonnée à `MAX_INCLUDE_DEPTH`.
+    include_depth: usize,
+    /// M19.2 — noms (MAJUSCULES) de macros dont la recherche autocall a déjà
+    /// été TENTÉE (trouvée ou non), pour éviter de relire/recompiler le disque
+    /// à chaque invocation. Une fois compilée, la macro vit dans `macros`.
+    autocall_tried: std::collections::HashSet<String>,
+    /// M19.3 — option `MPRINT` : si vrai, chaque ligne de code produite par
+    /// l'expansion d'une macro est écho­tée au log (préfixe `MPRINT(nom):`).
+    /// OFF par défaut.
+    mprint: bool,
+    /// M19.3 — option `MLOGIC` : si vrai, les décisions d'exécution du
+    /// processeur macro (entrée/sortie de macro, conditions `%if`, itérations
+    /// `%do`) sont écho­tées au log (préfixe `MLOGIC(nom):`). OFF par défaut.
+    mlogic: bool,
+    /// M19.3 — option `SYMBOLGEN` : si vrai, chaque résolution `&symbol` est
+    /// écho­tée au log (`SYMBOLGEN:  Macro variable X resolves to ...`). OFF par
+    /// défaut.
+    symbolgen: bool,
+    /// M19.3 — tampon de lignes de log produites pendant l'expansion (écho
+    /// MPRINT/MLOGIC/SYMBOLGEN et sortie de `%put`). L'engine n'a pas accès au
+    /// `LogWriter` (emprunté ailleurs) ; il accumule ici et l'exécuteur draine
+    /// après chaque `expand_open_code` via `take_pending_log_lines`.
+    pending_log_lines: Vec<String>,
+    /// M19.3 — file de fragments de code SAS produits par `%call execute(...)`
+    /// en code macro, à exécuter APRÈS l'étape/segment courant (même sémantique
+    /// que le `CALL EXECUTE` côté DATA step). Drainé par l'exécuteur via
+    /// `take_pending_call_execute`.
+    pending_call_execute: Vec<String>,
+    /// M19.3 — pile des noms de macros en cours d'expansion, pour étiqueter les
+    /// lignes `MPRINT(nom):` / `MLOGIC(nom):`. La macro la plus interne est en
+    /// fin de pile. Vide en code ouvert.
+    macro_stack: Vec<String>,
 }
 
 /// Définition d'une macro capturée par `%macro name(params); <body> %mend;`.
@@ -154,6 +196,76 @@ impl MacroEngine {
         engine
     }
 
+    /// M19.2 — fixe le répertoire de base servant à résoudre les chemins
+    /// relatifs de `%include 'fichier';` (cf. `Session::base_dir`).
+    pub fn set_include_base_dir(&mut self, dir: std::path::PathBuf) {
+        self.include_base_dir = dir;
+    }
+
+    /// M19.2 — fixe les répertoires de bibliothèques autocall (`SASAUTOS`).
+    /// Une macro `%nom` non définie sera cherchée comme `nom.sas` dans ces
+    /// répertoires, dans l'ordre (premier trouvé gagne).
+    pub fn set_sasautos_path(&mut self, path: Vec<std::path::PathBuf>) {
+        self.sasautos_path = path;
+    }
+
+    /// M19.3 — active/désactive l'option de trace `MPRINT` (écho du code
+    /// produit par l'expansion macro). OFF par défaut.
+    pub fn set_mprint(&mut self, on: bool) {
+        self.mprint = on;
+    }
+
+    /// M19.3 — active/désactive l'option de trace `MLOGIC` (écho des décisions
+    /// d'exécution du processeur macro). OFF par défaut.
+    pub fn set_mlogic(&mut self, on: bool) {
+        self.mlogic = on;
+    }
+
+    /// M19.3 — active/désactive l'option de trace `SYMBOLGEN` (écho de chaque
+    /// résolution `&symbol`). OFF par défaut.
+    pub fn set_symbolgen(&mut self, on: bool) {
+        self.symbolgen = on;
+    }
+
+    /// M19.3 — état courant des options de trace (lecture).
+    pub fn mprint(&self) -> bool {
+        self.mprint
+    }
+    pub fn mlogic(&self) -> bool {
+        self.mlogic
+    }
+    pub fn symbolgen(&self) -> bool {
+        self.symbolgen
+    }
+
+    /// M19.3 — draine les lignes de log accumulées pendant l'expansion (écho
+    /// MPRINT/MLOGIC/SYMBOLGEN et sortie de `%put`). L'exécuteur les transfère
+    /// vers le `LogWriter` après chaque `expand_open_code`.
+    pub fn take_pending_log_lines(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_log_lines)
+    }
+
+    /// M19.3 — draine les fragments de code mis en file par `%call execute(...)`
+    /// en code macro, à exécuter après le segment courant.
+    pub fn take_pending_call_execute(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_call_execute)
+    }
+
+    /// M19.3 — écho d'une ligne de log (helper interne). On la pousse dans le
+    /// tampon ; l'exécuteur la relaiera au `LogWriter`.
+    fn log_line(&mut self, line: impl Into<String>) {
+        self.pending_log_lines.push(line.into());
+    }
+
+    /// M19.3 — étiquette de macro courante pour MPRINT/MLOGIC : nom de la macro
+    /// la plus interne en cours d'expansion, ou chaîne vide en code ouvert.
+    fn current_macro_label(&self) -> String {
+        self.macro_stack
+            .last()
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Expanse un segment de "open code" (texte SAS hors corps de `%macro`).
     ///
     /// Applique le `%let`/`&var`/`%macro`/… Pour un segment SANS déclencheur
@@ -187,6 +299,14 @@ impl MacroEngine {
     /// open code, pour alimenter `SYMGET` (M11.5). On aplatit la pile de
     /// portées (plus interne d'abord) puis la table globale ; en open code la
     /// pile est vide, donc seule `table` contribue.
+    /// Variables macro GLOBALES (table globale uniquement, hors portées
+    /// locales), pour `DICTIONARY.MACROS` / `sashelp.vmacro` (M20.3). Clés en
+    /// MAJUSCULES → valeur. Le classement scope GLOBAL/AUTOMATIC est laissé à
+    /// l'appelant (cf. `sql::dictionary`).
+    pub fn global_symbols(&self) -> std::collections::HashMap<String, String> {
+        self.table.clone()
+    }
+
     pub fn symbols_snapshot(&self) -> std::collections::HashMap<String, String> {
         let mut snap = self.table.clone();
         // La table globale est la base ; les portées locales (s'il y en a)
@@ -264,6 +384,11 @@ impl MacroEngine {
     /// Profondeur maximale d'invocation de macro (garde anti-récursion).
     const MAX_MACRO_DEPTH: usize = 100;
 
+    /// M19.2 — profondeur maximale d'imbrication des `%include` (garde contre
+    /// les inclusions cycliques : un fichier qui s'inclut lui-même, ou un cycle
+    /// A→B→A). Au-delà, l'inclusion est refusée avec une note SAS-like.
+    const MAX_INCLUDE_DEPTH: usize = 50;
+
     /// Cherche un symbole macro par nom (insensible casse) : pile de portées du
     /// plus interne au plus externe, puis table globale. Rend la valeur si
     /// trouvée.
@@ -307,6 +432,47 @@ impl MacroEngine {
             current = next;
         }
         current
+    }
+
+    /// M19.3 — produit les lignes SYMBOLGEN pour un token `&...` (potentiellement
+    /// indirect `&&v&i`). On résout l'indirection jusqu'à obtenir un (ou
+    /// plusieurs) `&name` direct(s), puis on émet une ligne par variable
+    /// effectivement consultée, façon SAS :
+    /// `SYMBOLGEN:  Macro variable NAME resolves to VALUE`.
+    /// Les variables indéfinies ne produisent pas de ligne (SAS warne ailleurs).
+    fn symbolgen_trace(&mut self, run: &str) {
+        // Réduit l'indirection : tant qu'il reste des `&&`, on résout une passe
+        // (qui transforme `&&`→`&` et substitue les `&name` directs internes).
+        let mut current = run.to_string();
+        for _ in 0..Self::MAX_RESOLVE_ITERS {
+            if !current.contains("&&") {
+                break;
+            }
+            let next = self.resolve_refs_once(&current);
+            if next == current {
+                break;
+            }
+            current = next;
+        }
+        // À ce stade `current` ne contient plus que des `&name` directs.
+        let chars: Vec<char> = current.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '&' {
+                if let Some((name, after)) = Self::read_name(&chars, i + 1) {
+                    if let Some(v) = self.lookup(&name) {
+                        self.log_line(format!(
+                            "SYMBOLGEN:  Macro variable {} resolves to {}",
+                            name.to_uppercase(),
+                            v
+                        ));
+                    }
+                    i = after;
+                    continue;
+                }
+            }
+            i += 1;
+        }
     }
 
     /// Une passe de résolution des `&ref` sur une chaîne, sans réinjection.
@@ -367,6 +533,34 @@ impl MacroEngine {
                 }
             }
 
+            // `%put <texte>;` (M19.3) — écrit son argument (résolu) au log,
+            // n'émet RIEN dans le flux de code.
+            if c == '%' && Self::matches_kw(&chars, i, "put") {
+                if let Some(next) = self.consume_put(&chars, i, &mut out) {
+                    i = next;
+                    continue;
+                }
+            }
+
+            // `%call execute(text);` (M19.3) — met en file un fragment de code
+            // SAS à exécuter APRÈS le segment courant (sémantique CALL EXECUTE).
+            if c == '%' && Self::matches_kw(&chars, i, "call") {
+                if let Some(next) = self.consume_macro_call(&chars, i, &mut out) {
+                    i = next;
+                    continue;
+                }
+            }
+
+            // `%include 'chemin';` (M19.2) — charge le fichier, l'expanse
+            // récursivement et splice le résultat À LA PLACE du statement,
+            // AVANT de poursuivre le scan du segment courant.
+            if c == '%' && Self::matches_kw(&chars, i, "include") {
+                if let Some(next) = self.consume_include(&chars, i, &mut out) {
+                    i = next;
+                    continue;
+                }
+            }
+
             // `%macro name(params); body %mend;` — capture, n'émet rien.
             if c == '%' && Self::matches_kw(&chars, i, "macro") {
                 if let Some(next) = self.consume_macro_def(&chars, i, &mut out) {
@@ -407,6 +601,56 @@ impl MacroEngine {
             }
             if c == '%' && Self::matches_kw_paren(&chars, i, "qsysfunc") {
                 if let Some(next) = self.consume_sysfunc(&chars, "qsysfunc", i, &mut out) {
+                    i = next;
+                    continue;
+                }
+            }
+
+            // `%sysevalf(expr [, conv])` — évaluation FLOTTANTE (M19.1).
+            if c == '%' && Self::matches_kw_paren(&chars, i, "sysevalf") {
+                if let Some(next) = self.consume_sysevalf(&chars, i, &mut out) {
+                    i = next;
+                    continue;
+                }
+            }
+
+            // `%cmpres(text)` / `%qcmpres(text)` — compression des blancs (M19.1).
+            if c == '%' && Self::matches_kw_paren(&chars, i, "qcmpres") {
+                if let Some(next) = self.consume_cmpres(&chars, "qcmpres", true, i, &mut out) {
+                    i = next;
+                    continue;
+                }
+            }
+            if c == '%' && Self::matches_kw_paren(&chars, i, "cmpres") {
+                if let Some(next) = self.consume_cmpres(&chars, "cmpres", false, i, &mut out) {
+                    i = next;
+                    continue;
+                }
+            }
+
+            // `%symexist(name)` / `%sysmexist(name)` / `%sysget(name)` (M19.1).
+            if c == '%' && Self::matches_kw_paren(&chars, i, "symexist") {
+                if let Some(next) = self.consume_symexist(&chars, i, &mut out) {
+                    i = next;
+                    continue;
+                }
+            }
+            if c == '%' && Self::matches_kw_paren(&chars, i, "sysmexist") {
+                if let Some(next) = self.consume_sysmexist(&chars, i, &mut out) {
+                    i = next;
+                    continue;
+                }
+            }
+            if c == '%' && Self::matches_kw_paren(&chars, i, "sysget") {
+                if let Some(next) = self.consume_sysget(&chars, i, &mut out) {
+                    i = next;
+                    continue;
+                }
+            }
+
+            // `%unquote(text)` — ré-active la résolution `&`/`%` masquée (M19.1).
+            if c == '%' && Self::matches_kw_paren(&chars, i, "unquote") {
+                if let Some(next) = self.consume_unquote(&chars, i, &mut out) {
                     i = next;
                     continue;
                 }
@@ -496,10 +740,17 @@ impl MacroEngine {
                 }
             }
 
-            // Invocation `%name` ou `%name(args)` d'une macro DÉFINIE.
+            // Invocation `%name` ou `%name(args)` d'une macro DÉFINIE — ou, à
+            // défaut, chargée paresseusement depuis une bibliothèque autocall
+            // (`SASAUTOS`, M19.2). `try_autocall` compile `nom.sas` au premier
+            // appel (idempotent via `autocall_tried`).
             if c == '%' {
                 if let Some((name, after)) = Self::read_name(&chars, i + 1) {
-                    if self.macros.contains_key(&name.to_uppercase()) {
+                    let key = name.to_uppercase();
+                    if !self.macros.contains_key(&key) {
+                        self.try_autocall(&name);
+                    }
+                    if self.macros.contains_key(&key) {
                         let next = self.expand_invocation(&chars, i + 1, &name, after, &mut out);
                         i = next;
                         continue;
@@ -541,6 +792,13 @@ impl MacroEngine {
                         next += 1;
                     }
                     let run: String = chars[amp_start..next].iter().collect();
+                    // M19.3 — SYMBOLGEN : écho de chaque résolution `&symbol`.
+                    // On trace la résolution finale au point fixe de la chaîne
+                    // (pour `&&v&i` l'indirection est résolue avant l'écho :
+                    // SAS trace alors la variable réellement consultée).
+                    if self.symbolgen {
+                        self.symbolgen_trace(&run);
+                    }
                     let resolved = self.resolve_value(&run);
                     out.push_str(&resolved);
                     i = next;
@@ -603,7 +861,11 @@ impl MacroEngine {
                     || Self::matches_kw_paren(chars, j, "nrstr")
                     || Self::matches_kw_paren(chars, j, "bquote")
                     || Self::matches_kw_paren(chars, j, "nrbquote")
-                    || Self::matches_kw_paren(chars, j, "superq"))
+                    || Self::matches_kw_paren(chars, j, "superq")
+                    || Self::matches_kw_paren(chars, j, "cmpres")
+                    || Self::matches_kw_paren(chars, j, "qcmpres")
+                    || Self::matches_kw_paren(chars, j, "unquote")
+                    || Self::matches_kw_paren(chars, j, "sysevalf"))
             {
                 // Avancer jusqu'à la `(` puis sauter la région équilibrée.
                 let mut p = j + 1;
@@ -643,6 +905,258 @@ impl MacroEngine {
             j += 1;
         }
         Some(j)
+    }
+}
+
+impl MacroEngine {
+    /// M19.2 — consomme un `%include 'chemin';` à partir de `i` (qui pointe sur
+    /// le `%`), charge le fichier référencé, l'expanse RÉCURSIVEMENT (les
+    /// `%macro` qu'il définit s'enregistrent dans l'état vivant de l'engine, et
+    /// son code ouvert est émis) et splice le résultat dans `out` À LA PLACE du
+    /// statement. Rend l'index APRÈS le `;` (un `\n` final est préservé pour la
+    /// numérotation), ou `None` si la syntaxe ne tient pas (le `%` est alors
+    /// laissé brut).
+    ///
+    /// # Formes reconnues
+    /// - `%include 'chemin';` / `%include "chemin";` : littéral entre guillemets.
+    ///   Le chemin est résolu via `include_base_dir` (relatif) ou tel quel
+    ///   (absolu).
+    ///
+    /// # Cas d'erreur (jamais de `panic`)
+    /// - profondeur d'inclusion > `MAX_INCLUDE_DEPTH` (cycle présumé) → un
+    ///   commentaire de note SAS-like est émis, le statement est consommé ;
+    /// - fichier illisible/absent → idem (commentaire d'erreur) ;
+    /// - `%include` sans guillemets (ex. `%include fileref;` ou `*` / stdin) →
+    ///   non supporté ici : un commentaire de note est émis et le statement
+    ///   consommé jusqu'au `;`.
+    fn consume_include(&mut self, chars: &[char], i: usize, out: &mut String) -> Option<usize> {
+        let mut j = i + "%include".len();
+        while matches!(chars.get(j), Some(c) if c.is_whitespace()) {
+            j += 1;
+        }
+        // Chemin entre guillemets simples ou doubles.
+        let quote = match chars.get(j) {
+            Some(&q @ ('\'' | '"')) => q,
+            _ => {
+                // Forme non supportée (fileref nu, `*` stdin) : consommer jusqu'au
+                // `;` et émettre une note plutôt que de laisser un résidu.
+                let mut k = j;
+                while k < chars.len() && chars[k] != ';' {
+                    k += 1;
+                }
+                if chars.get(k) != Some(&';') {
+                    return None;
+                }
+                out.push_str(
+                    "/* %include: only quoted file paths are supported (fileref/stdin deferred) */",
+                );
+                return Some(Self::skip_trailing_newline(chars, k + 1, out));
+            }
+        };
+        j += 1; // après le guillemet ouvrant
+        let path_start = j;
+        while j < chars.len() && chars[j] != quote {
+            j += 1;
+        }
+        if chars.get(j) != Some(&quote) {
+            return None; // guillemet non fermé
+        }
+        let path: String = chars[path_start..j].iter().collect();
+        j += 1; // après le guillemet fermant
+                // Consommer le reste jusqu'au `;` terminal (options éventuelles ignorées).
+        while j < chars.len() && chars[j] != ';' {
+            j += 1;
+        }
+        if chars.get(j) != Some(&';') {
+            return None;
+        }
+        let resume = Self::skip_trailing_newline(chars, j + 1, out);
+
+        // Garde contre les inclusions cycliques (profondeur max).
+        if self.include_depth >= Self::MAX_INCLUDE_DEPTH {
+            out.push_str(&format!(
+                "/* %include nesting limit ({}) reached for '{}' */",
+                Self::MAX_INCLUDE_DEPTH,
+                path
+            ));
+            return Some(resume);
+        }
+
+        // Résolution du chemin : absolu → tel quel ; relatif → joint à la base.
+        let resolved = {
+            let p = std::path::PathBuf::from(&path);
+            if p.is_absolute() {
+                p
+            } else {
+                self.include_base_dir.join(p)
+            }
+        };
+        let contents = match std::fs::read_to_string(&resolved) {
+            Ok(text) => text,
+            Err(e) => {
+                out.push_str(&format!(
+                    "/* %include: cannot read '{}': {} */",
+                    path, e
+                ));
+                return Some(resume);
+            }
+        };
+
+        // Expansion récursive du fichier inclus avec l'état VIVANT de l'engine.
+        self.include_depth += 1;
+        let expanded = self.process_impl(&contents);
+        self.include_depth -= 1;
+        out.push_str(&expanded);
+        Some(resume)
+    }
+
+    /// M19.3 — consomme un `%put <texte>;` à partir de `i` (sur le `%`). Le
+    /// texte va jusqu'au prochain `;` de niveau supérieur (en sautant les
+    /// régions à parenthèses équilibrées des fonctions macro, pour ne pas
+    /// couper sur un `;` interne). Il est résolu (`&var` + `%function`) puis
+    /// écrit AU LOG via le tampon `pending_log_lines` — `%put` n'émet RIEN dans
+    /// le flux de code. Rend l'index après le `;` (un `\n` final préservé).
+    ///
+    /// Conformément à SAS, `%put;` (sans argument) écrit une ligne vide.
+    fn consume_put(&mut self, chars: &[char], i: usize, out: &mut String) -> Option<usize> {
+        let mut j = i + "%put".len();
+        while matches!(chars.get(j), Some(c) if c.is_whitespace()) {
+            j += 1;
+        }
+        let arg_start = j;
+        // Texte jusqu'au `;` de niveau 0 (parenthèses équilibrées sautées).
+        let mut paren = 0i32;
+        while j < chars.len() {
+            let ch = chars[j];
+            if ch == '(' {
+                paren += 1;
+            } else if ch == ')' {
+                if paren > 0 {
+                    paren -= 1;
+                }
+            } else if ch == ';' && paren == 0 {
+                break;
+            }
+            j += 1;
+        }
+        if chars.get(j) != Some(&';') {
+            return None; // pas de `;` terminal : abandon, on ne consomme rien.
+        }
+        let raw: String = chars[arg_start..j].iter().collect();
+        j += 1; // après le `;`
+        // Résolution immédiate (interprétation des `&var` et `%function`).
+        let resolved = if raw.contains('%') {
+            // Ré-expansion complète (gère `%upcase`, `%sysfunc`, etc.), puis
+            // dé-masquage des sentinelles `%str`/`%nrstr`.
+            Self::unmask(&self.process_impl(&raw))
+        } else if raw.contains('&') {
+            Self::unmask(&self.resolve_value(&raw))
+        } else {
+            Self::unmask(&raw)
+        };
+        // SAS rogne le blanc de tête laissé après `%put` ; le reste est verbatim.
+        self.log_line(resolved.trim_end().to_string());
+        Some(Self::skip_trailing_newline(chars, j, out))
+    }
+
+    /// M19.3 — consomme un `%call <routine>(args);` à partir de `i` (sur le
+    /// `%`). Seul `%call execute(text)` est interprété : le texte (résolu) est
+    /// mis en file dans `pending_call_execute` pour exécution APRÈS le segment
+    /// courant, comme le `CALL EXECUTE` côté DATA step. Les autres routines
+    /// sont consommées sans effet (note SAS-like). N'émet RIEN dans le flux.
+    /// Rend l'index après le `;` (un `\n` final préservé), ou `None` si la
+    /// syntaxe ne tient pas.
+    fn consume_macro_call(&mut self, chars: &[char], i: usize, out: &mut String) -> Option<usize> {
+        let mut j = i + "%call".len();
+        while matches!(chars.get(j), Some(c) if c.is_whitespace()) {
+            j += 1;
+        }
+        let (routine, after_name) = Self::read_name(chars, j)?;
+        j = after_name;
+        while matches!(chars.get(j), Some(c) if c.is_whitespace()) {
+            j += 1;
+        }
+        if chars.get(j) != Some(&'(') {
+            return None;
+        }
+        let (inner, after_paren) = Self::read_balanced_parens(chars, j)?;
+        j = after_paren;
+        // Consommer un `;` terminal optionnel.
+        while matches!(chars.get(j), Some(c) if c.is_whitespace()) {
+            j += 1;
+        }
+        if chars.get(j) == Some(&';') {
+            j += 1;
+        }
+        if routine.eq_ignore_ascii_case("execute") {
+            // L'argument est résolu (macro + symboles) puis mis en file.
+            let code = if inner.contains('%') {
+                Self::unmask(&self.process_impl(&inner))
+            } else if inner.contains('&') {
+                Self::unmask(&self.resolve_value(&inner))
+            } else {
+                Self::unmask(&inner)
+            };
+            self.pending_call_execute.push(code);
+        } else {
+            out.push_str(&format!(
+                "/* %call {}: only EXECUTE is supported in macro code */",
+                routine
+            ));
+        }
+        Some(Self::skip_trailing_newline(chars, j, out))
+    }
+
+    /// Préserve un éventuel `\n` immédiatement après l'index `j` (poussé dans
+    /// `out`) afin de conserver la numérotation des lignes, comme le font les
+    /// autres `consume_*`. Rend l'index après ce `\n` (ou `j` inchangé).
+    fn skip_trailing_newline(chars: &[char], mut j: usize, out: &mut String) -> usize {
+        while matches!(chars.get(j), Some(c) if *c == ' ' || *c == '\t') {
+            j += 1;
+        }
+        if chars.get(j) == Some(&'\n') {
+            out.push('\n');
+            j += 1;
+        }
+        j
+    }
+
+    /// M19.2 — chargement paresseux d'une macro autocall (`SASAUTOS`).
+    ///
+    /// Appelé à l'expansion de `%nom(...)` lorsque `nom` n'est PAS encore défini
+    /// dans `self.macros`. Cherche `nom.sas` (nom en minuscules) dans chaque
+    /// répertoire de `sasautos_path` (premier trouvé gagne), lit le fichier et
+    /// l'expanse via `process_impl` (ce qui ENREGISTRE la `%macro` qu'il
+    /// contient ; toute sortie de code ouvert du fichier est ignorée — un
+    /// fichier autocall ne doit définir que la macro). La tentative est mémoïsée
+    /// dans `autocall_tried` (trouvée ou non), pour ne pas relire le disque à
+    /// chaque appel suivant.
+    fn try_autocall(&mut self, name: &str) {
+        let key = name.to_uppercase();
+        if self.autocall_tried.contains(&key) {
+            return;
+        }
+        self.autocall_tried.insert(key);
+        if self.sasautos_path.is_empty() {
+            return;
+        }
+        let filename = format!("{}.sas", name.to_lowercase());
+        // Premier fichier lisible gagne. On lit AVANT d'appeler `process_impl`
+        // pour ne pas garder `self.sasautos_path` emprunté pendant l'expansion
+        // (qui prend `&mut self`).
+        let mut found: Option<String> = None;
+        for dir in &self.sasautos_path {
+            let candidate = dir.join(&filename);
+            if let Ok(contents) = std::fs::read_to_string(&candidate) {
+                found = Some(contents);
+                break;
+            }
+        }
+        if let Some(contents) = found {
+            // Compilation : on expanse le fichier (qui enregistre la `%macro`)
+            // et on jette la sortie de code ouvert.
+            let _ = self.process_impl(&contents);
+        }
     }
 }
 
@@ -934,11 +1448,46 @@ impl MacroEngine {
 
         // Liaison des paramètres -> portée locale.
         let scope = Self::bind_params(&def.params, &pos_args, &kw_args);
+        let label = name.to_uppercase();
+        // M19.3 — MLOGIC : décision d'entrée de macro.
+        if self.mlogic {
+            self.log_line(format!("MLOGIC({label}):  Beginning execution."));
+            // Écho de la valeur reçue par chaque paramètre (façon SAS).
+            for param in &def.params {
+                let pname = match param {
+                    MacroParam::Positional(n) => n,
+                    MacroParam::Keyword { name, .. } => name,
+                };
+                let val = scope.get(&pname.to_uppercase()).cloned().unwrap_or_default();
+                self.log_line(format!(
+                    "MLOGIC({label}):  Parameter {} has value {}",
+                    pname.to_uppercase(),
+                    val
+                ));
+            }
+        }
         self.scopes.push(scope);
+        self.macro_stack.push(label.clone());
         self.depth += 1;
         let expanded = self.process_impl(&def.body);
         self.depth -= 1;
+        self.macro_stack.pop();
         self.scopes.pop();
+        // M19.3 — MPRINT : écho du code produit par la macro, ligne à ligne.
+        // Chaque ligne NON VIDE (après trim) du texte expansé est écho­tée
+        // avec le préfixe `MPRINT(nom):`.
+        if self.mprint {
+            for line in expanded.lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    self.log_line(format!("MPRINT({label}):   {trimmed}"));
+                }
+            }
+        }
+        // M19.3 — MLOGIC : décision de sortie de macro.
+        if self.mlogic {
+            self.log_line(format!("MLOGIC({label}):  Ending execution."));
+        }
         out.push_str(&expanded);
         resume
     }
@@ -1437,6 +1986,224 @@ impl MacroEngine {
         Some(after)
     }
 
+    // ── M19.1 : fonctions macro différées ───────────────────────────────────
+
+    /// Consomme `%unquote ( text )`. C'est l'INVERSE des fonctions de quoting
+    /// (`%str`/`%nrstr`/`%bquote`/`%superq`/`%q*`) : il « dé-masque » le texte et
+    /// RÉ-ACTIVE la résolution des déclencheurs `&`/`%` qui avaient été rendus
+    /// inertes par le schéma de sentinelles.
+    ///
+    /// Interaction avec le schéma de sentinelles (point délicat) : les fonctions
+    /// de quoting remplacent `&`/`%`/ponctuation par des sentinelles `MASK_BASE+k`.
+    /// `%unquote` procède en trois temps :
+    ///   1. résoudre les `&refs` ENCORE actifs de l'argument (texte non masqué) ;
+    ///   2. `unmask` → rétablir les littéraux d'origine, ce qui ressuscite tout
+    ///      `&`/`%` précédemment masqué ;
+    ///   3. ré-`process_impl` le texte dé-masqué → les `&`/`%` ressuscités sont
+    ///      maintenant résolus comme des déclencheurs normaux.
+    /// La passe `unmask` finale de `expand_open_code` ne fait alors plus rien sur
+    /// ce fragment (déjà dé-masqué). Rend l'index après la `)`.
+    fn consume_unquote(&mut self, chars: &[char], i: usize, out: &mut String) -> Option<usize> {
+        let mut j = i + 1 + "unquote".len();
+        while matches!(chars.get(j), Some(c) if c.is_whitespace()) {
+            j += 1;
+        }
+        if chars.get(j) != Some(&'(') {
+            return None;
+        }
+        let (inner, after) = Self::read_balanced_parens(chars, j)?;
+        // 1. expanser l'argument tel quel : tout `%str`/`%nrstr`/`%q*` imbriqué
+        //    s'exécute et POSE ses sentinelles (déclencheurs `&`/`%` masqués) ;
+        // 2. `unmask` → rétablit les littéraux, ce qui RESSUSCITE `&`/`%` ;
+        // 3. ré-`process_impl` → ces déclencheurs ressuscités sont maintenant
+        //    résolus comme des déclencheurs normaux. La passe `unmask` finale de
+        //    `expand_open_code` ne fait plus rien sur ce fragment.
+        let expanded = self.process_impl(&inner);
+        let unmasked = Self::unmask(&expanded);
+        let reexpanded = self.process_impl(&unmasked);
+        out.push_str(&reexpanded);
+        Some(after)
+    }
+
+    /// Consomme `%cmpres ( text )` / `%qcmpres ( text )`. Résout les `&refs`,
+    /// puis COMPRESSE les blancs : rogne les blancs de bord et réduit toute
+    /// suite de blancs interne à UN seul espace (fidèle à SAS CMPRES). La
+    /// variante `q` masque le résultat (ponctuation + déclencheurs) comme les
+    /// autres `%q*`. Rend l'index après la `)`.
+    fn consume_cmpres(
+        &mut self,
+        chars: &[char],
+        kw: &str,
+        masked: bool,
+        i: usize,
+        out: &mut String,
+    ) -> Option<usize> {
+        let mut j = i + 1 + kw.len();
+        while matches!(chars.get(j), Some(c) if c.is_whitespace()) {
+            j += 1;
+        }
+        if chars.get(j) != Some(&'(') {
+            return None;
+        }
+        let (inner, after) = Self::read_balanced_parens(chars, j)?;
+        let resolved = self.resolve_value(&inner);
+        let compressed = Self::compress_blanks(&resolved);
+        if masked {
+            out.push_str(&Self::mask_special(&compressed, true));
+        } else {
+            out.push_str(&compressed);
+        }
+        Some(after)
+    }
+
+    /// Rogne les blancs de bord et réduit chaque suite de blancs interne à un
+    /// unique espace. Helper de `%cmpres`/`%qcmpres`.
+    fn compress_blanks(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut prev_blank = false;
+        for c in s.trim().chars() {
+            if c.is_whitespace() {
+                if !prev_blank {
+                    out.push(' ');
+                    prev_blank = true;
+                }
+            } else {
+                out.push(c);
+                prev_blank = false;
+            }
+        }
+        out
+    }
+
+    /// Lit l'argument NOM d'une fonction `%kw ( name )` (commune à `%symexist`,
+    /// `%sysmexist`, `%sysget`). Résout les `&refs` de l'argument puis rogne les
+    /// blancs et un éventuel `&` de tête (SAS accepte `%symexist(&x)`). Rend
+    /// `(nom, index après la `)`)`, ou `None` si la parenthèse manque.
+    fn read_name_arg(&mut self, chars: &[char], kw: &str, i: usize) -> Option<(String, usize)> {
+        let mut j = i + 1 + kw.len();
+        while matches!(chars.get(j), Some(c) if c.is_whitespace()) {
+            j += 1;
+        }
+        if chars.get(j) != Some(&'(') {
+            return None;
+        }
+        let (inner, after) = Self::read_balanced_parens(chars, j)?;
+        let resolved = self.resolve_value(&inner);
+        let name = resolved.trim().trim_start_matches('&').trim().to_string();
+        Some((name, after))
+    }
+
+    /// Consomme `%symexist ( name )`. Rend `1` si la variable macro existe (dans
+    /// une portée locale OU globale), `0` sinon. Rend l'index après la `)`.
+    fn consume_symexist(&mut self, chars: &[char], i: usize, out: &mut String) -> Option<usize> {
+        let (name, after) = self.read_name_arg(chars, "symexist", i)?;
+        let exists = self.lookup(&name).is_some();
+        out.push_str(if exists { "1" } else { "0" });
+        Some(after)
+    }
+
+    /// Consomme `%sysmexist ( name )`. Rend `1` si la macro (définie via
+    /// `%macro`) existe, `0` sinon. Rend l'index après la `)`.
+    fn consume_sysmexist(&mut self, chars: &[char], i: usize, out: &mut String) -> Option<usize> {
+        let (name, after) = self.read_name_arg(chars, "sysmexist", i)?;
+        let exists = self.macros.contains_key(&name.to_uppercase());
+        out.push_str(if exists { "1" } else { "0" });
+        Some(after)
+    }
+
+    /// Consomme `%sysget ( name )`. Rend la valeur de la variable d'environnement
+    /// nommée. Une variable inexistante rend la CHAÎNE VIDE (SAS émet un WARNING ;
+    /// on se contente de produire vide pour rester déterministe). Cf. la note de
+    /// déterminisme dans l'en-tête du module. Rend l'index après la `)`.
+    fn consume_sysget(&mut self, chars: &[char], i: usize, out: &mut String) -> Option<usize> {
+        let (name, after) = self.read_name_arg(chars, "sysget", i)?;
+        if let Ok(v) = std::env::var(&name) {
+            out.push_str(&v);
+        }
+        Some(after)
+    }
+
+    /// Consomme `%sysevalf ( expr [, conv] )` : évaluation FLOTTANTE de `expr`
+    /// (contrairement à `%eval` qui est entier seulement). Le résultat brut est
+    /// un `f64` ; un éventuel deuxième argument `conv` le convertit :
+    /// - `BOOLEAN` → `1` si non nul (et non missing), `0` sinon ;
+    /// - `CEIL`    → plafond, formaté en entier ;
+    /// - `FLOOR`   → plancher, formaté en entier ;
+    /// - `INTEGER` → troncature vers zéro, formaté en entier ;
+    /// - absent    → le flottant formaté (entier sans décimales si exact).
+    /// `&refs`/macros imbriquées dans `expr` sont résolues d'abord. Erreur de
+    /// syntaxe → note d'erreur (pas de panic). Rend l'index après la `)`.
+    fn consume_sysevalf(&mut self, chars: &[char], i: usize, out: &mut String) -> Option<usize> {
+        let mut j = i + 1 + "sysevalf".len();
+        while matches!(chars.get(j), Some(c) if c.is_whitespace()) {
+            j += 1;
+        }
+        if chars.get(j) != Some(&'(') {
+            return None;
+        }
+        let (inner, after) = Self::read_balanced_parens(chars, j)?;
+        // L'argument peut contenir des &refs/macros : résoudre AVANT de découper
+        // les virgules (les nombres ne contiennent pas de virgule de niveau sup.).
+        let resolved = self.resolve_value(&inner);
+        let expanded = self.process_impl(&resolved);
+        let parts = Self::split_top_level_commas(&expanded);
+        let expr = parts.first().map(String::as_str).unwrap_or("").trim();
+        let conv = parts.get(1).map(|s| s.trim().to_ascii_uppercase());
+        match Self::eval_float(expr) {
+            Ok(v) => out.push_str(&Self::format_sysevalf(v, conv.as_deref())),
+            Err(e) => Self::emit_error(out, &e),
+        }
+        Some(after)
+    }
+
+    /// Formate le résultat flottant de `%sysevalf` selon la conversion demandée.
+    fn format_sysevalf(v: f64, conv: Option<&str>) -> String {
+        match conv {
+            Some("BOOLEAN") => {
+                if v != 0.0 && !v.is_nan() {
+                    "1".to_string()
+                } else {
+                    "0".to_string()
+                }
+            }
+            Some("CEIL") => Self::format_float(v.ceil()),
+            Some("FLOOR") => Self::format_float(v.floor()),
+            Some("INTEGER") => Self::format_float(v.trunc()),
+            _ => Self::format_float(v),
+        }
+    }
+
+    /// Formate un `f64` en texte façon SAS : un entier exact perd ses décimales
+    /// (`3.0` → `"3"`), sinon on emploie une représentation compacte sans zéros
+    /// finaux superflus.
+    fn format_float(v: f64) -> String {
+        if v.is_nan() {
+            return String::new();
+        }
+        if v == v.trunc() && v.abs() < 1e15 {
+            return format!("{}", v as i64);
+        }
+        // Représentation compacte : `{}` sur f64 rend déjà la plus courte forme
+        // fidèle sans zéros finaux superflus.
+        format!("{v}")
+    }
+
+    /// Évalue une expression arithmétique FLOTTANTE (pour `%sysevalf`). Supporte
+    /// `+ - * / **`, parenthèses, comparaisons (`= ne < <= > >= eq …` → 1/0),
+    /// logique (`and or not & | ^`) et l'unaire `+`/`-`. Tout est calculé en
+    /// `f64` (division réelle, `**` réelle). Un opérande non numérique → erreur.
+    fn eval_float(expr: &str) -> Result<f64, MacroError> {
+        let toks = Self::tokenize_eval(expr)?;
+        let mut p = FloatParser { toks: &toks, pos: 0 };
+        let v = p.parse_expr()?;
+        if p.pos != p.toks.len() {
+            return Err(MacroError::new(format!(
+                "ERROR: A syntax error was detected in the %SYSEVALF expression: {expr}"
+            )));
+        }
+        Ok(v)
+    }
+
     // ── M12.2 : quoting étendu (%superq, %bquote, %nrbquote) ─────────────────
 
     /// Masque TOUS les caractères « spéciaux » d'une chaîne via le schéma de
@@ -1693,6 +2460,16 @@ impl MacroEngine {
                 false
             }
         };
+        // M19.3 — MLOGIC : décision de la condition `%if`.
+        if self.mlogic {
+            let label = self.current_macro_label();
+            self.log_line(format!(
+                "MLOGIC({}):  %IF condition {} is {}",
+                label,
+                cond.trim(),
+                if take_then { "TRUE" } else { "FALSE" }
+            ));
+        }
 
         // Parser l'action du THEN (group ou fragment) -> (texte, index_après).
         let (then_text, after_then) = Self::scan_action(chars, j)?;
@@ -2301,10 +3078,39 @@ impl MacroEngine {
                         i += 1;
                     }
                 }
-                _ if c.is_ascii_digit() => {
+                _ if c.is_ascii_digit() || c == '.' => {
                     let start = i;
                     while matches!(chars.get(i), Some(d) if d.is_ascii_digit()) {
                         i += 1;
+                    }
+                    // Partie fractionnaire / exposant : marque un littéral FLOTTANT
+                    // (`7.5`, `.5`, `1e3`). `%eval` (entier) le verra comme un
+                    // `Word` et émettra l'erreur « character operand » ; `%sysevalf`
+                    // (flottant) le parse en `f64`.
+                    let mut is_float = false;
+                    if chars.get(i) == Some(&'.') {
+                        is_float = true;
+                        i += 1;
+                        while matches!(chars.get(i), Some(d) if d.is_ascii_digit()) {
+                            i += 1;
+                        }
+                    }
+                    if matches!(chars.get(i), Some('e' | 'E'))
+                        && matches!(
+                            chars.get(i + 1),
+                            Some(d) if d.is_ascii_digit()
+                                || ((*d == '+' || *d == '-')
+                                    && matches!(chars.get(i + 2), Some(e) if e.is_ascii_digit()))
+                        )
+                    {
+                        is_float = true;
+                        i += 1; // 'e'
+                        if matches!(chars.get(i), Some('+' | '-')) {
+                            i += 1;
+                        }
+                        while matches!(chars.get(i), Some(d) if d.is_ascii_digit()) {
+                            i += 1;
+                        }
                     }
                     // Un opérande alphanumérique mixte (ex. `3a`) est un mot.
                     if matches!(chars.get(i), Some(d) if d.is_ascii_alphabetic() || *d == '_') {
@@ -2314,6 +3120,9 @@ impl MacroEngine {
                         }
                         let w: String = chars[wstart..i].iter().collect();
                         toks.push(EvalTok::Word(w));
+                    } else if is_float {
+                        // Littéral flottant : porté comme `Word` (entier le rejette).
+                        toks.push(EvalTok::Word(chars[start..i].iter().collect()));
                     } else {
                         let s: String = chars[start..i].iter().collect();
                         match s.parse::<i64>() {
@@ -2559,6 +3368,190 @@ impl<'a> EvalParser<'a> {
             ))),
             other => Err(MacroError::new(format!(
                 "ERROR: A syntax error was detected in the %EVAL expression near {other:?}"
+            ))),
+        }
+    }
+}
+
+/// Analyseur récursif-descendant FLOTTANT pour `%sysevalf` (M19.1). Même
+/// grammaire que [`EvalParser`] mais en `f64` : division réelle, `**` réelle,
+/// comparaisons/logique rendant `1.0`/`0.0`. Réutilise les `EvalTok` produits
+/// par `MacroEngine::tokenize_eval` ; un littéral flottant arrive comme
+/// `EvalTok::Word` (que cet analyseur parse en nombre, contrairement à
+/// l'analyseur entier qui le rejette).
+struct FloatParser<'a> {
+    toks: &'a [EvalTok],
+    pos: usize,
+}
+
+impl FloatParser<'_> {
+    fn peek(&self) -> Option<&EvalTok> {
+        self.toks.get(self.pos)
+    }
+
+    fn bump(&mut self) -> Option<&EvalTok> {
+        let t = self.toks.get(self.pos);
+        if t.is_some() {
+            self.pos += 1;
+        }
+        t
+    }
+
+    fn parse_expr(&mut self) -> Result<f64, MacroError> {
+        self.parse_or()
+    }
+
+    fn parse_or(&mut self) -> Result<f64, MacroError> {
+        let mut left = self.parse_and()?;
+        while matches!(self.peek(), Some(EvalTok::Or)) {
+            self.bump();
+            let right = self.parse_and()?;
+            left = ((left != 0.0) || (right != 0.0)) as i64 as f64;
+        }
+        Ok(left)
+    }
+
+    fn parse_and(&mut self) -> Result<f64, MacroError> {
+        let mut left = self.parse_not()?;
+        while matches!(self.peek(), Some(EvalTok::And)) {
+            self.bump();
+            let right = self.parse_not()?;
+            left = ((left != 0.0) && (right != 0.0)) as i64 as f64;
+        }
+        Ok(left)
+    }
+
+    fn parse_not(&mut self) -> Result<f64, MacroError> {
+        let mut negs = 0;
+        while matches!(self.peek(), Some(EvalTok::Not)) {
+            self.bump();
+            negs += 1;
+        }
+        let v = self.parse_cmp()?;
+        if negs % 2 == 1 {
+            Ok((v == 0.0) as i64 as f64)
+        } else {
+            Ok(v)
+        }
+    }
+
+    fn parse_cmp(&mut self) -> Result<f64, MacroError> {
+        let left = self.parse_add()?;
+        if let Some(op) = self.peek().cloned() {
+            let is_cmp = matches!(
+                op,
+                EvalTok::Eq
+                    | EvalTok::Ne
+                    | EvalTok::Lt
+                    | EvalTok::Le
+                    | EvalTok::Gt
+                    | EvalTok::Ge
+            );
+            if is_cmp {
+                self.bump();
+                let right = self.parse_add()?;
+                let r = match op {
+                    EvalTok::Eq => left == right,
+                    EvalTok::Ne => left != right,
+                    EvalTok::Lt => left < right,
+                    EvalTok::Le => left <= right,
+                    EvalTok::Gt => left > right,
+                    EvalTok::Ge => left >= right,
+                    _ => unreachable!(),
+                };
+                return Ok(r as i64 as f64);
+            }
+        }
+        Ok(left)
+    }
+
+    fn parse_add(&mut self) -> Result<f64, MacroError> {
+        let mut left = self.parse_mul()?;
+        loop {
+            match self.peek() {
+                Some(EvalTok::Plus) => {
+                    self.bump();
+                    left += self.parse_mul()?;
+                }
+                Some(EvalTok::Minus) => {
+                    self.bump();
+                    left -= self.parse_mul()?;
+                }
+                _ => break,
+            }
+        }
+        Ok(left)
+    }
+
+    fn parse_mul(&mut self) -> Result<f64, MacroError> {
+        let mut left = self.parse_pow()?;
+        loop {
+            match self.peek() {
+                Some(EvalTok::Star) => {
+                    self.bump();
+                    left *= self.parse_pow()?;
+                }
+                Some(EvalTok::Slash) => {
+                    self.bump();
+                    let right = self.parse_pow()?;
+                    if right == 0.0 {
+                        return Err(MacroError::new(
+                            "ERROR: Division by zero detected in the %SYSEVALF expression",
+                        ));
+                    }
+                    // Division RÉELLE (≠ %eval qui tronque).
+                    left /= right;
+                }
+                _ => break,
+            }
+        }
+        Ok(left)
+    }
+
+    fn parse_pow(&mut self) -> Result<f64, MacroError> {
+        let base = self.parse_unary()?;
+        if matches!(self.peek(), Some(EvalTok::Pow)) {
+            self.bump();
+            // Associatif à droite.
+            let exp = self.parse_pow()?;
+            return Ok(base.powf(exp));
+        }
+        Ok(base)
+    }
+
+    fn parse_unary(&mut self) -> Result<f64, MacroError> {
+        match self.peek() {
+            Some(EvalTok::Plus) => {
+                self.bump();
+                self.parse_unary()
+            }
+            Some(EvalTok::Minus) => {
+                self.bump();
+                Ok(-self.parse_unary()?)
+            }
+            _ => self.parse_primary(),
+        }
+    }
+
+    fn parse_primary(&mut self) -> Result<f64, MacroError> {
+        match self.bump() {
+            Some(EvalTok::Int(n)) => Ok(*n as f64),
+            Some(EvalTok::Word(w)) => w.parse::<f64>().map_err(|_| {
+                MacroError::new(format!(
+                    "ERROR: A character operand was found in the %SYSEVALF function where a numeric operand is required: {w}"
+                ))
+            }),
+            Some(EvalTok::LParen) => {
+                let v = self.parse_expr()?;
+                match self.bump() {
+                    Some(EvalTok::RParen) => Ok(v),
+                    _ => Err(MacroError::new(
+                        "ERROR: A syntax error was detected in the %SYSEVALF expression: expected ')'",
+                    )),
+                }
+            }
+            other => Err(MacroError::new(format!(
+                "ERROR: A syntax error was detected in the %SYSEVALF expression near {other:?}"
             ))),
         }
     }
@@ -3319,5 +4312,446 @@ mod macro_tests {
         // x indéfini : &x reste, est mis en MAJ (inchangé), puis masqué donc
         // inerte ; la sortie finale (unmask) montre `&X` littéral.
         assert_eq!(expand("%qupcase(a&x)"), "A&X");
+    }
+
+    // --- M19.1 : %unquote ---
+
+    #[test]
+    fn unquote_reenables_resolution_after_nrstr() {
+        // %nrstr masque le `&` : sans %unquote, `&x` reste littéral. %unquote
+        // ré-active la résolution → la valeur de x est splicée.
+        assert_eq!(expand("%let x=hi; %unquote(%nrstr(&x))"), "hi");
+    }
+
+    #[test]
+    fn unquote_roundtrip_plain_text() {
+        // Texte sans déclencheur : %unquote est l'identité.
+        assert_eq!(expand("%unquote(abc)"), "abc");
+    }
+
+    #[test]
+    fn unquote_reenables_macro_call() {
+        // %nrstr masque le `%` d'un appel ; %unquote le ré-active → la macro
+        // s'exécute et émet son corps.
+        assert_eq!(expand("%macro m; got %mend; %unquote(%nrstr(%m))"), "got");
+    }
+
+    // --- M19.1 : %cmpres / %qcmpres ---
+
+    #[test]
+    fn cmpres_compresses_internal_blanks() {
+        assert_eq!(expand("%cmpres(a    b     c)"), "a b c");
+    }
+
+    #[test]
+    fn cmpres_trims_edges() {
+        assert_eq!(expand("%cmpres(   hello   world   )"), "hello world");
+    }
+
+    #[test]
+    fn cmpres_resolves_refs() {
+        assert_eq!(expand("%let v=  x   y  ; %cmpres(&v)"), "x y");
+    }
+
+    #[test]
+    fn qcmpres_masks_result() {
+        // Le résultat de %qcmpres est masqué : un `;` interne ne termine pas le
+        // %let. La valeur stockée (puis ré-émise) garde le `;` littéral.
+        assert_eq!(expand("%let v=%qcmpres(a ;  b); &v"), "a ; b");
+    }
+
+    // --- M19.1 : %symexist ---
+
+    #[test]
+    fn symexist_found() {
+        assert_eq!(expand("%let a=1; %symexist(a)"), "1");
+    }
+
+    #[test]
+    fn symexist_not_found() {
+        assert_eq!(expand("%symexist(nope)"), "0");
+    }
+
+    #[test]
+    fn symexist_accepts_ampersand_name() {
+        // %symexist(&which) : &which désigne le NOM à tester.
+        assert_eq!(expand("%let a=1; %let which=a; %symexist(&which)"), "1");
+    }
+
+    // --- M19.1 : %sysmexist ---
+
+    #[test]
+    fn sysmexist_defined_macro() {
+        assert_eq!(expand("%macro foo; %mend; %sysmexist(foo)"), "1");
+    }
+
+    #[test]
+    fn sysmexist_undefined_macro() {
+        assert_eq!(expand("%sysmexist(bar)"), "0");
+    }
+
+    // --- M19.1 : %sysget (env var posée en mémoire dans le test) ---
+
+    #[test]
+    fn sysget_reads_env_var() {
+        // SAFETY: test mono-thread sur une variable d'env dédiée à ce test ;
+        // posée puis retirée localement.
+        unsafe {
+            std::env::set_var("SASRS_TEST_VAR_M19", "hello_env");
+        }
+        assert_eq!(expand("%sysget(SASRS_TEST_VAR_M19)"), "hello_env");
+        unsafe {
+            std::env::remove_var("SASRS_TEST_VAR_M19");
+        }
+    }
+
+    #[test]
+    fn sysget_unset_is_empty() {
+        // SAFETY: variable d'env dédiée, jamais posée ailleurs.
+        unsafe {
+            std::env::remove_var("SASRS_DEFINITELY_UNSET_M19");
+        }
+        assert_eq!(expand("%sysget(SASRS_DEFINITELY_UNSET_M19)"), "");
+    }
+
+    // --- M19.1 : %sysevalf (évaluation flottante) ---
+
+    #[test]
+    fn sysevalf_float_division() {
+        assert_eq!(expand("%sysevalf(7/2)"), "3.5");
+    }
+
+    #[test]
+    fn sysevalf_vs_eval_integer_division() {
+        // %eval tronque (entier) ; %sysevalf est réel.
+        assert_eq!(expand("%eval(7/2)"), "3");
+        assert_eq!(expand("%sysevalf(7/2)"), "3.5");
+    }
+
+    #[test]
+    fn sysevalf_decimal_literals() {
+        assert_eq!(expand("%sysevalf(0.5 + 0.25)"), "0.75");
+    }
+
+    #[test]
+    fn sysevalf_integer_result_has_no_decimals() {
+        assert_eq!(expand("%sysevalf(4/2)"), "2");
+    }
+
+    #[test]
+    fn sysevalf_conv_boolean() {
+        assert_eq!(expand("%sysevalf(3.5, boolean)"), "1");
+        assert_eq!(expand("%sysevalf(0, boolean)"), "0");
+    }
+
+    #[test]
+    fn sysevalf_conv_ceil_floor_integer() {
+        assert_eq!(expand("%sysevalf(7/2, ceil)"), "4");
+        assert_eq!(expand("%sysevalf(7/2, floor)"), "3");
+        assert_eq!(expand("%sysevalf(7/2, integer)"), "3");
+        assert_eq!(expand("%sysevalf(-7/2, integer)"), "-3");
+        assert_eq!(expand("%sysevalf(-7/2, floor)"), "-4");
+    }
+
+    #[test]
+    fn sysevalf_resolves_refs() {
+        assert_eq!(expand("%let n=5; %sysevalf(&n / 2)"), "2.5");
+    }
+
+    #[test]
+    fn sysevalf_power_is_real() {
+        assert_eq!(expand("%sysevalf(2 ** 0.5)"), f64::sqrt(2.0).to_string());
+    }
+
+    #[test]
+    fn sysevalf_syntax_error_no_panic() {
+        let out = expand("%sysevalf(2 + + )");
+        assert!(out.contains("ERROR"), "got: {out}");
+    }
+
+    // --- M19.2 : %include + bibliothèques autocall (SASAUTOS) ---
+
+    use std::io::Write;
+
+    /// Crée un engine déterministe dont la base d'inclusion est `dir`.
+    fn engine_in(dir: &std::path::Path) -> MacroEngine {
+        let mut e = MacroEngine::new(true);
+        e.set_include_base_dir(dir.to_path_buf());
+        e
+    }
+
+    /// Écrit `content` dans `dir/name` et rend le chemin.
+    fn write_file(dir: &std::path::Path, name: &str, content: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        path
+    }
+
+    #[test]
+    fn include_simple_relative_path() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "inc.sas", "%let x = 42;");
+        let mut e = engine_in(dir.path());
+        // Le %include charge inc.sas (pose &x), puis &x se résout.
+        let out = e.expand_open_code("%include 'inc.sas'; &x");
+        assert_eq!(out.trim(), "42");
+    }
+
+    #[test]
+    fn include_double_quotes() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "inc.sas", "data a;run;");
+        let mut e = engine_in(dir.path());
+        let out = e.expand_open_code("%include \"inc.sas\";");
+        assert!(out.contains("data a;run;"), "got: {out}");
+    }
+
+    #[test]
+    fn include_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_file(dir.path(), "abs.sas", "%let y = hi;");
+        // Engine sans base : on utilise un chemin absolu.
+        let mut e = MacroEngine::new(true);
+        let stmt = format!("%include '{}'; &y", p.display());
+        let out = e.expand_open_code(&stmt);
+        assert_eq!(out.trim(), "hi");
+    }
+
+    #[test]
+    fn include_defines_macro_then_invoked() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "mac.sas", "%macro greet; hello %mend;");
+        let mut e = engine_in(dir.path());
+        // Le fichier inclus DÉFINIT %greet ; l'appel suivant l'expanse.
+        let out = e.expand_open_code("%include 'mac.sas'; %greet");
+        assert_eq!(out.trim(), "hello");
+    }
+
+    #[test]
+    fn include_nested() {
+        let dir = tempfile::tempdir().unwrap();
+        // a.sas inclut b.sas ; b.sas pose &z.
+        write_file(dir.path(), "b.sas", "%let z = nested;");
+        write_file(dir.path(), "a.sas", "%include 'b.sas';");
+        let mut e = engine_in(dir.path());
+        let out = e.expand_open_code("%include 'a.sas'; &z");
+        assert_eq!(out.trim(), "nested");
+    }
+
+    #[test]
+    fn include_missing_file_emits_note_no_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = engine_in(dir.path());
+        let out = e.expand_open_code("%include 'does_not_exist.sas'; after");
+        assert!(out.contains("cannot read"), "got: {out}");
+        // Le scan se poursuit après le statement.
+        assert!(out.contains("after"), "got: {out}");
+    }
+
+    #[test]
+    fn include_cycle_hits_depth_limit_no_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        // self.sas s'inclut lui-même : la garde de profondeur arrête le cycle.
+        write_file(dir.path(), "self.sas", "%include 'self.sas';");
+        let mut e = engine_in(dir.path());
+        let out = e.expand_open_code("%include 'self.sas';");
+        assert!(out.contains("nesting limit"), "got: {out}");
+    }
+
+    #[test]
+    fn include_fileref_form_unsupported_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = engine_in(dir.path());
+        let out = e.expand_open_code("%include myref; tail");
+        assert!(out.contains("only quoted file paths"), "got: {out}");
+        assert!(out.contains("tail"), "got: {out}");
+    }
+
+    #[test]
+    fn autocall_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "sayhi.sas", "%macro sayhi; HI %mend;");
+        let mut e = MacroEngine::new(true);
+        e.set_sasautos_path(vec![dir.path().to_path_buf()]);
+        // %sayhi non défini : chargé paresseusement depuis sayhi.sas.
+        let out = e.expand_open_code("%sayhi");
+        assert_eq!(out.trim(), "HI");
+    }
+
+    #[test]
+    fn autocall_with_args() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "dbl.sas",
+            "%macro dbl(x); &x&x %mend;",
+        );
+        let mut e = MacroEngine::new(true);
+        e.set_sasautos_path(vec![dir.path().to_path_buf()]);
+        let out = e.expand_open_code("%dbl(ab)");
+        assert_eq!(out.trim(), "abab");
+    }
+
+    #[test]
+    fn autocall_nested() {
+        let dir = tempfile::tempdir().unwrap();
+        // outer appelle inner ; les deux sont des fichiers autocall.
+        write_file(dir.path(), "inner.sas", "%macro inner; IN %mend;");
+        write_file(
+            dir.path(),
+            "outer.sas",
+            "%macro outer; [%inner] %mend;",
+        );
+        let mut e = MacroEngine::new(true);
+        e.set_sasautos_path(vec![dir.path().to_path_buf()]);
+        let out = e.expand_open_code("%outer");
+        assert_eq!(out.trim(), "[IN]");
+    }
+
+    #[test]
+    fn autocall_first_dir_wins() {
+        let d1 = tempfile::tempdir().unwrap();
+        let d2 = tempfile::tempdir().unwrap();
+        write_file(d1.path(), "pick.sas", "%macro pick; ONE %mend;");
+        write_file(d2.path(), "pick.sas", "%macro pick; TWO %mend;");
+        let mut e = MacroEngine::new(true);
+        e.set_sasautos_path(vec![d1.path().to_path_buf(), d2.path().to_path_buf()]);
+        let out = e.expand_open_code("%pick");
+        assert_eq!(out.trim(), "ONE");
+    }
+
+    #[test]
+    fn autocall_not_found_left_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = MacroEngine::new(true);
+        e.set_sasautos_path(vec![dir.path().to_path_buf()]);
+        // Macro introuvable : `%nope` laissé verbatim (comportement historique).
+        let out = e.expand_open_code("%nope");
+        assert_eq!(out, "%nope");
+    }
+
+    #[test]
+    fn autocall_tried_only_once() {
+        // Même sans fichier, la deuxième invocation ne doit pas re-tenter le
+        // disque ni paniquer ; le résultat reste verbatim.
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = MacroEngine::new(true);
+        e.set_sasautos_path(vec![dir.path().to_path_buf()]);
+        let out = e.expand_open_code("%miss %miss");
+        assert_eq!(out, "%miss %miss");
+    }
+
+    #[test]
+    fn defined_macro_takes_priority_over_autocall() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "m.sas", "%macro m; FROMDISK %mend;");
+        let mut e = MacroEngine::new(true);
+        e.set_sasautos_path(vec![dir.path().to_path_buf()]);
+        // Définition inline : elle prime, autocall n'est pas consulté.
+        let out = e.expand_open_code("%macro m; INLINE %mend; %m");
+        assert_eq!(out.trim(), "INLINE");
+    }
+
+    // --- M19.3 : trace options + %put + %call execute ---
+
+    #[test]
+    fn put_simple_text() {
+        let mut e = MacroEngine::new(true);
+        let _out = e.expand_open_code("%put Hello world;");
+        let logs = e.take_pending_log_lines();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0], "Hello world");
+    }
+
+    #[test]
+    fn put_with_symbol_resolution() {
+        let mut e = MacroEngine::new(true);
+        let _out = e.expand_open_code("%let name=Alice; %put Hello &name;");
+        let logs = e.take_pending_log_lines();
+        assert!(logs.iter().any(|l| l.contains("Hello Alice")));
+    }
+
+    #[test]
+    fn put_empty_line() {
+        let mut e = MacroEngine::new(true);
+        let _out = e.expand_open_code("%put;");
+        let logs = e.take_pending_log_lines();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0], "");
+    }
+
+    #[test]
+    fn mprint_flag_echoes_macro_output() {
+        let mut e = MacroEngine::new(true);
+        e.set_mprint(true);
+        let _out = e.expand_open_code("%macro m; DATA x; RUN; %mend; %m");
+        let logs = e.take_pending_log_lines();
+        assert!(logs.iter().any(|l| l.starts_with("MPRINT(M):")));
+        assert!(logs.iter().any(|l| l.contains("DATA x")));
+    }
+
+    #[test]
+    fn mlogic_flag_echoes_macro_entry_exit() {
+        let mut e = MacroEngine::new(true);
+        e.set_mlogic(true);
+        let _out = e.expand_open_code("%macro m(a=1); x=&a; %mend; %m(a=5)");
+        let logs = e.take_pending_log_lines();
+        assert!(logs.iter().any(|l| l.contains("Beginning execution")));
+        assert!(logs.iter().any(|l| l.contains("Parameter A has value 5")));
+        assert!(logs.iter().any(|l| l.contains("Ending execution")));
+    }
+
+    #[test]
+    fn mlogic_flag_echoes_if_condition() {
+        let mut e = MacroEngine::new(true);
+        e.set_mlogic(true);
+        let _out = e.expand_open_code("%macro m; %if 1=1 %then YES; %else NO; %mend; %m");
+        let logs = e.take_pending_log_lines();
+        assert!(logs.iter().any(|l| l.contains("is TRUE")));
+    }
+
+    #[test]
+    fn symbolgen_flag_echoes_symbol_resolution() {
+        let mut e = MacroEngine::new(true);
+        e.set_symbolgen(true);
+        // SYMBOLGEN traces when a symbol is USED in the expansion, not just defined
+        let _out = e.expand_open_code("%let x=abc; data &x;");
+        let logs = e.take_pending_log_lines();
+        assert!(logs.iter().any(|l| l.contains("Macro variable X resolves to abc")), "got logs: {:?}", logs);
+    }
+
+    #[test]
+    fn call_execute_queues_code() {
+        let mut e = MacroEngine::new(true);
+        let _out = e.expand_open_code("%macro m; %call execute(data step here;); %mend; %m");
+        let queue = e.take_pending_call_execute();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0], "data step here;");
+    }
+
+    #[test]
+    fn call_execute_resolves_symbols() {
+        let mut e = MacroEngine::new(true);
+        let _out = e.expand_open_code("%let step=SET x; %macro m; %call execute(&step run;); %mend; %m");
+        let queue = e.take_pending_call_execute();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0], "SET x run;");
+    }
+
+    #[test]
+    fn multiple_trace_flags_interact() {
+        let mut e = MacroEngine::new(true);
+        e.set_mprint(true);
+        e.set_mlogic(true);
+        e.set_symbolgen(true);
+        let _out = e.expand_open_code(
+            "%let x=5; %macro m; %if &x > 3 %then YES; %mend; %m"
+        );
+        let logs = e.take_pending_log_lines();
+        // Should have logs from MLOGIC and MPRINT at minimum
+        assert!(logs.iter().any(|l| l.contains("MLOGIC")), "got logs: {:?}", logs);
+        assert!(logs.iter().any(|l| l.contains("is TRUE")), "got logs: {:?}", logs);
+        assert!(logs.iter().any(|l| l.contains("MPRINT")), "got logs: {:?}", logs);
     }
 }

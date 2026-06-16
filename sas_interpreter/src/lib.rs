@@ -15,6 +15,7 @@ pub mod library;
 pub mod listing;
 pub mod log;
 pub mod missing;
+pub mod output;
 pub mod parser;
 pub mod preprocess;
 pub mod procs;
@@ -88,6 +89,47 @@ pub fn run(source_text: &str, opts: RunOptions) -> RunOutcome {
         session.log.error(&e.to_string());
     }
 
+    // M23 — filet de sécurité : si une destination avec fichier cible est encore
+    // ouverte à la fin du programme (fixture sans `ODS CLOSE`), on l'écrit
+    // maintenant. La NOTE va dans le log AVANT `log.into_string()`.
+    if let Some((path, bytes)) = session.listing.finalize_to_bytes() {
+        let label = session.listing.dest_type_label();
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("output")
+            .to_string();
+        match std::fs::write(&path, &bytes) {
+            Ok(()) => {
+                session.log.note(&format!("Writing {} file: {}", label, file_name));
+            }
+            Err(e) => {
+                session.log.note(&format!(
+                    "WARNING: Could not write {} file {}: {}",
+                    label, file_name, e
+                ));
+            }
+        }
+    } else if let Some((path, content)) = session.listing.finalize() {
+        let label = session.listing.dest_type_label();
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("output.html")
+            .to_string();
+        match std::fs::write(&path, &content) {
+            Ok(()) => {
+                session.log.note(&format!("Writing {} file: {}", label, file_name));
+            }
+            Err(e) => {
+                session.log.note(&format!(
+                    "WARNING: Could not write {} file {}: {}",
+                    label, file_name, e
+                ));
+            }
+        }
+    }
+
     let exit_code = if session.log.errors > 0 {
         2
     } else if session.log.warnings > 0 {
@@ -98,6 +140,8 @@ pub fn run(source_text: &str, opts: RunOptions) -> RunOutcome {
     RunOutcome {
         log: session.log.into_string(),
         listing: session.listing.into_string(),
+        // NB : `Session.listing` est désormais `Box<dyn OutputDestination>` ;
+        // `into_string` prend `&mut self` (drain) au lieu de consommer.
         exit_code,
     }
 }
