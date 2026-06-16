@@ -355,9 +355,14 @@ pub fn eigenvectors_jacobi(a: &[Vec<f64>]) -> Result<(Vec<Vec<f64>>, Vec<f64>)> 
 }
 
 // ───────────────────────── Helper functions ───────────────────────────
+//
+// These primitive matrix operations are part of the linalg toolkit, exposed
+// `pub(crate)` for downstream milestones (M25 PROC REG normal equations via
+// transpose + matrix_mult, M27 PCA, etc.). They are kept here even when not
+// yet exercised by the M24.1 decompositions, which inline their arithmetic.
 
 /// Transpose a matrix.
-fn transpose(a: &[Vec<f64>]) -> Vec<Vec<f64>> {
+pub fn transpose(a: &[Vec<f64>]) -> Vec<Vec<f64>> {
     if a.is_empty() {
         return vec![];
     }
@@ -372,7 +377,7 @@ fn transpose(a: &[Vec<f64>]) -> Vec<Vec<f64>> {
 }
 
 /// Matrix-vector multiplication: y = A @ x.
-fn matrix_vec_mult(a: &[Vec<f64>], x: &[f64]) -> Vec<f64> {
+pub fn matrix_vec_mult(a: &[Vec<f64>], x: &[f64]) -> Vec<f64> {
     let mut y = vec![0.0; a.len()];
     for (i, row) in a.iter().enumerate() {
         for (j, &val) in row.iter().enumerate() {
@@ -383,7 +388,7 @@ fn matrix_vec_mult(a: &[Vec<f64>], x: &[f64]) -> Vec<f64> {
 }
 
 /// Matrix-matrix multiplication: C = A @ B.
-fn matrix_mult(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
+pub fn matrix_mult(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
     let m = a.len();
     let n = b[0].len();
     let k = b.len();
@@ -399,7 +404,7 @@ fn matrix_mult(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
 }
 
 /// Frobenius norm: ‖A‖_F = sqrt(Σ a_ij²).
-fn frobenius_norm(a: &[Vec<f64>]) -> f64 {
+pub fn frobenius_norm(a: &[Vec<f64>]) -> f64 {
     a.iter().flat_map(|row| row.iter()).map(|&x| x * x).sum::<f64>().sqrt()
 }
 
