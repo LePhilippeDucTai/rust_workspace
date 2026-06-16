@@ -1,0 +1,100 @@
+---
+source: sas_interpreter/tests/snapshot.rs
+assertion_line: 29
+expression: "format!(\"==== LOG ====\\n{}\\n==== LISTING ====\\n{}\\n==== EXIT {} ====\",\noutcome.log, outcome.listing, outcome.exit_code)"
+input_file: sas_interpreter/tests/fixtures/m24/npar1way.sas
+---
+==== LOG ====
+
+1     libname d 'data';
+NOTE: Libref D was successfully assigned as follows:
+            Engine:        PARQUET
+            Physical Name: data
+
+2     title "Wilcoxon Rank-Sum: Height by Sex";
+
+3     proc npar1way data=d.class wilcoxon;
+4         class sex;
+5         var height;
+6     run;
+NOTE: PROCEDURE NPAR1WAY used (Total process time):
+            real time           0.00 seconds
+            cpu time            0.00 seconds
+
+7     data scores;
+8         input grp $ score;
+9         datalines;
+10    A 10
+11    A 12
+12    A 15
+13    B 20
+14    B 22
+15    B 25
+16    C 28
+17    C 30
+18    C 35
+19    ;
+20    run;
+NOTE: The data set WORK.SCORES has 9 observations and 2 variables.
+NOTE: DATA statement used (Total process time):
+            real time           0.00 seconds
+            cpu time            0.00 seconds
+
+21    title "Kruskal-Wallis: 3 groups (perfect separation)";
+
+22    proc npar1way data=scores wilcoxon;
+23        class grp;
+24        var score;
+25    run;
+NOTE: PROCEDURE NPAR1WAY used (Total process time):
+            real time           0.00 seconds
+            cpu time            0.00 seconds
+
+26    title;
+
+==== LISTING ====
+                                Wilcoxon Rank-Sum: Height by Sex
+
+                                     The NPAR1WAY Procedure
+
+           Wilcoxon Scores (Rank Sums) for Variable height Classified by Variable sex
+
+      sex     N    Sum of Scores    Expected Under H0    Std Dev Under H0      Mean Score
+
+      F       9               73                   90        12.236700622    8.1111111111
+      M      10              117                  100        12.236700622            11.7
+
+                                    Wilcoxon Two-Sample Test
+
+Statistic (S)            73
+Z                        -1.348402687
+One-Sided Pr >  Z        0.0888
+Two-Sided Pr > |Z|       0.1775
+
+                                      Kruskal-Wallis Test
+
+Chi-Square               1.9300527241
+DF                       1
+Pr > Chi-Square          0.1648
+
+
+                         Kruskal-Wallis: 3 groups (perfect separation)
+
+                                     The NPAR1WAY Procedure
+
+           Wilcoxon Scores (Rank Sums) for Variable score Classified by Variable grp
+
+        grp    N    Sum of Scores    Expected Under H0    Std Dev Under H0    Mean Score
+
+        A      3                6                   15        3.8729833462             2
+        B      3               15                   15        3.8729833462             5
+        C      3               24                   15        3.8729833462             8
+
+                                      Kruskal-Wallis Test
+
+Chi-Square               7.2
+DF                       2
+Pr > Chi-Square          0.0273
+
+
+==== EXIT 0 ====
