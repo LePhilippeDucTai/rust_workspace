@@ -275,7 +275,7 @@ Table-driven (`DISPATCH` dans `functions.rs`), numérique maison. Un lot ⫽ par
 - [x] Fixtures `m25/` + snapshots. DoD
 
 ## M26 — modèles catégoriels
-- [ ] M26.1 — `PROC LOGISTIC` (logistique binaire, Newton-Raphson/IRLS, odds ratios, CLASS, LINK=) (Fable, élevé)
+- [x] M26.1 — `PROC LOGISTIC` (logistique binaire, Newton-Raphson/IRLS, odds ratios, CLASS, LINK=) (Fable, élevé)
 - [ ] M26.2 — `PROC GENMOD` (GLM exponentiels : Poisson, binomial, gamma ; fonctions de lien ; DIST=) (Fable, élevé)
 - [ ] Fixtures `m26/` + snapshots. DoD
 
