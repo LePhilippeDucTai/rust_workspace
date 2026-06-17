@@ -271,7 +271,7 @@ Table-driven (`DISPATCH` dans `functions.rs`), numérique maison. Un lot ⫽ par
 ## M25 — modèle linéaire
 - [x] M25.1 — `PROC REG` (OLS via QR, MODEL, R²/F/t, OUTPUT OUT= résidus/prédits, TEST, intervalles) (Fable, élevé)
 - [x] M25.2 — `PROC ANOVA` (plans équilibrés, CLASS, MEANS, types de SC) (Opus, élevé)
-- [ ] M25.3 — `PROC GLM` (codage CLASS, SC type I/III, LSMEANS, contrastes, ESTIMATE) (Fable, élevé)
+- [x] M25.3 — `PROC GLM` (codage CLASS, SC type I/III, LSMEANS, contrastes, ESTIMATE) (Fable, élevé)
 - [ ] Fixtures `m25/` + snapshots. DoD
 
 ## M26 — modèles catégoriels
