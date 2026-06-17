@@ -1,0 +1,90 @@
+---
+source: sas_interpreter/tests/snapshot.rs
+assertion_line: 29
+expression: "format!(\"==== LOG ====\\n{}\\n==== LISTING ====\\n{}\\n==== EXIT {} ====\",\noutcome.log, outcome.listing, outcome.exit_code)"
+input_file: sas_interpreter/tests/fixtures/m25/glm_twoway.sas
+---
+==== LOG ====
+
+1     data glm_data;
+2       input factor1 $ factor2 $ response @@;
+3       datalines;
+4       A X 100.2
+5       A X 101.5
+6       A Y 95.3
+7       A Y 96.1
+8       B X 110.1
+9       B X 111.2
+10      B Y 85.4
+11      B Y 84.9
+12      ;
+13    run;
+NOTE: The data set WORK.GLM_DATA has 8 observations and 3 variables.
+NOTE: DATA statement used (Total process time):
+            real time           0.00 seconds
+            cpu time            0.00 seconds
+
+14    proc glm data=glm_data;
+15      class factor1 factor2;
+16      model response = factor1 factor2 factor1*factor2;
+17      lsmeans factor1*factor2;
+18      title "Two-Way ANOVA with GLM";
+19    run;
+NOTE: PROCEDURE GLM used (Total process time):
+            real time           0.00 seconds
+            cpu time            0.00 seconds
+
+==== LISTING ====
+                                         The SAS System
+
+                                       The GLM Procedure
+
+                                    Class Level Information
+
+                                  Class      Levels    Values
+
+                                  factor1         2    A B
+                                  factor2         2    X Y
+
+Number of Observations Read       8
+Number of Observations Used       8
+
+                                       The GLM Procedure
+
+                                  Dependent Variable: response
+
+          Source             DF    Sum of Squares     Mean Square    F Value    Pr > F
+
+          Model               3         677.05375    225.68458333     476.38    <.0001
+          Error               4             1.895         0.47375
+          Corrected Total     7         678.94875
+
+                       R-Square    Coeff Var        Root MSE    response Mean
+
+                   0.9972089204    0.7017153    0.6882949949          98.0875
+
+             Source             DF    Type I SS    Mean Square    F Value    Pr > F
+
+             factor1             1      0.28125        0.28125       0.59    0.4840
+             factor2             1    469.71125      469.71125     991.47    <.0001
+             factor1*factor2     1    207.06125      207.06125     437.07    <.0001
+
+            Source             DF    Type III SS    Mean Square    F Value    Pr > F
+
+            factor1             1       111.3025       111.3025     234.94    0.0001
+            factor2             1         650.25         650.25    1372.56    <.0001
+            factor1*factor2     1      207.06125      207.06125     437.07    <.0001
+
+                                       The GLM Procedure
+
+                                      Least Squares Means
+
+     factor1    factor2     LSMEAN    Standard Error    DF       Lower 95%       Upper 95%
+
+     A          X           82.825      0.7695371986     4    80.688422212    84.961577788
+     A          Y          103.175      0.3441474974     4    102.21949337    104.13050663
+     B          X          103.175      0.3441474974     4    102.21949337    104.13050663
+     B          Y          103.175      0.3441474974     4    102.21949337    104.13050663
+
+
+==== EXIT 0 ====

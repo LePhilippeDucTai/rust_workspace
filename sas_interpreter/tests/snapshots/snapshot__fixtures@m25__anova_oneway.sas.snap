@@ -1,0 +1,77 @@
+---
+source: sas_interpreter/tests/snapshot.rs
+assertion_line: 29
+expression: "format!(\"==== LOG ====\\n{}\\n==== LISTING ====\\n{}\\n==== EXIT {} ====\",\noutcome.log, outcome.listing, outcome.exit_code)"
+input_file: sas_interpreter/tests/fixtures/m25/anova_oneway.sas
+---
+==== LOG ====
+
+1     data anova_data;
+2       input group $ y @@;
+3       datalines;
+4       A 10.2
+5       A 11.1
+6       A 10.8
+7       B 15.3
+8       B 14.9
+9       B 15.5
+10      C 12.0
+11      C 12.5
+12      C 11.8
+13      ;
+14    run;
+NOTE: The data set WORK.ANOVA_DATA has 9 observations and 2 variables.
+NOTE: DATA statement used (Total process time):
+            real time           0.00 seconds
+            cpu time            0.00 seconds
+
+15    proc anova data=anova_data;
+16      class group;
+17      model y = group;
+18      means group;
+19      title "One-Way ANOVA";
+20    run;
+NOTE: PROCEDURE ANOVA used (Total process time):
+            real time           0.00 seconds
+            cpu time            0.00 seconds
+
+==== LISTING ====
+                                         The SAS System
+
+                                      The ANOVA Procedure
+
+                                    Class Level Information
+
+                                   Class    Levels    Values
+
+                                   group         3    A B C
+
+Number of Observations Read       9
+Number of Observations Used       9
+
+                                      The ANOVA Procedure
+
+                                     Dependent Variable: y
+
+          Source             DF    Sum of Squares     Mean Square    F Value    Pr > F
+
+          Model               2      32.328888889    16.164444444     111.91    <.0001
+          Error               6      0.8666666667    0.1444444444
+          Corrected Total     8      33.195555556
+
+                      R-Square       Coeff Var       Root MSE          y Mean
+
+                  0.9738920873    2.9978319678    0.380058475    12.677777778
+
+                                      The ANOVA Procedure
+
+                                     Means for effect group
+
+                           group    N            Mean         Std Err
+
+                           A        3            10.7    0.2194268629
+                           B        3    15.233333333    0.2194268629
+                           C        3            12.1    0.2194268629
+
+
+==== EXIT 0 ====
