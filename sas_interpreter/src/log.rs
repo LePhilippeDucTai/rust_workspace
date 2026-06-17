@@ -25,6 +25,12 @@ impl LogWriter {
         self.buf
     }
 
+    /// Non-consuming read of the accumulated log buffer (useful for tests that
+    /// need to inspect both the log and other session state afterwards).
+    pub fn buffer(&self) -> &str {
+        &self.buf
+    }
+
     fn raw(&mut self, line: &str) {
         self.buf.push_str(line);
         self.buf.push('\n');

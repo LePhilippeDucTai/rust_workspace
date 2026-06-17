@@ -269,7 +269,7 @@ Table-driven (`DISPATCH` dans `functions.rs`), numérique maison. Un lot ⫽ par
 - [x] Fixtures `m24/` + snapshots vérifiés contre SAS. DoD : `ttest.sas` (1-éch. height vs H0=60 → t=1.9867/df18/p0.0624/IC[59.866,64.808] = fixture M10 ; 2-éch. height par sex → Pooled t=-1.4526/df17, Satterthwaite t=-1.4513/df16.73, F plié 1.0328 ; apparié before-after diffs{5,7,2,-2,8} mean4/t2.2019/df4) ; `npar1way.sas` (Wilcoxon height/sex → S=73 Z=-1.3484 [corr. continuité 0.5] p_bi=0.1775 + KW k=2 χ²=1.930/df1, total rangs 190 ✓ ; KW 3 groupes séparation parfaite R=6/15/24 → H=7.2/df2/p=0.0273 = R kruskal.test). **Vérifiés à la main**, m1–m23 octet-identiques (0 `.snap.new`). `cargo test -p sas_interpreter` vert (2091 lib + snapshots), `-D warnings` propre. **M24 TERMINÉ.**
 
 ## M25 — modèle linéaire
-- [ ] M25.1 — `PROC REG` (OLS via QR, MODEL, R²/F/t, OUTPUT OUT= résidus/prédits, TEST, intervalles) (Fable, élevé)
+- [x] M25.1 — `PROC REG` (OLS via QR, MODEL, R²/F/t, OUTPUT OUT= résidus/prédits, TEST, intervalles) (Fable, élevé)
 - [ ] M25.2 — `PROC ANOVA` (plans équilibrés, CLASS, MEANS, types de SC) (Opus, élevé)
 - [ ] M25.3 — `PROC GLM` (codage CLASS, SC type I/III, LSMEANS, contrastes, ESTIMATE) (Fable, élevé)
 - [ ] Fixtures `m25/` + snapshots. DoD
