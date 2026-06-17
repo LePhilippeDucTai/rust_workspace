@@ -1,0 +1,115 @@
+---
+source: sas_interpreter/tests/snapshot.rs
+assertion_line: 29
+expression: "format!(\"==== LOG ====\\n{}\\n==== LISTING ====\\n{}\\n==== EXIT {} ====\",\noutcome.log, outcome.listing, outcome.exit_code)"
+input_file: sas_interpreter/tests/fixtures/m24/ttest.sas
+---
+==== LOG ====
+
+1     libname d 'data';
+NOTE: Libref D was successfully assigned as follows:
+            Engine:        PARQUET
+            Physical Name: data
+
+2     title "One-sample t-test: height vs H0=62";
+
+3     proc ttest data=d.class h0=62;
+4         var height;
+5     run;
+NOTE: PROCEDURE TTEST used (Total process time):
+            real time           0.00 seconds
+            cpu time            0.00 seconds
+
+6     title "Two-sample t-test: height by sex";
+
+7     proc ttest data=d.class;
+8         class sex;
+9         var height;
+10    run;
+NOTE: PROCEDURE TTEST used (Total process time):
+            real time           0.00 seconds
+            cpu time            0.00 seconds
+
+11    data trial;
+12        input pre post;
+13        datalines;
+14    10 12
+15    12 15
+16    14 16
+17    16 20
+18    ;
+19    run;
+NOTE: The data set WORK.TRIAL has 4 observations and 2 variables.
+NOTE: DATA statement used (Total process time):
+            real time           0.00 seconds
+            cpu time            0.00 seconds
+
+20    title "Paired t-test: pre vs post";
+
+21    proc ttest data=trial;
+22        paired pre*post;
+23    run;
+NOTE: PROCEDURE TTEST used (Total process time):
+            real time           0.00 seconds
+            cpu time            0.00 seconds
+
+24    title;
+
+==== LISTING ====
+                               One-sample t-test: height vs H0=62
+
+                                      The TTEST Procedure
+
+      Variable     N            Mean         Std Dev         Std Err    Minimum    Maximum
+
+      height      19    62.336842105    5.1270752466    1.1762317303       51.3         72
+
+                                            T-Tests
+
+            Variable    DF    t Value    Pr > |t|    Lower CL Mean    Upper CL Mean
+
+            height      18       0.29      0.7779     59.865670939     64.808013272
+
+
+                                Two-sample t-test: height by sex
+
+                                      The TTEST Procedure
+
+                                        Variable: height
+
+     sex            N            Mean         Std Dev         Std Err    Minimum    Maximum
+
+     F              9    60.588888889    5.0183275213    1.6727758404       51.3       66.5
+     M             10           63.91    4.9379370411    1.5615127993       57.3         72
+     Diff (1-2)    19    -3.321111111               .               .          .          .
+
+                                            T-Tests
+
+  Method           Variances       DF    t Value    Pr > |t|    Lower CL Mean    Upper CL Mean
+
+  Pooled           Equal           17      -1.45      0.1645     -8.144744264     1.5025220423
+  Satterthwaite    Unequal      16.73      -1.45      0.1652     -8.155097676     1.5128754535
+
+                                     Equality of Variances
+
+                       Method      Num DF    Den DF    F Value    Pr > F
+
+                       Folded F         8         9       1.03    0.9527
+
+
+                                   Paired t-test: pre vs post
+
+                                      The TTEST Procedure
+
+         Difference    N     Mean         Std Dev         Std Err    Minimum    Maximum
+
+         pre - post    4    -2.75    0.9574271078    0.4787135539         -4         -2
+
+                                            T-Tests
+
+           Difference    DF    t Value    Pr > |t|    Lower CL Mean    Upper CL Mean
+
+           pre - post     3      -5.74      0.0105     -4.273480181     -1.226519819
+
+
+==== EXIT 0 ====
