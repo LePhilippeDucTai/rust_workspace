@@ -6,7 +6,7 @@ COMMIT que le code livré. Ne cocher une case que si : implémentation
 complète (zéro `todo!()` restant dans le fichier), tests du fichier écrits,
 `cargo test -p sas_interpreter` vert.
 
-Jalon courant : **M26** (modèles catégoriels : LOGISTIC/GENMOD). M1–M25 terminés. Roadmap M14–M30 ouverte
+Jalon courant : **M27** (multivarié : PCA/FACTOR/CLUSTER/DISCRIM). M1–M26 terminés. Roadmap M14–M30 ouverte
 (couverture SAS quasi-intégrale : I/O fichiers plats, bibliothèque de fonctions, hash,
 compléments SQL/macro/formats, complétion des procs, ODS, modélisation statistique,
 graphiques). Décisions verrouillées : graphiques en images PNG/SVG via `plotters` ;
@@ -277,7 +277,7 @@ Table-driven (`DISPATCH` dans `functions.rs`), numérique maison. Un lot ⫽ par
 ## M26 — modèles catégoriels
 - [x] M26.1 — `PROC LOGISTIC` (logistique binaire, Newton-Raphson/IRLS, odds ratios, CLASS, LINK=) (Fable, élevé)
 - [x] M26.2 — `PROC GENMOD` (GLM exponentiels : Poisson, binomial, gamma ; fonctions de lien ; DIST=) (Fable, élevé)
-- [ ] Fixtures `m26/` + snapshots. DoD
+- [x] Fixtures `m26/` + snapshots. DoD
 
 ## M27 — multivarié
 - [ ] M27.1 — `PROC PRINCOMP` (ACP via valeurs propres covariance/corrélation) (Opus, élevé)

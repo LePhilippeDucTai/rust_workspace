@@ -1,0 +1,72 @@
+---
+source: sas_interpreter/tests/snapshot.rs
+assertion_line: 29
+expression: "format!(\"==== LOG ====\\n{}\\n==== LISTING ====\\n{}\\n==== EXIT {} ====\",\noutcome.log, outcome.listing, outcome.exit_code)"
+input_file: sas_interpreter/tests/fixtures/m26/genmod_poisson.sas
+---
+==== LOG ====
+
+1     data poisson_data;
+2       input x count @@;
+3       datalines;
+4       1 2
+5       1 1
+6       2 4
+7       2 3
+8       3 6
+9       3 7
+10      4 10
+11      4 9
+12      ;
+13    run;
+NOTE: The data set WORK.POISSON_DATA has 8 observations and 2 variables.
+NOTE: DATA statement used (Total process time):
+            real time           0.00 seconds
+            cpu time            0.00 seconds
+
+14    proc genmod data=poisson_data;
+15      model count = x;
+16      dist=poisson;
+17      link=log;
+18      title "Poisson Regression";
+19    run;
+NOTE: PROCEDURE GENMOD used (Total process time):
+            real time           0.00 seconds
+            cpu time            0.00 seconds
+
+==== LISTING ====
+                                         The SAS System
+
+                                      The GENMOD Procedure
+
+                                       Model Information
+
+
+
+                            Data Set              WORK.POISSON_DATA
+                            Distribution          Poisson
+                            Link Function         Log
+                            Dependent Variable    count
+
+Number of Observations Read       8
+Number of Observations Used       8
+
+                             Criteria For Assessing Goodness Of Fit
+
+                         Criterion          DF       Value    Value/DF
+
+                         Deviance            6      1.0550      0.1758
+                         Scaled Deviance     6      1.0550      0.1758
+                         Log Likelihood           -13.8010
+                         AIC                       31.6020
+                         BIC                       31.7609
+
+                       Analysis Of Maximum Likelihood Parameter Estimates
+
+         Parameter    DF    Estimate    Standard Error    Wald Chi-Square    Pr > ChiSq
+
+         Intercept     1      0.0754            0.5149             0.0214        0.8836
+         x             1      0.5584            0.1563            12.7635        0.0004
+
+
+==== EXIT 0 ====

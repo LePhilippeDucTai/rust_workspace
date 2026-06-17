@@ -1,0 +1,87 @@
+---
+source: sas_interpreter/tests/snapshot.rs
+assertion_line: 29
+expression: "format!(\"==== LOG ====\\n{}\\n==== LISTING ====\\n{}\\n==== EXIT {} ====\",\noutcome.log, outcome.listing, outcome.exit_code)"
+input_file: sas_interpreter/tests/fixtures/m26/logistic_simple.sas
+---
+==== LOG ====
+
+1     data logistic_data;
+2       input x event @@;
+3       datalines;
+4       1 0
+5       2 0
+6       2 1
+7       3 1
+8       4 1
+9       4 1
+10      5 1
+11      ;
+12    run;
+NOTE: The data set WORK.LOGISTIC_DATA has 7 observations and 2 variables.
+NOTE: DATA statement used (Total process time):
+            real time           0.00 seconds
+            cpu time            0.00 seconds
+
+13    proc logistic data=logistic_data;
+14      model event = x;
+15      oddsratio x;
+16      title "Logistic Regression";
+17    run;
+NOTE: Convergence criterion (GCONV=1E-8) not satisfied.
+NOTE: PROCEDURE LOGISTIC used (Total process time):
+            real time           0.00 seconds
+            cpu time            0.00 seconds
+
+==== LISTING ====
+                                         The SAS System
+
+                                     The LOGISTIC Procedure
+
+
+
+                          Data Set                  WORK.LOGISTIC_DATA
+                          Response Variable         event
+                          Model                     binary logit
+                          Optimization Technique    Newton-Raphson
+
+                                        Response Profile
+
+                           Ordered Value    event    Total Frequency
+
+                                       1    1                      5
+                                       2    0                      2
+
+Probability modeled is for the second ordered (largest) response level.
+
+                                      Model Fit Statistics
+
+                    Criterion    Intercept Only    Intercept and Covariates
+
+                    AIC                  10.376                       6.773
+                    SC                   10.322                       6.664
+                    -2 Log L              8.376                       2.773
+
+                             Testing Global Null Hypothesis: BETA=0
+
+                       Test                Chi-Square    DF    Pr > ChiSq
+
+                       Likelihood Ratio        5.6032     1        0.0179
+
+                            Analysis of Maximum Likelihood Estimates
+
+         Parameter    DF    Estimate    Standard Error    Wald Chi-Square    Pr > ChiSq
+
+         Intercept     1    -48.5651       160787.3705             0.0000        0.9998
+         x             1     24.2825        80393.6853             0.0000        0.9998
+
+                                     The LOGISTIC Procedure
+
+                                      Odds Ratio Estimates
+
+                      Effect     Point Estimate    95% Lower    95% Upper
+
+                      x         35137292313.573        0.000            .
+
+
+==== EXIT 0 ====
