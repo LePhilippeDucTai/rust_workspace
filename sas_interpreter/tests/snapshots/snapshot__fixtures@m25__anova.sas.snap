@@ -1,0 +1,82 @@
+---
+source: sas_interpreter/tests/snapshot.rs
+assertion_line: 29
+expression: "format!(\"==== LOG ====\\n{}\\n==== LISTING ====\\n{}\\n==== EXIT {} ====\",\noutcome.log, outcome.listing, outcome.exit_code)"
+input_file: sas_interpreter/tests/fixtures/m25/anova.sas
+---
+==== LOG ====
+
+1     data plants;
+2         input fert $ growth;
+3         datalines;
+4     A 1
+5     A 2
+6     A 3
+7     B 4
+8     B 5
+9     B 6
+10    C 7
+11    C 8
+12    C 9
+13    ;
+14    run;
+NOTE: The data set WORK.PLANTS has 9 observations and 2 variables.
+NOTE: DATA statement used (Total process time):
+            real time           0.00 seconds
+            cpu time            0.00 seconds
+
+15    title "PROC ANOVA: one-way growth by fert (balanced)";
+
+16    proc anova data=plants;
+17        class fert;
+18        model growth = fert;
+19        means fert;
+20    run;
+NOTE: PROCEDURE ANOVA used (Total process time):
+            real time           0.00 seconds
+            cpu time            0.00 seconds
+
+21    title;
+
+==== LISTING ====
+                         PROC ANOVA: one-way growth by fert (balanced)
+
+                                      The ANOVA Procedure
+
+                                    Class Level Information
+
+                                   Class    Levels    Values
+
+                                   fert          3    A B C
+
+Number of Observations Read         9
+Number of Observations Used         9
+
+                                      The ANOVA Procedure
+
+                                   Dependent Variable: growth
+
+          Source             DF    Sum of Squares    Mean Square    F Value    Pr > F
+
+          Model               2                54             27      27.00    0.0010
+          Error               6                 6              1
+          Corrected Total     8                60
+
+                        R-Square    Coeff Var    Root MSE    growth Mean
+
+                        0.900000           20           1              5
+
+                  Source    DF    Anova SS    Mean Square    F Value    Pr > F
+
+                  fert       2          54             27      27.00    0.0010
+
+                                         Level of fert
+
+                                    fert    N    growth Mean
+
+                                    A       3              2
+                                    B       3              5
+                                    C       3              8
+
+
+==== EXIT 0 ====

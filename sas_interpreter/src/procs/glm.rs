@@ -1354,7 +1354,7 @@ pub fn execute(ast: &GlmAst, session: &mut Session) -> Result<()> {
 
     // Parameter Estimates (SOLUTION).
     if ast.solution {
-        emit_solution(session, &result);
+        emit_solution(session, &result, !ast.class.is_empty());
     }
 
     // LSMEANS.
@@ -1488,7 +1488,9 @@ fn emit_effect_table(session: &mut Session, ss_label: &str, effs: &[EffectSS], _
 }
 
 /// Emit the Parameter Estimates table for the full-rank coefficients.
-fn emit_solution(session: &mut Session, res: &GlmResult) {
+/// `has_class` gates the reference-cell parameterization NOTE: it is only
+/// meaningful (and only emitted) when the model contains CLASS factors.
+fn emit_solution(session: &mut Session, res: &GlmResult, has_class: bool) {
     centered(session, "Parameter Estimates");
     session.listing.blank();
     let headers: Vec<String> = vec![
@@ -1518,9 +1520,11 @@ fn emit_solution(session: &mut Session, res: &GlmResult) {
         .collect();
     session.listing.write_table(&headers, &aligns, &rows);
     session.listing.blank();
-    session.log.note(
-        "PROC GLM v1: Parameter Estimates use a full-rank reference-cell parameterization; each CLASS factor's lowest level is the (zero) reference. This differs from SAS's last-level-zero singular parameterization (the fitted values and tests are identical).",
-    );
+    if has_class {
+        session.log.note(
+            "PROC GLM v1: Parameter Estimates use a full-rank reference-cell parameterization; each CLASS factor's lowest level is the (zero) reference. This differs from SAS's last-level-zero singular parameterization (the fitted values and tests are identical).",
+        );
+    }
 }
 
 /// Emit an LSMEANS table for a CLASS main effect.
