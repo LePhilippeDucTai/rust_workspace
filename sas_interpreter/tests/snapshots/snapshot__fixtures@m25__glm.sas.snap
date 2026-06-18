@@ -1,0 +1,146 @@
+---
+source: sas_interpreter/tests/snapshot.rs
+assertion_line: 29
+expression: "format!(\"==== LOG ====\\n{}\\n==== LISTING ====\\n{}\\n==== EXIT {} ====\",\noutcome.log, outcome.listing, outcome.exit_code)"
+input_file: sas_interpreter/tests/fixtures/m25/glm.sas
+---
+==== LOG ====
+
+1     libname d 'data';
+NOTE: Libref D was successfully assigned as follows:
+            Engine:        PARQUET
+            Physical Name: data
+
+2     title "PROC GLM: weight = height (continuous, == REG)";
+
+3     proc glm data=d.class;
+4         model weight = height / solution;
+5     run;
+NOTE: PROCEDURE GLM used (Total process time):
+            real time           0.00 seconds
+            cpu time            0.00 seconds
+
+6     data plants;
+7         input fert $ growth;
+8         datalines;
+9     A 1
+10    A 2
+11    A 3
+12    B 4
+13    B 5
+14    B 6
+15    C 7
+16    C 8
+17    C 9
+18    ;
+19    run;
+NOTE: The data set WORK.PLANTS has 9 observations and 2 variables.
+NOTE: DATA statement used (Total process time):
+            real time           0.00 seconds
+            cpu time            0.00 seconds
+
+20    title "PROC GLM: growth = fert (CLASS, SOLUTION, LSMEANS)";
+
+21    proc glm data=plants;
+22        class fert;
+23        model growth = fert / solution;
+24        lsmeans fert;
+25    run;
+NOTE: PROC GLM v1: Parameter Estimates use a full-rank reference-cell parameterization; each CLASS factor's lowest level is the (zero) reference. This differs from SAS's last-level-zero singular parameterization (the fitted values and tests are identical).
+NOTE: PROCEDURE GLM used (Total process time):
+            real time           0.00 seconds
+            cpu time            0.00 seconds
+
+26    title;
+
+==== LISTING ====
+                         PROC GLM: weight = height (continuous, == REG)
+
+                                       The GLM Procedure
+
+Number of Observations Read        19
+Number of Observations Used        19
+
+                                       The GLM Procedure
+
+                                   Dependent Variable: weight
+
+          Source             DF    Sum of Squares     Mean Square    F Value    Pr > F
+
+          Model               1      7193.2491186    7193.2491186      57.08    <.0001
+          Error              17      2142.4877235    126.02868962
+          Corrected Total    18      9335.7368421
+
+                    R-Square       Coeff Var        Root MSE     weight Mean
+
+                    0.770507    11.223296526    11.226250025    100.02631579
+
+               Source    DF       Type I SS     Mean Square    F Value    Pr > F
+
+               height     1    7193.2491186    7193.2491186      57.08    <.0001
+
+               Source    DF     Type III SS     Mean Square    F Value    Pr > F
+
+               height     1    7193.2491186    7193.2491186      57.08    <.0001
+
+                                      Parameter Estimates
+
+               Parameter        Estimate    Standard Error    t Value    Pr > |t|
+
+               Intercept    -143.0269184      32.274591303      -4.43      0.0004
+               height       3.8990302688      0.5160939482       7.55      <.0001
+
+
+                       PROC GLM: growth = fert (CLASS, SOLUTION, LSMEANS)
+
+                                       The GLM Procedure
+
+                                    Class Level Information
+
+                                   Class    Levels    Values
+
+                                   fert          3    A B C
+
+Number of Observations Read         9
+Number of Observations Used         9
+
+                                       The GLM Procedure
+
+                                   Dependent Variable: growth
+
+          Source             DF    Sum of Squares    Mean Square    F Value    Pr > F
+
+          Model               2                54             27      27.00    0.0010
+          Error               6                 6              1
+          Corrected Total     8                60
+
+                        R-Square    Coeff Var    Root MSE    growth Mean
+
+                        0.900000           20           1              5
+
+                 Source    DF    Type I SS    Mean Square    F Value    Pr > F
+
+                 fert       2           54             27      27.00    0.0010
+
+                Source    DF    Type III SS    Mean Square    F Value    Pr > F
+
+                fert       2             54             27      27.00    0.0010
+
+                                      Parameter Estimates
+
+                 Parameter    Estimate    Standard Error    t Value    Pr > |t|
+
+                 Intercept           2      0.5773502692       3.46      0.0134
+                 fert B              3      0.8164965809       3.67      0.0104
+                 fert C              6      0.8164965809       7.35      0.0003
+
+                                      Least Squares Means
+
+                                     fert    growth LSMEAN
+
+                                     A                   2
+                                     B                   5
+                                     C                   8
+
+
+==== EXIT 0 ====
